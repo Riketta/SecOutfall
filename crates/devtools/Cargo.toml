@@ -1,0 +1,18 @@
+[package]
+name = "devtools"
+description = "Dev harnesses: dummy NATS broker observer, multi-session study simulator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "dummy-broker"
+path = "src/bin/dummy-broker.rs"
+
+[[bin]]
+name = "session-sim"
+path = "src/bin/session-sim.rs"
+
+[lints]
+workspace = true

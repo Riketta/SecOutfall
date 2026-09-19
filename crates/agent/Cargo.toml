@@ -1,0 +1,20 @@
+[package]
+name = "agent"
+description = "SecOutfall agent: session-0 malware analysis service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "secoutfall-agent"
+path = "src/bin/secoutfall-agent.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+kernel.workspace = true
+protocol.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
