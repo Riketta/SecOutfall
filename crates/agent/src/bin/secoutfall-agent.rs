@@ -1,30 +1,88 @@
 //! Composition root for the `SecOutfall` agent.
 //!
-//! Modes:
+//! Modes (first positional argument):
 //! - *(default)* `console` — full runtime on this host; Ctrl+C finalizes.
-//! - `simulate` — the phase-3 scripted single-session demo.
+//! - `simulate` — the phase-3 scripted single-session demo (fakes only).
 //! - `service` — SCM service mode (`--features service`).
 //! - `etw-probe [seconds]` — live kernel-trace spike probe (`--features etw`).
+//!
+//! Flags:
+//! - `--config <path>` — TOML config location (default `C:\Agent.toml`;
+//!   ignored by `simulate` and `etw-probe`).
+//! - `--demo` — console mode over fakes (demo config + captured broker) for
+//!   dev boxes without a NATS broker; never use in a real VM.
 
-use std::sync::Arc;
+use std::{
+    path::PathBuf,
+    sync::Arc,
+};
 
-use agent::app::event::SandboxEvent;
 #[cfg(all(windows, feature = "etw"))]
 use agent::ports::event_source::EventSourcePort;
+use agent::{
+    app::{
+        event::SandboxEvent,
+        runtime::SessionDeps,
+    },
+    ports::broker::BrokerPort,
+};
 use kernel::app::api_ports::EventInletPort;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    match std::env::args().nth(1).as_deref() {
+    let args = Args::parse();
+    match args.mode.as_deref() {
         Some("simulate") => simulate().await,
-        Some("service") => service_mode().await,
+        Some("service") => service_mode(&args).await,
         Some("etw-probe") => etw_probe().await,
-        _ => console().await,
+        _ => console(&args).await,
     }
 }
 
-/// Demo configuration standing in for `C:\Agent.toml` until the config
-/// subcommand lands; validation runs exactly like production would.
+/// Parsed command line.
+struct Args {
+    /// Positional mode (`None` = console).
+    mode: Option<String>,
+    /// Config file location.
+    config_path: PathBuf,
+    /// Console mode over fakes (dev only).
+    demo: bool,
+}
+
+impl Args {
+    fn parse() -> Self {
+        Self::parse_from(std::env::args_os().skip(1))
+    }
+
+    /// Parse an explicit argv (SCM passes the service command line here).
+    fn parse_from<I>(args: I) -> Self
+    where
+        I: IntoIterator<Item = std::ffi::OsString>,
+    {
+        let mut parsed =
+            Self { mode: None, config_path: PathBuf::from("C:\\Agent.toml"), demo: false };
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            match arg.to_string_lossy().as_ref() {
+                "--config" => {
+                    if let Some(path) = args.next() {
+                        parsed.config_path = PathBuf::from(path);
+                    }
+                }
+                "--demo" => parsed.demo = true,
+                positional => {
+                    if parsed.mode.is_none() {
+                        parsed.mode = Some(positional.to_owned());
+                    }
+                }
+            }
+        }
+        parsed
+    }
+}
+
+/// Demo configuration standing in for `C:\Agent.toml` in fake-backed modes;
+/// validation runs exactly like production would.
 fn demo_config() -> anyhow::Result<protocol::config::AgentConfig> {
     let mut config = protocol::config::AgentConfig::default();
     config.target.path = "C:\\Targets\\evil.exe".into();
@@ -32,6 +90,22 @@ fn demo_config() -> anyhow::Result<protocol::config::AgentConfig> {
     config.drops.extensions = vec![".txt".into(), ".exe".into()];
     config.validate()?;
     Ok(config)
+}
+
+/// Production wiring: strict TOML config, real NATS broker (legacy retry
+/// budget), config-driven scope DB location.
+async fn production_session_deps(config_path: &std::path::Path) -> anyhow::Result<SessionDeps> {
+    let config = Arc::new(agent::adapters::config_toml::load(config_path)?);
+    let broker = agent::adapters::broker_nats::NatsBrokerAdapter::connect(&config.broker).await?;
+    tracing::info!(uri = %config.broker.uri, "NATS broker connected");
+    Ok(SessionDeps {
+        config: Arc::clone(&config),
+        scope_repo: Arc::new(agent::adapters::scope_store_json::JsonScopeRepository::new(
+            config.study.scope_path.clone(),
+        )),
+        broker: Arc::new(broker),
+        clock: Arc::new(agent::adapters::clock_system::SystemClock),
+    })
 }
 
 fn demo_script() -> Vec<SandboxEvent> {
@@ -111,21 +185,31 @@ async fn simulate() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Full runtime on this host: real clock, file-backed scope, Ctrl+C to stop.
-async fn console() -> anyhow::Result<()> {
-    println!("{} v{} (console)", agent::NAME, env!("CARGO_PKG_VERSION"));
-    let clock = Arc::new(agent::adapters::clock_system::SystemClock);
-    let broker = Arc::new(agent::adapters::broker_fake::FakeBroker::default());
-    let repo = Arc::new(agent::adapters::scope_store_json::JsonScopeRepository::new("scope.json"));
+/// Full runtime on this host: real config + broker, real clock, Ctrl+C to
+/// stop. `--demo` swaps every adapter for a fake (dev boxes without NATS).
+async fn console(args: &Args) -> anyhow::Result<()> {
+    let (session_deps, broker_kind) = if args.demo {
+        println!("{} v{} (console, demo)", agent::NAME, env!("CARGO_PKG_VERSION"));
+        (
+            SessionDeps {
+                config: Arc::new(demo_config()?),
+                scope_repo: Arc::new(agent::adapters::scope_store_json::JsonScopeRepository::new(
+                    "scope.json",
+                )),
+                broker: Arc::new(agent::adapters::broker_fake::FakeBroker::default())
+                    as Arc<dyn BrokerPort>,
+                clock: Arc::new(agent::adapters::clock_system::SystemClock),
+            },
+            "fake broker (demo)".to_owned(),
+        )
+    } else {
+        println!("{} v{} (console)", agent::NAME, env!("CARGO_PKG_VERSION"));
+        (production_session_deps(&args.config_path).await?, args.config_path.display().to_string())
+    };
+    println!("config: {broker_kind}");
 
     let (session, stop_tx, stop_rx) =
-        agent::app::runtime::RunningSession::start(agent::app::runtime::SessionDeps {
-            config: Arc::new(demo_config()?),
-            scope_repo: repo,
-            broker,
-            clock,
-        })
-        .await?;
+        agent::app::runtime::RunningSession::start(session_deps).await?;
 
     // Ctrl+C → ServiceStop (the same event SCM delivers).
     let ctrl_c_tx = stop_tx.clone();
@@ -165,7 +249,7 @@ async fn attach_etw(session: &agent::app::runtime::RunningSession) {
 /// SCM service mode (feature `service`).
 #[cfg(all(windows, feature = "service"))]
 #[allow(clippy::unused_async)] // dispatch signature parity across features
-async fn service_mode() -> anyhow::Result<()> {
+async fn service_mode(_args: &Args) -> anyhow::Result<()> {
     windows_service::service_dispatcher::start(
         agent::adapters::service_control::SERVICE_NAME,
         ffi_service_main,
@@ -176,7 +260,7 @@ async fn service_mode() -> anyhow::Result<()> {
 /// Console fallback when built without the `service` feature.
 #[cfg(not(all(windows, feature = "service")))]
 #[allow(clippy::unused_async)] // signature parity with the real service mode
-async fn service_mode() -> anyhow::Result<()> {
+async fn service_mode(_args: &Args) -> anyhow::Result<()> {
     anyhow::bail!("service mode requires building with --features service")
 }
 
@@ -185,7 +269,7 @@ async fn service_mode() -> anyhow::Result<()> {
 async fn etw_probe() -> anyhow::Result<()> {
     struct RecordingInlet;
     #[async_trait::async_trait]
-    impl EventInletPort<SandboxEvent> for RecordingInlet {
+    impl kernel::app::api_ports::EventInletPort<SandboxEvent> for RecordingInlet {
         async fn accept(&self, event: SandboxEvent) {
             if let SandboxEvent::Source(source) = event {
                 println!("  {} :: {source:?}", source.event_type());
@@ -200,7 +284,8 @@ async fn etw_probe() -> anyhow::Result<()> {
         format!("{}-probe", agent::adapters::etw_adapter::SESSION_NAME),
     ));
 
-    let inlet: Arc<dyn EventInletPort<SandboxEvent>> = Arc::new(RecordingInlet);
+    let inlet: Arc<dyn kernel::app::api_ports::EventInletPort<SandboxEvent>> =
+        Arc::new(RecordingInlet);
     let run = adapter.run(inlet);
     match tokio::time::timeout(std::time::Duration::from_secs(seconds), run).await {
         Err(_elapsed) => {
@@ -225,11 +310,11 @@ windows_service::define_windows_service!(ffi_service_main, service_main);
 
 /// Service entry: same runtime as console, stop fed by the SCM handler.
 #[cfg(all(windows, feature = "service"))]
-fn service_main(_args: Vec<std::ffi::OsString>) {
+fn service_main(args: Vec<std::ffi::OsString>) {
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build();
     match runtime {
         Ok(rt) => {
-            if let Err(error) = rt.block_on(run_service_body()) {
+            if let Err(error) = rt.block_on(run_service_body(args)) {
                 eprintln!("service body failed: {error}");
             }
         }
@@ -239,19 +324,13 @@ fn service_main(_args: Vec<std::ffi::OsString>) {
 
 /// Same runtime as console; stop fed by the SCM control handler.
 #[cfg(all(windows, feature = "service"))]
-async fn run_service_body() -> anyhow::Result<()> {
-    let clock = Arc::new(agent::adapters::clock_system::SystemClock);
-    let broker = Arc::new(agent::adapters::broker_fake::FakeBroker::default());
-    let repo = Arc::new(agent::adapters::scope_store_json::JsonScopeRepository::new("scope.json"));
+async fn run_service_body(args: Vec<std::ffi::OsString>) -> anyhow::Result<()> {
+    // SCM passes the service command line (ImagePath arguments included), so
+    // `--config <path>` set at install time lands here.
+    let args = Args::parse_from(args);
+    let deps = production_session_deps(&args.config_path).await?;
 
-    let (session, stop_tx, stop_rx) =
-        agent::app::runtime::RunningSession::start(agent::app::runtime::SessionDeps {
-            config: Arc::new(demo_config()?),
-            scope_repo: repo,
-            broker,
-            clock,
-        })
-        .await?;
+    let (session, stop_tx, stop_rx) = agent::app::runtime::RunningSession::start(deps).await?;
 
     // SCM handler (sync thread) → runtime stop channel (async).
     let (scm_tx, scm_rx) = std::sync::mpsc::channel::<SandboxEvent>();

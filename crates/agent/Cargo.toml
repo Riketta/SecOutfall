@@ -16,6 +16,8 @@ path = "src/bin/secoutfall-agent.rs"
 etw = ["dep:ferrisetw"]
 # Token-based interactive-session process launcher (CreateProcessAsUser spike).
 launcher = ["dep:windows"]
+# Registry-backed shell-association lookup for non-exe targets (Windows-only).
+associations = ["dep:windows"]
 # SCM service mode (windows-service).
 service = ["dep:windows-service"]
 
@@ -24,15 +26,27 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-nats.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
 ferrisetw = { workspace = true, optional = true }
+futures-core.workspace = true
 kernel.workspace = true
 parking_lot.workspace = true
 protocol.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "fs", "signal"] }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "fs",
+    "signal",
+    "io-util",
+] }
 tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
@@ -40,4 +54,7 @@ windows = { workspace = true, optional = true }
 windows-service = { workspace = true, optional = true }
 
 [dev-dependencies]
+# In-process HTTP server backing the multipart-uploader integration tests.
+axum = { version = "0.8", features = ["multipart"] }
+futures-util.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

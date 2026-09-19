@@ -2,9 +2,12 @@
 //! the simulation harness.
 
 pub mod broker_fake;
+pub mod broker_nats;
 pub mod clock_fake;
 pub mod clock_system;
+pub mod config_toml;
 pub mod event_source_fake;
+pub mod http_upload;
 pub mod launcher_fake;
 pub mod scheduler;
 pub mod scope_store_json;
@@ -16,6 +19,8 @@ pub mod etw_adapter;
 pub mod launcher_token;
 #[cfg(all(windows, feature = "service"))]
 pub mod service_control;
+#[cfg(all(windows, feature = "associations"))]
+pub mod shell_association_registry;
 
 /// Pure ETW → taxonomy mapping; platform-independent and always tested.
 pub mod etw_mapping;

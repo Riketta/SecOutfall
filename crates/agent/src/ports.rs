@@ -5,3 +5,5 @@ pub mod clock;
 pub mod event_source;
 pub mod process_launcher;
 pub mod scope_repository;
+pub mod shell_association;
+pub mod uploader;
