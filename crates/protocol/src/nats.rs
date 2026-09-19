@@ -10,10 +10,9 @@ use serde::{
 };
 use uuid::Uuid;
 
-use crate::{
-    events::EventType,
-    payload::Payload,
-};
+use crate::events::EventType;
+#[doc(inline)]
+pub use crate::payload::Payload;
 
 /// Wire protocol version carried in every envelope.
 pub const PROTOCOL_VERSION: u32 = 3;

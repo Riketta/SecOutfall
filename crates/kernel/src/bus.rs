@@ -10,6 +10,7 @@ use crate::app::plugin_ports::event_bus_port::EventBusPort;
 /// Bounded in-memory bus. Overflow policy: the publisher never blocks; slow
 /// subscribers lose events and see `RecvError::Lagged` — they must count the loss
 /// and report it.
+#[derive(Clone)]
 pub struct InMemoryEventBus<E> {
     sender: broadcast::Sender<E>,
 }

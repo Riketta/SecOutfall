@@ -1,1 +1,4 @@
-//! Agent domain model: study, session, scope aggregate, drops (later phases).
+//! Agent domain model: study/session/scope aggregates and drop detection.
+
+pub mod drop_filter;
+pub mod scope;

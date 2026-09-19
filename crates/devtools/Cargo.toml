@@ -16,3 +16,10 @@ path = "src/bin/session-sim.rs"
 
 [lints]
 workspace = true
+
+[dependencies]
+agent.workspace = true
+anyhow.workspace = true
+kernel.workspace = true
+protocol.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

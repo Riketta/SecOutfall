@@ -138,7 +138,7 @@ fn pipeline(log: &Log) -> KernelService<TestEvent, (), InMemoryEventBus<TestEven
 #[tokio::test]
 async fn lifecycle_runs_init_all_then_start_all_and_stops_reversed() {
     let log: Log = Arc::default();
-    let kernel = KernelService::new(
+    let kernel = KernelService::<TestEvent, (), InMemoryEventBus<TestEvent>, TestEvent>::new(
         vec![Arc::new(LifecyclePlugin::new("a", &log)), Arc::new(LifecyclePlugin::new("b", &log))],
         Vec::new(),
         InMemoryEventBus::<TestEvent>::new(8),
@@ -156,7 +156,7 @@ async fn boot_fails_on_first_init_error() {
     let log: Log = Arc::default();
     let mut failing = LifecyclePlugin::new("bad", &log);
     failing.fail_init = true;
-    let kernel = KernelService::new(
+    let kernel = KernelService::<TestEvent, (), InMemoryEventBus<TestEvent>, TestEvent>::new(
         vec![Arc::new(LifecyclePlugin::new("ok", &log)), Arc::new(failing)],
         Vec::new(),
         InMemoryEventBus::<TestEvent>::new(8),
@@ -180,7 +180,7 @@ async fn full_chain_runs_all_pre_then_post_reversed() {
 #[tokio::test]
 async fn stop_skips_remaining_pre_but_runs_post_of_ran_plugins() {
     let log: Log = Arc::default();
-    let kernel = KernelService::new(
+    let kernel = KernelService::<TestEvent, (), InMemoryEventBus<TestEvent>, TestEvent>::new(
         Vec::new(),
         vec![
             Arc::new(PipelinePlugin::continuing("m1", &log)),
@@ -199,7 +199,7 @@ async fn stop_skips_remaining_pre_but_runs_post_of_ran_plugins() {
 #[tokio::test]
 async fn abort_skips_remaining_pre_and_all_post() {
     let log: Log = Arc::default();
-    let kernel = KernelService::new(
+    let kernel = KernelService::<TestEvent, (), InMemoryEventBus<TestEvent>, TestEvent>::new(
         Vec::new(),
         vec![
             Arc::new(PipelinePlugin::continuing("m1", &log)),

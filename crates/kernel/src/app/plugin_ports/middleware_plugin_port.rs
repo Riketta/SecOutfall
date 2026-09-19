@@ -2,10 +2,9 @@
 
 use async_trait::async_trait;
 
-use crate::{
-    app::plugin_ports::plugin_port::PluginPort,
-    models::Next,
-};
+use crate::app::plugin_ports::plugin_port::PluginPort;
+#[doc(inline)]
+pub use crate::models::Next;
 
 /// A plugin that intercepts inbound events implements this in addition to
 /// [`PluginPort`]. Steps run forward through `pre`, backward through `post`.

@@ -1,6 +1,9 @@
 //! The kernel: plugin registries, event bus wiring, and the pipeline runner.
 
-use std::sync::Arc;
+use std::{
+    marker::PhantomData,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 
@@ -20,18 +23,25 @@ use crate::{
 };
 
 /// The inner hexagon. Assembles the chain, but never knows what is in it.
+///
+/// `D` is the derived bus event type — a different taxonomy from inbound `E`
+/// (doctrine: the bus never carries raw inbound events). Defaults to `E` for
+/// simple deployments and tests.
 #[allow(clippy::module_name_repetitions)]
-pub struct KernelService<E, S, B> {
+pub struct KernelService<E, S, B, D = E> {
     plugins: Vec<Arc<dyn PluginPort>>,
     middleware: Vec<Arc<dyn MiddlewarePluginPort<E, S>>>,
     event_bus: B,
     services: S,
+    // `fn() -> D` marker: always Send + Sync, unlike plain PhantomData<D>.
+    _bus_events: PhantomData<fn() -> D>,
 }
 
-impl<E, S, B> KernelService<E, S, B>
+impl<E, S, B, D> KernelService<E, S, B, D>
 where
-    B: EventBusPort<E>,
-    E: Clone + Send,
+    B: EventBusPort<D>,
+    D: Clone + Send,
+    E: Send + 'static,
 {
     /// Assemble the kernel from plugin registries and injected services.
     #[must_use]
@@ -41,7 +51,7 @@ where
         event_bus: B,
         services: S,
     ) -> Self {
-        Self { plugins, middleware, event_bus, services }
+        Self { plugins, middleware, event_bus, services, _bus_events: PhantomData }
     }
 
     /// Boot: `init` all plugins first, then `start` all — a plugin's start may
@@ -89,10 +99,11 @@ where
 }
 
 #[async_trait]
-impl<E, S, B> EventInletPort<E> for KernelService<E, S, B>
+impl<E, S, B, D> EventInletPort<E> for KernelService<E, S, B, D>
 where
-    B: EventBusPort<E>,
-    E: Clone + Send + 'static,
+    B: EventBusPort<D>,
+    D: Clone + Send + 'static,
+    E: Send + 'static,
     S: Send + Sync + 'static,
 {
     async fn accept(&self, mut event: E) {

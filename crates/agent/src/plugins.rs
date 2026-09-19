@@ -1,2 +1,6 @@
-//! Hexagon plugins: scope-tracker, event-reporter, drops-collector, finalizer,
-//! and the rest of the inventory in root `AGENTS.md` (phases 6–7).
+//! Hexagon plugins of the agent.
+
+pub mod event_reporter;
+pub mod scope_tracker;
+pub mod session_manager;
+pub mod wire;
