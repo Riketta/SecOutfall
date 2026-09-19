@@ -10,22 +10,34 @@ publish.workspace = true
 name = "secoutfall-agent"
 path = "src/bin/secoutfall-agent.rs"
 
+[features]
+# Live Windows Kernel ETW consumption (ferrisetw). Windows-only at runtime;
+# the pure mapping table (`adapters/etw_mapping`) is always compiled and tested.
+etw = ["dep:ferrisetw"]
+# Token-based interactive-session process launcher (CreateProcessAsUser spike).
+launcher = ["dep:windows"]
+# SCM service mode (windows-service).
+service = ["dep:windows-service"]
+
 [lints]
 workspace = true
 
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+ferrisetw = { workspace = true, optional = true }
 kernel.workspace = true
 parking_lot.workspace = true
 protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "fs"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "fs", "signal"] }
 tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+windows = { workspace = true, optional = true }
+windows-service = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

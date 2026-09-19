@@ -3,4 +3,5 @@
 pub mod broker;
 pub mod clock;
 pub mod event_source;
+pub mod process_launcher;
 pub mod scope_repository;
