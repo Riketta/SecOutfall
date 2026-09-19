@@ -5,6 +5,8 @@
 //! screenshots). Peers MUST reject frames exceeding [`MAX_PAYLOAD_LEN`] — never
 //! allocate attacker-chosen sizes.
 
+pub mod messages;
+
 use serde::{
     Deserialize,
     Serialize,
@@ -58,6 +60,9 @@ pub enum FrameError {
     /// Unknown message type — IPC v1 is strict; forward compat is a version bump.
     #[error("unknown message type {0:#06x}")]
     UnknownType(u16),
+    /// Screenshot payload shorter than the 4-byte sequence prefix.
+    #[error("screenshot payload needs {0} bytes minimum, got {1}")]
+    MalformedScreenshot(usize, usize),
 }
 
 impl FrameHeader {
