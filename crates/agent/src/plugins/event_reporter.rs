@@ -31,10 +31,8 @@ use protocol::{
     payload::{
         DropClosedData,
         DropObservedData,
-        Launcher,
         Payload,
         ScopeDiedData,
-        TargetLaunchedData,
     },
 };
 use tokio::{
@@ -130,20 +128,12 @@ async fn publish_bus_event(
     let (study_id, session_id) = identity(state);
     let now = clock.now_ms();
     let envelope = match event {
-        AgentBusEvent::TargetLaunched { name } => crate::plugins::wire::envelope_raw(
-            now,
-            next_seq(seq),
-            study_id,
-            session_id,
-            EventType::TargetLaunched,
-            Payload::TargetLaunched(TargetLaunchedData {
-                pid: None,
-                path: name,
-                args: None,
-                // Launch mechanism attribution lands with the launcher adapters.
-                launcher: Launcher::Token,
-            }),
-        ),
+        // `target.launched` is reported by the launcher itself (it owns the
+        // pid/args/mechanism facts); this bus event stays scoring fodder.
+        AgentBusEvent::TargetLaunched { .. }
+        | AgentBusEvent::ExtendScopeExpectation { .. }
+        | AgentBusEvent::ProcessEnteredScope { .. }
+        | AgentBusEvent::ProcessExitedScope { .. } => return,
         AgentBusEvent::DropObserved { path, pid } => crate::plugins::wire::envelope_raw(
             now,
             next_seq(seq),
@@ -170,9 +160,6 @@ async fn publish_bus_event(
         ),
         // Scope membership events are bus-internal (scoring/statistics fodder);
         // the raw process.started/stopped already hit the wire from `pre`.
-        AgentBusEvent::ProcessEnteredScope { .. } | AgentBusEvent::ProcessExitedScope { .. } => {
-            return;
-        }
     };
     publish_envelope(broker, envelope).await;
 }

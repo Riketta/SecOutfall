@@ -9,9 +9,12 @@ pub mod config_toml;
 pub mod event_source_fake;
 pub mod http_upload;
 pub mod launcher_fake;
+pub mod launcher_unavailable;
 pub mod scheduler;
 pub mod scope_store_json;
 pub mod scope_store_memory;
+pub mod shell_association_fake;
+pub mod upload_fake;
 
 #[cfg(all(windows, feature = "etw"))]
 pub mod etw_adapter;

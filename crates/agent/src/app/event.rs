@@ -40,6 +40,20 @@ pub enum SandboxEvent {
     InteractiveSessionReady,
     /// The service/console host asked the agent to stop.
     ServiceStop,
+    /// A decoded screenshot frame arrived from the user-actor (IPC v1).
+    ScreenshotReceived(ScreenshotFrame),
+}
+
+/// One screenshot frame handed over by the user-actor.
+///
+/// `Default` exists for the `mem::take` swap in the intake plugin; a default
+/// frame is never a real frame.
+#[derive(Debug, Clone, Default)]
+pub struct ScreenshotFrame {
+    /// Per-session screenshot sequence number (chosen by the user-actor).
+    pub seq: u32,
+    /// Raw JPEG bytes.
+    pub jpeg: Vec<u8>,
 }
 
 /// Source-observable telemetry, variant-for-variant identical to the
@@ -181,4 +195,11 @@ pub enum AgentBusEvent {
     },
     /// Every scoped process of the current session died (empty scope is NOT dead).
     ScopeDied,
+    /// The launcher resolved a target program image whose process name should
+    /// seed the scope expectation (non-exe targets launch via interpreters,
+    /// so the observed image differs from the configured target name).
+    ExtendScopeExpectation {
+        /// Image name (with extension) to expect in the scope.
+        name: String,
+    },
 }

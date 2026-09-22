@@ -27,7 +27,10 @@ use crate::{
         broker::BrokerPort,
         clock::SystemClockPort,
         event_source::EventSourcePort,
+        process_launcher::ProcessLauncherPort,
         scope_repository::ScopeRepository,
+        shell_association::ShellAssociationPort,
+        uploader::FileUploadPort,
     },
 };
 
@@ -41,6 +44,12 @@ pub struct SessionDeps {
     pub broker: Arc<dyn BrokerPort>,
     /// Time source.
     pub clock: Arc<dyn SystemClockPort>,
+    /// Controller upload transport (drops, screenshots).
+    pub uploader: Arc<dyn FileUploadPort>,
+    /// Interactive-session launcher (mechanism per config).
+    pub launcher: Arc<dyn ProcessLauncherPort>,
+    /// Shell-association resolver for non-exe targets.
+    pub shell: Arc<dyn ShellAssociationPort>,
 }
 
 /// A running session: the assembled kernel plus its driving handles.
@@ -69,6 +78,9 @@ impl RunningSession {
             scope_repo: Arc::clone(&deps.scope_repo),
             broker: Arc::clone(&deps.broker),
             clock: Arc::clone(&deps.clock),
+            uploader: Arc::clone(&deps.uploader),
+            launcher: Arc::clone(&deps.launcher),
+            shell: Arc::clone(&deps.shell),
             bus,
         }));
         kernel.boot().await?;

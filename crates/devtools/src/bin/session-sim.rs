@@ -57,6 +57,12 @@ async fn main() -> anyhow::Result<()> {
                 as Arc<dyn agent::ports::scope_repository::ScopeRepository>,
             broker: Arc::clone(&broker) as Arc<dyn agent::ports::broker::BrokerPort>,
             clock: Arc::clone(&clock) as Arc<dyn agent::ports::clock::SystemClockPort>,
+            uploader: Arc::new(agent::adapters::upload_fake::FakeUploader::default())
+                as Arc<dyn agent::ports::uploader::FileUploadPort>,
+            launcher: Arc::new(agent::adapters::launcher_fake::FakeLauncher::default())
+                as Arc<dyn agent::ports::process_launcher::ProcessLauncherPort>,
+            shell: Arc::new(agent::adapters::shell_association_fake::FakeShellAssociation::new())
+                as Arc<dyn agent::ports::shell_association::ShellAssociationPort>,
             bus: kernel::bus::InMemoryEventBus::new(1024),
         });
 

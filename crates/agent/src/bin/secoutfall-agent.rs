@@ -24,7 +24,12 @@ use agent::{
         event::SandboxEvent,
         runtime::SessionDeps,
     },
-    ports::broker::BrokerPort,
+    ports::{
+        broker::BrokerPort,
+        process_launcher::ProcessLauncherPort,
+        shell_association::ShellAssociationPort,
+        uploader::FileUploadPort,
+    },
 };
 use kernel::app::api_ports::EventInletPort;
 
@@ -82,18 +87,23 @@ impl Args {
 }
 
 /// Demo configuration standing in for `C:\Agent.toml` in fake-backed modes;
-/// validation runs exactly like production would.
+/// validation runs exactly like production would. Writes go to the temp dir
+/// so the demo never pollutes the working directory.
 fn demo_config() -> anyhow::Result<protocol::config::AgentConfig> {
     let mut config = protocol::config::AgentConfig::default();
     config.target.path = "C:\\Targets\\evil.exe".into();
     config.study.uptimes = vec![6000];
     config.drops.extensions = vec![".txt".into(), ".exe".into()];
+    config.drops.path = std::env::temp_dir().join("secoutfall-demo-drops").display().to_string();
+    config.drops.upload_uri = None;
+    config.screenshots.path =
+        std::env::temp_dir().join("secoutfall-demo-shots").display().to_string();
     config.validate()?;
     Ok(config)
 }
 
 /// Production wiring: strict TOML config, real NATS broker (legacy retry
-/// budget), config-driven scope DB location.
+/// budget), HTTP uploader, config-driven scope DB location.
 async fn production_session_deps(config_path: &std::path::Path) -> anyhow::Result<SessionDeps> {
     let config = Arc::new(agent::adapters::config_toml::load(config_path)?);
     let broker = agent::adapters::broker_nats::NatsBrokerAdapter::connect(&config.broker).await?;
@@ -105,7 +115,50 @@ async fn production_session_deps(config_path: &std::path::Path) -> anyhow::Resul
         )),
         broker: Arc::new(broker),
         clock: Arc::new(agent::adapters::clock_system::SystemClock),
+        uploader: Arc::new(
+            agent::adapters::http_upload::HttpUploadAdapter::new()
+                .map_err(|error| anyhow::anyhow!("HTTP uploader unavailable: {error}"))?,
+        ),
+        launcher: production_launcher(&config),
+        shell: production_shell(),
     })
+}
+
+/// Launcher selection by config mechanism (adapter availability per feature).
+fn production_launcher(config: &protocol::config::AgentConfig) -> Arc<dyn ProcessLauncherPort> {
+    match config.platform.launch_mechanism {
+        protocol::config::LaunchMechanism::SchedTask => {
+            tracing::warn!("sched-task launcher not built yet; launching will fail");
+            Arc::new(agent::adapters::launcher_unavailable::UnavailableLauncher::new(
+                "the sched-task launcher adapter is not implemented yet",
+            ))
+        }
+        protocol::config::LaunchMechanism::Token => token_launcher(),
+    }
+}
+
+#[cfg(all(windows, feature = "launcher"))]
+fn token_launcher() -> Arc<dyn ProcessLauncherPort> {
+    Arc::new(agent::adapters::launcher_token::TokenProcessLauncher::new())
+}
+
+#[cfg(not(all(windows, feature = "launcher")))]
+fn token_launcher() -> Arc<dyn ProcessLauncherPort> {
+    tracing::warn!("token launcher not compiled in (build with --features launcher)");
+    Arc::new(agent::adapters::launcher_unavailable::UnavailableLauncher::new(
+        "build with --features launcher",
+    ))
+}
+
+/// Shell-association resolver (registry adapter is feature-gated).
+#[cfg(all(windows, feature = "associations"))]
+fn production_shell() -> Arc<dyn ShellAssociationPort> {
+    Arc::new(agent::adapters::shell_association_registry::RegistryShellAssociationAdapter::new())
+}
+
+#[cfg(not(all(windows, feature = "associations")))]
+fn production_shell() -> Arc<dyn ShellAssociationPort> {
+    Arc::new(agent::adapters::shell_association_fake::UnavailableShellAssociation)
 }
 
 fn demo_script() -> Vec<SandboxEvent> {
@@ -113,6 +166,15 @@ fn demo_script() -> Vec<SandboxEvent> {
         source_process_started(1000, None, "evil.exe"),
         source_process_started(1001, Some(1000), "cmd.exe"),
         source_file_written(1001, "C:\\Users\\victim\\payload.txt"),
+        // The close frees the drop for the collector (copy on close, not write).
+        SandboxEvent::Source(agent::app::event::SourceEvent::FileCleanedUp(
+            protocol::payload::FileReleasedData {
+                pid: 1001,
+                file_object: Some(1),
+                file_key: Some(2),
+                file_name: Some("C:\\Users\\victim\\payload.txt".to_owned()),
+            },
+        )),
         source_process_stopped(1001, "cmd.exe"),
         source_process_stopped(1000, "evil.exe"),
     ]
@@ -151,13 +213,16 @@ fn source_file_written(pid: u32, path: &str) -> SandboxEvent {
 }
 
 /// Phase-3 demo: one scripted session against fakes (kept for the walking
-/// skeleton history and quick end-to-end sanity checks).
+/// skeleton history and quick end-to-end sanity checks). In-memory scope DB:
+/// a demo must not inherit sessions from previous runs (a non-zero session
+/// count disables the session-0 target seeding — and rightly so).
 async fn simulate() -> anyhow::Result<()> {
     println!("{} v{} (simulate)", agent::NAME, env!("CARGO_PKG_VERSION"));
     let config = demo_config()?;
     let clock = Arc::new(agent::adapters::clock_fake::FakeClock::new(1_465_182_366_000));
     let broker = Arc::new(agent::adapters::broker_fake::FakeBroker::default());
-    let repo = Arc::new(agent::adapters::scope_store_json::JsonScopeRepository::new("scope.json"));
+    let uploader = Arc::new(agent::adapters::upload_fake::FakeUploader::default());
+    let repo = Arc::new(agent::adapters::scope_store_memory::InMemoryScopeRepository::default());
 
     let scope_state = agent::app::builder::load_scope_state(repo.as_ref()).await?;
     let kernel = agent::app::builder::assemble(agent::app::builder::AgentDeps {
@@ -166,22 +231,30 @@ async fn simulate() -> anyhow::Result<()> {
         scope_repo: Arc::clone(&repo) as Arc<dyn agent::ports::scope_repository::ScopeRepository>,
         broker: Arc::clone(&broker) as Arc<dyn agent::ports::broker::BrokerPort>,
         clock: Arc::clone(&clock) as Arc<dyn agent::ports::clock::SystemClockPort>,
+        uploader: Arc::clone(&uploader) as Arc<dyn FileUploadPort>,
+        launcher: Arc::new(agent::adapters::launcher_fake::FakeLauncher::default()),
+        shell: Arc::new(agent::adapters::shell_association_fake::FakeShellAssociation::new()),
         bus: kernel::bus::InMemoryEventBus::new(1024),
     });
 
     kernel.boot().await?;
     for event in demo_script() {
         kernel.accept(event).await;
-        tokio::task::yield_now().await;
+        // The collector acts on the bus asynchronously; yield between events.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     kernel.accept(SandboxEvent::SessionDeadline).await;
     kernel.shutdown().await;
 
     println!("published {} wire events this session", broker.event_sequence().len());
-    for envelope in broker.of_channel(agent::ports::broker::Channel::Control) {
-        println!("control: {}", envelope.event_type);
+    for envelope in broker.of_channel(agent::ports::broker::Channel::Event) {
+        println!("  event: {}", envelope.event_type);
     }
-    println!("scope persisted to scope.json");
+    for envelope in broker.of_channel(agent::ports::broker::Channel::Control) {
+        println!("  control: {}", envelope.event_type);
+    }
+    println!("collector uploads: {} (demo drop source does not exist)", uploader.uploads().len());
+    println!("scope state: in-memory (demo)");
     Ok(())
 }
 
@@ -199,6 +272,12 @@ async fn console(args: &Args) -> anyhow::Result<()> {
                 broker: Arc::new(agent::adapters::broker_fake::FakeBroker::default())
                     as Arc<dyn BrokerPort>,
                 clock: Arc::new(agent::adapters::clock_system::SystemClock),
+                uploader: Arc::new(agent::adapters::upload_fake::FakeUploader::default())
+                    as Arc<dyn FileUploadPort>,
+                launcher: Arc::new(agent::adapters::launcher_fake::FakeLauncher::default())
+                    as Arc<dyn ProcessLauncherPort>,
+                shell: Arc::new(agent::adapters::shell_association_fake::FakeShellAssociation::new())
+                    as Arc<dyn ShellAssociationPort>,
             },
             "fake broker (demo)".to_owned(),
         )

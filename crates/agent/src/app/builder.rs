@@ -28,17 +28,32 @@ use crate::{
         scope::SharedScopeState,
     },
     plugins::{
+        drops_collector::{
+            DropsCollectorDeps,
+            DropsCollectorPlugin,
+        },
         event_reporter::EventReporterPlugin,
         scope_tracker::ScopeTrackerPlugin,
+        screenshot_intake::{
+            ScreenshotIntakeDeps,
+            ScreenshotIntakePlugin,
+        },
         session_manager::{
             SessionManagerDeps,
             SessionManagerPlugin,
+        },
+        target_launcher::{
+            TargetLauncherDeps,
+            TargetLauncherPlugin,
         },
     },
     ports::{
         broker::BrokerPort,
         clock::SystemClockPort,
+        process_launcher::ProcessLauncherPort,
         scope_repository::ScopeRepository,
+        shell_association::ShellAssociationPort,
+        uploader::FileUploadPort,
     },
 };
 
@@ -72,6 +87,12 @@ pub struct AgentDeps {
     pub broker: Arc<dyn BrokerPort>,
     /// Time source.
     pub clock: Arc<dyn SystemClockPort>,
+    /// Controller upload transport (drops, screenshots).
+    pub uploader: Arc<dyn FileUploadPort>,
+    /// Interactive-session launcher (mechanism per config).
+    pub launcher: Arc<dyn ProcessLauncherPort>,
+    /// Shell-association resolver for non-exe targets.
+    pub shell: Arc<dyn ShellAssociationPort>,
     /// Derived-event bus (also handed to tests/simulator for extra assertions).
     pub bus: InMemoryEventBus<AgentBusEvent>,
 }
@@ -143,10 +164,48 @@ pub fn assemble(deps: AgentDeps) -> AgentKernel {
         Arc::clone(&seq),
     ));
 
-    let plugins: Vec<Arc<dyn PluginPort>> =
-        vec![session_manager.clone(), tracker.clone(), reporter.clone()];
+    let drops_collector = Arc::new(DropsCollectorPlugin::new(DropsCollectorDeps {
+        state: Arc::clone(&deps.scope_state),
+        config: Arc::new(deps.config.drops.clone()),
+        uploader: Arc::clone(&deps.uploader),
+        broker: Arc::clone(&deps.broker),
+        clock: Arc::clone(&deps.clock),
+        seq: Arc::clone(&seq),
+        bus: deps.bus.clone(),
+    }));
+
+    let screenshot_intake = Arc::new(ScreenshotIntakePlugin::new(ScreenshotIntakeDeps {
+        state: Arc::clone(&deps.scope_state),
+        config: Arc::new(deps.config.screenshots.clone()),
+        capture_enabled: deps.config.user_actor.screencapture,
+        uploader: Arc::clone(&deps.uploader),
+        broker: Arc::clone(&deps.broker),
+        clock: Arc::clone(&deps.clock),
+        seq: Arc::clone(&seq),
+        bus: deps.bus.clone(),
+    }));
+
+    let target_launcher = Arc::new(TargetLauncherPlugin::new(TargetLauncherDeps {
+        state: Arc::clone(&deps.scope_state),
+        config: Arc::clone(&deps.config),
+        launcher: Arc::clone(&deps.launcher),
+        shell: Arc::clone(&deps.shell),
+        broker: Arc::clone(&deps.broker),
+        clock: Arc::clone(&deps.clock),
+        seq: Arc::clone(&seq),
+        bus: deps.bus.clone(),
+    }));
+
+    let plugins: Vec<Arc<dyn PluginPort>> = vec![
+        session_manager.clone(),
+        tracker.clone(),
+        reporter.clone(),
+        drops_collector.clone(),
+        screenshot_intake.clone(),
+        target_launcher.clone(),
+    ];
     let middleware: Vec<Arc<dyn MiddlewarePluginPort<SandboxEvent, AgentServices>>> =
-        vec![session_manager, tracker, reporter];
+        vec![session_manager, tracker, reporter, screenshot_intake, target_launcher];
 
     KernelService::new(plugins, middleware, deps.bus, services)
 }

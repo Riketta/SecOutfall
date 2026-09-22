@@ -19,6 +19,8 @@ use kernel::{
     bus::InMemoryEventBus,
 };
 use parking_lot::Mutex;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     app::event::{
@@ -40,12 +42,15 @@ use crate::{
 /// mutates the shared [`crate::domain::scope::ScopeState`].
 pub struct ScopeTrackerPlugin {
     state: SharedScopeState,
-    tracker: Mutex<ScopeTracker>,
+    tracker: Arc<Mutex<ScopeTracker>>,
     filter: Arc<DropFilter>,
     target_name: String,
     every_session: bool,
     bus: InMemoryEventBus<AgentBusEvent>,
     clock: Arc<dyn SystemClockPort>,
+    /// Bus consumer for `ExtendScopeExpectation` (from the target launcher).
+    consumer: Mutex<Option<JoinHandle<()>>>,
+    cancel: CancellationToken,
 }
 
 impl ScopeTrackerPlugin {
@@ -59,8 +64,17 @@ impl ScopeTrackerPlugin {
         bus: InMemoryEventBus<AgentBusEvent>,
         clock: Arc<dyn SystemClockPort>,
     ) -> Self {
-        let tracker = ScopeTracker::default();
-        Self { state, tracker: Mutex::new(tracker), filter, target_name, every_session, bus, clock }
+        Self {
+            state,
+            tracker: Arc::new(Mutex::new(ScopeTracker::default())),
+            filter,
+            target_name,
+            every_session,
+            bus,
+            clock,
+            consumer: Mutex::new(None),
+            cancel: CancellationToken::new(),
+        }
     }
 }
 
@@ -77,6 +91,41 @@ impl PluginPort for ScopeTrackerPlugin {
         let session_count = self.state.lock().sessions.len();
         if session_count == 1 || self.every_session {
             self.tracker.lock().expect(&self.target_name);
+        }
+
+        // The launcher resolves non-exe targets through interpreters (a `.js`
+        // sample runs as `wscript.exe`) and tells us over the bus which image
+        // to expect next.
+        let mut receiver = self.bus.subscribe();
+        let cancel = self.cancel.clone();
+        let tracker = Arc::clone(&self.tracker);
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => break,
+                    event = receiver.recv() => match event {
+                        Ok(AgentBusEvent::ExtendScopeExpectation { name }) => {
+                            tracker.lock().expect(&name);
+                        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                            tracing::warn!(lost = count, "scope-tracker bus lag");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                }
+            }
+        });
+        *self.consumer.lock() = Some(handle);
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<(), kernel::models::PluginError> {
+        self.cancel.cancel();
+        let handle = self.consumer.lock().take();
+        if let Some(handle) = handle {
+            let _ = handle.await;
         }
         Ok(())
     }

@@ -13,7 +13,10 @@ use agent::{
     adapters::{
         broker_fake::FakeBroker,
         clock_fake::FakeClock,
+        launcher_fake::FakeLauncher,
         scope_store_memory::InMemoryScopeRepository,
+        shell_association_fake::FakeShellAssociation,
+        upload_fake::FakeUploader,
     },
     app::{
         builder::{
@@ -125,6 +128,12 @@ async fn run_boot(
         scope_repo: Arc::clone(repo) as Arc<dyn agent::ports::scope_repository::ScopeRepository>,
         broker: Arc::clone(&broker) as Arc<dyn agent::ports::broker::BrokerPort>,
         clock: Arc::clone(&clock) as Arc<dyn agent::ports::clock::SystemClockPort>,
+        uploader: Arc::new(FakeUploader::default())
+            as Arc<dyn agent::ports::uploader::FileUploadPort>,
+        launcher: Arc::new(FakeLauncher::default())
+            as Arc<dyn agent::ports::process_launcher::ProcessLauncherPort>,
+        shell: Arc::new(FakeShellAssociation::new())
+            as Arc<dyn agent::ports::shell_association::ShellAssociationPort>,
         bus: InMemoryEventBus::new(1024),
     });
 
@@ -140,17 +149,38 @@ async fn run_boot(
     Boot { broker }
 }
 
+fn boot0_sequence() -> Vec<EventType> {
+    vec![
+        EventType::AgentState,
+        EventType::SessionStarted,
+        EventType::ProcessStarted, // explorer.exe (marker)
+        EventType::TargetLaunched, // launcher detonates on the marker
+        EventType::ProcessStarted, // evil.exe
+        EventType::ProcessStarted, // cmd.exe
+        EventType::ProcessStarted, // notepad.exe (unscoped, still forwarded)
+        EventType::FileWritten,    // a.txt
+        EventType::DropObserved,
+        EventType::FileWritten, // unscoped.txt (no drop: unscoped writer)
+        EventType::FileClosed,  // a.txt
+        EventType::DropClosed,
+        EventType::ProcessStopped, // cmd.exe (no scope.died: evil alive)
+        EventType::SessionFinalizing,
+        EventType::SessionEnded,
+    ]
+}
+
 #[tokio::test]
 async fn three_session_study_reboots_then_shuts_down() {
     let config = base_config(vec![6000, 6000, 6000], false);
     let repo = Arc::new(InMemoryScopeRepository::default());
 
-    // Session 0: target + child join, one drop observed and closed, one
-    // unscoped process whose telemetry still forwards (Full verbosity).
+    // Session 0: marker (launch) + target + child join, one drop observed and
+    // closed, one unscoped process whose telemetry still forwards.
     let boot0 = run_boot(
         &config,
         &repo,
         &[
+            process_started(999, None, "explorer.exe"),
             process_started(1000, None, "evil.exe"),
             process_started(1001, Some(1000), "cmd.exe"),
             process_started(2000, None, "notepad.exe"),
@@ -163,26 +193,22 @@ async fn three_session_study_reboots_then_shuts_down() {
     )
     .await;
 
-    assert_eq!(
-        boot0.broker.event_sequence(),
-        vec![
-            EventType::AgentState,
-            EventType::SessionStarted,
-            EventType::ProcessStarted, // evil.exe
-            EventType::TargetLaunched,
-            EventType::ProcessStarted, // cmd.exe
-            EventType::ProcessStarted, // notepad.exe (unscoped, still forwarded)
-            EventType::FileWritten,    // a.txt
-            EventType::DropObserved,
-            EventType::FileWritten, // unscoped.txt (no drop: unscoped writer)
-            EventType::FileClosed,  // a.txt
-            EventType::DropClosed,
-            EventType::ProcessStopped, // cmd.exe (no scope.died: evil alive)
-            EventType::SessionFinalizing,
-            EventType::SessionEnded,
-        ],
-        "session 0 wire sequence"
-    );
+    assert_eq!(boot0.broker.event_sequence(), boot0_sequence(), "session 0 wire sequence");
+    // The launcher owns target.launched and reports real facts.
+    let launched = boot0
+        .broker
+        .of_channel(Channel::Event)
+        .into_iter()
+        .find(|envelope| envelope.event_type == EventType::TargetLaunched)
+        .unwrap();
+    match launched.data {
+        protocol::payload::Payload::TargetLaunched(data) => {
+            assert_eq!(data.path, "C:\\Targets\\evil.exe");
+            assert_eq!(data.pid, Some(0), "FakeLauncher assigns sequential pids");
+            assert!(matches!(data.launcher, protocol::payload::Launcher::Token));
+        }
+        other => panic!("unexpected payload: {other:?}"),
+    }
     assert_eq!(
         boot0.broker.of_channel(Channel::Control).len(),
         1,
@@ -200,11 +226,16 @@ async fn three_session_study_reboots_then_shuts_down() {
     seqs.sort_unstable();
     assert_eq!(seqs, (0..seqs.len() as u64).collect::<Vec<u64>>());
 
-    // Session 1: the target rejoins (every_session), no drops, deadline.
+    // Session 1: the marker re-triggers the launch (every_session), the target
+    // rejoins, no closes, deadline.
     let boot1 = run_boot(
         &config,
         &repo,
-        &[process_started(3000, None, "evil.exe"), file_written(3000, "C:\\Users\\victim\\b.txt")],
+        &[
+            process_started(4000, None, "explorer.exe"),
+            process_started(3000, None, "evil.exe"),
+            file_written(3000, "C:\\Users\\victim\\b.txt"),
+        ],
         true,
     )
     .await;
@@ -213,8 +244,9 @@ async fn three_session_study_reboots_then_shuts_down() {
         vec![
             EventType::AgentState,
             EventType::SessionStarted,
-            EventType::ProcessStarted,
+            EventType::ProcessStarted, // explorer.exe (marker)
             EventType::TargetLaunched,
+            EventType::ProcessStarted,
             EventType::FileWritten,
             EventType::DropObserved,
             EventType::SessionFinalizing,
@@ -267,6 +299,7 @@ async fn autoshutdown_finalizes_on_real_scope_death_only_once() {
         &config,
         &repo,
         &[
+            process_started(999, None, "explorer.exe"),
             process_started(1000, None, "evil.exe"),
             process_started(1001, Some(1000), "cmd.exe"),
             process_stopped(1001, "cmd.exe"),
@@ -292,9 +325,10 @@ async fn autoshutdown_finalizes_on_real_scope_death_only_once() {
         vec![
             EventType::AgentState,
             EventType::SessionStarted,
-            EventType::ProcessStarted,
+            EventType::ProcessStarted, // explorer.exe (marker)
             EventType::TargetLaunched,
-            EventType::ProcessStarted,
+            EventType::ProcessStarted, // evil.exe
+            EventType::ProcessStarted, // cmd.exe
             EventType::ProcessStopped, // cmd.exe (evil still alive: no death)
             EventType::ProcessStopped, // evil.exe
         ],
@@ -325,15 +359,22 @@ async fn uptimes_overrun_is_dynamic_not_a_panic() {
     );
     assert_eq!(boot0.broker.event_sequence().get(1), Some(&EventType::SessionStarted));
     // The controller ignores the request and reboots anyway (VM bounced again):
-    let boot1 = run_boot(&config, &repo, &[process_started(5000, None, "evil.exe")], true).await;
+    let boot1 = run_boot(
+        &config,
+        &repo,
+        &[process_started(4000, None, "explorer.exe"), process_started(5000, None, "evil.exe")],
+        true,
+    )
+    .await;
     // Session 1 runs dynamic (no scheduled duration) and still finalizes.
     assert_eq!(
         boot1.broker.event_sequence(),
         vec![
             EventType::AgentState,
             EventType::SessionStarted,
-            EventType::ProcessStarted,
+            EventType::ProcessStarted, // explorer.exe (marker)
             EventType::TargetLaunched,
+            EventType::ProcessStarted,
             EventType::SessionFinalizing,
             EventType::SessionEnded,
         ]
