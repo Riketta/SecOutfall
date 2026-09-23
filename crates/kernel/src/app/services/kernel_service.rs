@@ -65,7 +65,10 @@ where
     /// # Errors
     /// [`KernelError::Lifecycle`] naming the first failed plugin, after the
     /// rollback completed.
-    pub async fn boot(&self) -> Result<(), KernelError> {
+    pub async fn boot(&self) -> Result<(), KernelError>
+    where
+        S: Sync,
+    {
         for (index, plugin) in self.plugins.iter().enumerate() {
             if let Err(source) = plugin.init().await {
                 self.rollback(index).await;
@@ -84,7 +87,10 @@ where
     }
 
     /// Best-effort reverse-order `stop` of the first `count` plugins.
-    async fn rollback(&self, count: usize) {
+    async fn rollback(&self, count: usize)
+    where
+        S: Sync,
+    {
         for plugin in self.plugins.iter().take(count).rev() {
             if let Err(error) = plugin.stop().await {
                 tracing::warn!(plugin = plugin.name(), %error, "boot rollback stop failed");
@@ -94,7 +100,10 @@ where
 
     /// Shutdown: `stop` all plugins in reverse registration order. Best-effort:
     /// failures are logged, remaining plugins are still stopped.
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(&self)
+    where
+        S: Sync,
+    {
         for plugin in self.plugins.iter().rev() {
             if let Err(error) = plugin.stop().await {
                 tracing::error!(plugin = plugin.name(), %error, "plugin stop failed");
