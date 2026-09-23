@@ -24,11 +24,23 @@ use crate::{
         SharedRuntime,
     },
     plugins::{
+        activities::{
+            ActivityEnv,
+            ScriptedActivity,
+            calc_script,
+            explorer_script,
+            notepad_script,
+        },
         config_apply::ConfigApplyPlugin,
         focus_watch::FocusWatchPlugin,
         reactive::ReactivePlugin,
+        scripted::{
+            ScriptedRunnerDeps,
+            ScriptedRunnerPlugin,
+        },
     },
     ports::{
+        AppLauncherPort,
         InputSynthesisPort,
         ScreenCapturePort,
         ScreenshotSinkPort,
@@ -51,6 +63,8 @@ pub struct ActorDeps {
     pub sink: Arc<dyn ScreenshotSinkPort>,
     /// Reactive input synthesis.
     pub input: Arc<dyn InputSynthesisPort>,
+    /// Scripted-activity app launcher.
+    pub launcher: Arc<dyn AppLauncherPort>,
 }
 
 /// Assemble the kernel. Registration order matters: the config must be
@@ -61,12 +75,23 @@ pub fn assemble(deps: ActorDeps) -> ActorKernel {
 
     let config_apply = Arc::new(ConfigApplyPlugin::new(deps.bus.clone()));
     let focus_watch = Arc::new(FocusWatchPlugin::new(deps.bus.clone(), deps.capture, deps.sink));
-    let reactive = Arc::new(ReactivePlugin::new(deps.bus.clone(), deps.input, deps.runtime));
+    let reactive =
+        Arc::new(ReactivePlugin::new(deps.bus.clone(), deps.input.clone(), deps.runtime));
+
+    // Scripted activities (notepad/calc/explorer), driven by the runner and
+    // gated at runtime by the pushed `scripted` flag.
+    let env = ActivityEnv { launcher: deps.launcher, input: deps.input };
+    let activities: Vec<Arc<dyn crate::plugins::scripted::ActivityPort>> = vec![
+        ScriptedActivity::new("notepad", notepad_script(), env.clone()),
+        ScriptedActivity::new("calc", calc_script(), env.clone()),
+        ScriptedActivity::new("explorer", explorer_script(), env),
+    ];
+    let scripted_runner = Arc::new(ScriptedRunnerPlugin::new(ScriptedRunnerDeps { activities }));
 
     let plugins: Vec<Arc<dyn PluginPort>> =
-        vec![config_apply.clone(), focus_watch.clone(), reactive.clone()];
+        vec![config_apply.clone(), focus_watch.clone(), reactive.clone(), scripted_runner.clone()];
     let middleware: Vec<Arc<dyn MiddlewarePluginPort<ActorEvent, ActorServices>>> =
-        vec![config_apply, focus_watch];
+        vec![config_apply, focus_watch, scripted_runner];
 
     KernelService::new(plugins, middleware, deps.bus, services)
 }

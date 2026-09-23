@@ -24,6 +24,7 @@ use protocol::{
 };
 use user_actor::{
     adapters::{
+        app_launcher_fake::FakeAppLauncher,
         capture_fake::{
             FailingCapture,
             FakeCapture,
@@ -89,6 +90,8 @@ async fn boot(cfg: UserActorConfig) -> Harness {
         capture: Arc::clone(&capture) as Arc<dyn user_actor::ports::ScreenCapturePort>,
         sink: Arc::clone(&sink) as Arc<dyn user_actor::ports::ScreenshotSinkPort>,
         input: Arc::clone(&input) as Arc<dyn user_actor::ports::InputSynthesisPort>,
+        launcher: Arc::new(FakeAppLauncher::default())
+            as Arc<dyn user_actor::ports::AppLauncherPort>,
     }));
     kernel.boot().await.unwrap();
     // Push the config the way the IPC adapter would.
@@ -179,6 +182,8 @@ async fn capture_failure_does_not_consume_quota() {
         capture: failing.clone() as Arc<dyn user_actor::ports::ScreenCapturePort>,
         sink: Arc::clone(&sink) as Arc<dyn user_actor::ports::ScreenshotSinkPort>,
         input: Arc::clone(&input) as Arc<dyn user_actor::ports::InputSynthesisPort>,
+        launcher: Arc::new(FakeAppLauncher::default())
+            as Arc<dyn user_actor::ports::AppLauncherPort>,
     }));
     kernel.boot().await.unwrap();
     kernel.accept(ActorEvent::Welcome(welcome(config(true, false, 2)))).await;
@@ -231,6 +236,8 @@ async fn focus_before_welcome_is_ignored() {
         capture: Arc::clone(&capture) as Arc<dyn user_actor::ports::ScreenCapturePort>,
         sink: Arc::clone(&sink) as Arc<dyn user_actor::ports::ScreenshotSinkPort>,
         input: Arc::clone(&input) as Arc<dyn user_actor::ports::InputSynthesisPort>,
+        launcher: Arc::new(FakeAppLauncher::default())
+            as Arc<dyn user_actor::ports::AppLauncherPort>,
     }));
     kernel.boot().await.unwrap();
     kernel.accept(focus(9, "early")).await;

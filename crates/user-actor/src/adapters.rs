@@ -2,6 +2,9 @@
 //! sources, GDI capture, input synthesis) live beside the always-compiled
 //! fakes used by tests and fallback composition.
 
+#[cfg(feature = "apps")]
+pub mod app_launcher;
+pub mod app_launcher_fake;
 pub mod capture_fake;
 pub mod input_fake;
 pub mod sink_fake;

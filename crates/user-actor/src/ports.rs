@@ -56,6 +56,72 @@ pub enum ScreenshotSinkError {
     Closed,
 }
 
+/// A virtual key named for script use; mapped to Win32 VK codes by adapters.
+/// `Raw` is the escape hatch for anything the scripts don't name yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    /// Left Windows key (scripted `Win+E` and friends).
+    Win,
+    /// Ctrl modifier.
+    Ctrl,
+    /// Shift modifier.
+    Shift,
+    /// Alt modifier.
+    Alt,
+    /// Escape.
+    Escape,
+    /// Tab.
+    Tab,
+    /// Enter / Return.
+    Enter,
+    /// Backspace.
+    Backspace,
+    /// Space.
+    Space,
+    /// Top-row digit `0`–`9` (`Key::Digit(0)` … `Key::Digit(9)`).
+    Digit(u8),
+    /// Letter `A`–`Z` (VK code, layout-independent for modifiers chords).
+    Letter(char),
+    /// Numpad `+`.
+    Add,
+    /// Numpad `-`.
+    Subtract,
+    /// Numpad `*`.
+    Multiply,
+    /// Numpad `/`.
+    Divide,
+    /// Numpad `.`.
+    Decimal,
+    /// Raw virtual-key code (escape hatch; scripts should prefer named keys).
+    Raw(u16),
+}
+
+impl Key {
+    /// The Win32 virtual-key code.
+    #[must_use]
+    pub fn virtual_key(self) -> u16 {
+        match self {
+            Self::Win => 0x5B,                                          // VK_LWIN
+            Self::Ctrl => 0x11,                                         // VK_CONTROL
+            Self::Shift => 0x10,                                        // VK_SHIFT
+            Self::Alt => 0x12,                                          // VK_MENU
+            Self::Escape => 0x1B,                                       // VK_ESCAPE
+            Self::Tab => 0x09,                                          // VK_TAB
+            Self::Enter => 0x0D,                                        // VK_RETURN
+            Self::Backspace => 0x08,                                    // VK_BACK
+            Self::Space => 0x20,                                        // VK_SPACE
+            Self::Digit(d) => 0x30 + u16::from(d.min(9)),               // VK 0x30..0x39 = '0'..'9'
+            Self::Letter(c) => u16::from(c.to_ascii_uppercase() as u8), // VK = ASCII for A..Z
+            Self::Add => 0x6B,                                          // VK_ADD
+            Self::Subtract => 0x6D,                                     // VK_SUBTRACT
+            Self::Multiply => 0x6A,                                     // VK_MULTIPLY
+            Self::Divide => 0x6F,                                       // VK_DIVIDE
+            Self::Decimal => 0x6E,                                      // VK_DECIMAL
+            Self::Raw(vk) => vk,
+        }
+    }
+}
+
 /// Driven port: synthesize user input on the interactive desktop
 /// (`SendInput` only — `SendMessage`/`mouse_event` are deprecated).
 #[async_trait]
@@ -65,6 +131,26 @@ pub trait InputSynthesisPort: Send + Sync + 'static {
     /// # Errors
     /// [`InputError`] when the OS refuses the synthesis.
     async fn press_enter(&self, hold: std::time::Duration) -> Result<(), InputError>;
+
+    /// Type Unicode text (`KEYEVENTF_UNICODE`, layout-independent). Line
+    /// breaks become Enter presses.
+    ///
+    /// # Errors
+    /// [`InputError`] when the OS refuses the synthesis.
+    async fn type_text(&self, text: &str) -> Result<(), InputError>;
+
+    /// Press and release one key.
+    ///
+    /// # Errors
+    /// [`InputError`] when the OS refuses the synthesis.
+    async fn press_key(&self, key: Key) -> Result<(), InputError>;
+
+    /// Press a chord: modifiers down first (in order), the last key pressed
+    /// and released, modifiers up in reverse.
+    ///
+    /// # Errors
+    /// [`InputError`] when the OS refuses the synthesis.
+    async fn press_hotkey(&self, keys: &[Key]) -> Result<(), InputError>;
 }
 
 /// Input synthesis failures.
@@ -75,5 +161,28 @@ pub enum InputError {
     Failed(String),
     /// The blocking task could not be joined.
     #[error("input task join failed: {0}")]
+    Join(String),
+}
+
+/// Driven port: start an application in the interactive session. The user
+/// actor already runs as the interactive user, so a plain process creation
+/// is enough (the agent's token-based launcher is session-0 side only).
+#[async_trait]
+pub trait AppLauncherPort: Send + Sync + 'static {
+    /// Launch `program` with `args`; returns the spawned pid.
+    ///
+    /// # Errors
+    /// [`AppLaunchError`] when creation fails.
+    async fn launch(&self, program: &str, args: &[String]) -> Result<u32, AppLaunchError>;
+}
+
+/// App launch failures.
+#[derive(Debug, thiserror::Error)]
+pub enum AppLaunchError {
+    /// Process creation failed (binary missing, desktop gone).
+    #[error("process creation failed: {0}")]
+    Create(String),
+    /// The blocking task could not be joined.
+    #[error("launch task join failed: {0}")]
     Join(String),
 }

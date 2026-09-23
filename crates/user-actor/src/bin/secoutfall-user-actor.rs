@@ -30,6 +30,7 @@ use user_actor::{
         SharedRuntime,
     },
     ports::{
+        AppLauncherPort,
         InputSynthesisPort,
         ScreenCapturePort,
         ScreenshotSinkPort,
@@ -57,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
         bus: bus.clone(),
         capture: build_capture(),
         input: build_input(),
+        launcher: build_app_launcher(),
         sink,
     }));
     kernel.boot().await?;
@@ -207,6 +209,16 @@ fn build_input() -> Arc<dyn InputSynthesisPort> {
     {
         tracing::warn!("built without the input feature: reactive input disabled");
         Arc::new(user_actor::adapters::input_fake::UnavailableInput)
+    }
+}
+
+fn build_app_launcher() -> Arc<dyn AppLauncherPort> {
+    #[cfg(all(windows, feature = "apps"))]
+    return Arc::new(user_actor::adapters::app_launcher::NativeAppLauncher::new());
+    #[cfg(not(all(windows, feature = "apps")))]
+    {
+        tracing::warn!("built without the apps feature: scripted activities cannot launch");
+        Arc::new(user_actor::adapters::app_launcher_fake::UnavailableAppLauncher)
     }
 }
 

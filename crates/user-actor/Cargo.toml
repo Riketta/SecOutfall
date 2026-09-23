@@ -25,6 +25,8 @@ focus-winevents = ["dep:windows"]
 capture = ["dep:windows", "dep:jpeg-encoder"]
 # `SendInput`-based reactive input synthesis.
 input = ["dep:windows"]
+# `CreateProcessW` app launcher for scripted activities.
+apps = ["dep:windows"]
 
 [dependencies]
 anyhow.workspace = true
