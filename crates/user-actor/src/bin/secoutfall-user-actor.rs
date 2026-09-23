@@ -132,10 +132,54 @@ impl Args {
 }
 
 fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::{
+        EnvFilter,
+        layer::SubscriberExt,
+        util::SubscriberInitExt,
+    };
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,user_actor=debug"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).with_target(false).try_init();
+    // The Sentry layer is wired at init but stays a no-op until the DSN from
+    // the WELCOME push activates a client — layers are fixed at subscriber
+    // init, the egress client is not (`init_sentry_once`).
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(sentry_tracing::layer())
+        .init();
+}
+
+/// Activate Sentry egress exactly once, from the DSN pushed over IPC (the
+/// module reads no files). A malformed DSN is hostile input: warn, continue
+/// without egress. The guard is leaked deliberately — the transport must
+/// outlive this function for the process lifetime.
+fn init_sentry_once(dsn: Option<&String>) {
+    static ACTIVATED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if ACTIVATED.get().is_some() {
+        return; // already active; re-pushed config must not re-init
+    }
+    let Some(dsn) = dsn else {
+        tracing::debug!("no telemetry DSN in the pushed config; reporting disabled");
+        return;
+    };
+    match dsn.parse::<sentry::types::Dsn>() {
+        Ok(parsed) => {
+            let guard = sentry::init(sentry::ClientOptions {
+                dsn: Some(parsed),
+                release: Some(env!("CARGO_PKG_VERSION").to_owned().into()),
+                ..sentry::ClientOptions::default()
+            });
+            std::mem::forget(guard);
+            // Set only on success: an invalid first DSN must not lock out a
+            // valid re-push. The caller is a single sequential task, so the
+            // check-then-act gap above cannot race.
+            let _ = ACTIVATED.set(());
+            tracing::info!("sentry egress active (direct to GlitchTip)");
+        }
+        Err(error) => {
+            tracing::warn!(%error, "invalid telemetry DSN pushed over IPC; reporting disabled");
+        }
+    }
 }
 
 /// The sink half for the plugins plus the queue for the transport. Without
@@ -238,6 +282,7 @@ async fn start_focus_source_when_configured(
                 if started.swap(true, Ordering::SeqCst) {
                     continue; // re-pushes (GET_CONFIG) do not restart the source
                 }
+                init_sentry_once(config.telemetry_dsn.as_ref());
                 start_focus_source(config.focus_method, Arc::clone(&inlet), cancel.child_token());
             }
             Ok(_) => {}

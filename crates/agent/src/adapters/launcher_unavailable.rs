@@ -1,7 +1,6 @@
 //! Production stand-in when no launch adapter is compiled or configured
-//! (e.g. `TokenProcessLauncher` requires the `launcher` feature; the legacy
-//! `SchedTaskLauncher` adapter is not built yet): every launch fails with a
-//! typed, explanatory error. Never a silent no-op.
+//! (each mechanism needs its own feature: `launcher`, `schedtask`): every
+//! launch fails with a typed, explanatory error. Never a silent no-op.
 
 use async_trait::async_trait;
 

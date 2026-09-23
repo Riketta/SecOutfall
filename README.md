@@ -53,10 +53,11 @@ default documented is [`docs/Agent.toml`](docs/Agent.toml) — parsing is strict
 with the schema.
 
 Feature flags (`agent`): `etw` (kernel-trace consumption), `launcher`
-(`CreateProcessAsUser` token launcher), `associations` (shell-association
-target resolution), `killer` (finalize process termination), `time_shift`
-(`SetSystemTime` fake clock), `ipc` (user-actor named-pipe server), `service`
-(SCM mode + install/uninstall).
+(`CreateProcessAsUser` token launcher), `schedtask` (legacy EventID-777
+scheduled-task launcher via the run-as helper), `associations`
+(shell-association target resolution), `killer` (finalize process
+termination), `time_shift` (`SetSystemTime` fake clock), `ipc` (user-actor
+named-pipe server), `service` (SCM mode + install/uninstall).
 
 Feature flags (`user-actor`): `ipc`, `focus-poll`, `focus-winevents`,
 `capture`, `input`, `apps`.
@@ -128,8 +129,9 @@ cargo test --workspace --all-features   # unit + integration + property + chaos
 
 ## Status
 
-Phases 0–10 of the rewrite are complete (kernel, protocol, agent hexagon +
-plugins, real adapters behind feature gates, user actor, scripted activities,
-hardening). Current focus: ops (this README, install/uninstall, dev harnesses)
-and VM soak. `Legacy/` (the original C# implementation) and `Reference/` (the
-architecture template) live in the parent directory, outside this repository.
+Phases 0–12 of the rewrite are complete (kernel, protocol, agent hexagon +
+plugins, both launch mechanisms, telemetry egress, user actor, scripted
+activities, hardening, ops). Remaining: VM soak and the CI runner decision
+(self-hosted integration runner). `Legacy/` (the original C# implementation)
+and `Reference/` (the architecture template) live in the parent directory,
+outside this repository.

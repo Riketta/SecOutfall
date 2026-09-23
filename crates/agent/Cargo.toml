@@ -16,6 +16,8 @@ path = "src/bin/secoutfall-agent.rs"
 etw = ["dep:ferrisetw"]
 # Token-based interactive-session process launcher (CreateProcessAsUser spike).
 launcher = ["dep:windows"]
+# Legacy scheduled-task launch path (EventID-777 ONEVENT trigger + run-as helper).
+schedtask = ["dep:windows"]
 # Registry-backed shell-association lookup for non-exe targets (Windows-only).
 associations = ["dep:windows"]
 # Terminate configured processes at finalize (Toolhelp snapshot, Windows-only).
@@ -42,6 +44,8 @@ kernel.workspace = true
 parking_lot.workspace = true
 protocol.workspace = true
 reqwest.workspace = true
+sentry.workspace = true
+sentry-tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -55,9 +59,11 @@ tokio = { workspace = true, features = [
     "signal",
     "io-util",
     "net",
+    "process",
 ] }
 tokio-util.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 uuid.workspace = true
 windows = { workspace = true, optional = true }
 windows-service = { workspace = true, optional = true }

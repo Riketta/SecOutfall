@@ -34,6 +34,8 @@ reqwest = { version = "0.13", default-features = false, features = [
     "stream",
     "native-tls",
 ] }
+sentry = "0.42"
+sentry-tracing = "0.42"
 sha2 = "0.10"
 parking_lot = "0.12"
 proptest = "1.6"

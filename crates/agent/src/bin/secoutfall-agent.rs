@@ -40,6 +40,7 @@ use kernel::app::api_ports::EventInletPort;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_tracing();
     let args = Args::parse();
     match args.mode.as_deref() {
         Some("simulate") => simulate().await,
@@ -48,6 +49,51 @@ async fn main() -> anyhow::Result<()> {
         Some("uninstall") => service_uninstall(),
         Some("etw-probe") => etw_probe().await,
         _ => console(&args).await,
+    }
+}
+
+/// Single global subscriber: `registry` + `EnvFilter` (`RUST_LOG`-aware) +
+/// console fmt + the `sentry-tracing` layer. The Sentry layer is a no-op
+/// until [`init_sentry`] activates a client — layer wiring is fixed at init,
+/// the client is not.
+fn init_tracing() {
+    use tracing_subscriber::{
+        EnvFilter,
+        layer::SubscriberExt,
+        util::SubscriberInitExt,
+    };
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,agent=debug"));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(sentry_tracing::layer())
+        .init();
+}
+
+/// Activate Sentry egress to the local `GlitchTip` (doctrine: gated by
+/// `[telemetry] sentry_enabled`; timestamps will be skewed by the fake clock
+/// — correlate by study/session ids, never by wall time). A malformed DSN is
+/// hostile config: warn and continue without egress, never crash.
+fn init_sentry(config: &protocol::config::AgentConfig) -> Option<sentry::ClientInitGuard> {
+    if !config.telemetry.sentry_enabled {
+        tracing::debug!("sentry egress disabled by config");
+        return None;
+    }
+    match config.telemetry.dsn.parse::<sentry::types::Dsn>() {
+        Ok(dsn) => {
+            let guard = sentry::init(sentry::ClientOptions {
+                dsn: Some(dsn),
+                release: Some(env!("CARGO_PKG_VERSION").to_owned().into()),
+                ..sentry::ClientOptions::default()
+            });
+            tracing::info!("sentry egress active");
+            Some(guard)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "invalid telemetry.dsn; sentry egress disabled");
+            None
+        }
     }
 }
 
@@ -154,10 +200,7 @@ async fn production_session_deps(
 fn production_launcher(config: &protocol::config::AgentConfig) -> Arc<dyn ProcessLauncherPort> {
     match config.platform.launch_mechanism {
         protocol::config::LaunchMechanism::SchedTask => {
-            tracing::warn!("sched-task launcher not built yet; launching will fail");
-            Arc::new(agent::adapters::launcher_unavailable::UnavailableLauncher::new(
-                "the sched-task launcher adapter is not implemented yet",
-            ))
+            schedtask_launcher(config.platform.runas_utility_path.clone())
         }
         protocol::config::LaunchMechanism::Token => token_launcher(),
     }
@@ -173,6 +216,19 @@ fn token_launcher() -> Arc<dyn ProcessLauncherPort> {
     tracing::warn!("token launcher not compiled in (build with --features launcher)");
     Arc::new(agent::adapters::launcher_unavailable::UnavailableLauncher::new(
         "build with --features launcher",
+    ))
+}
+
+#[cfg(all(windows, feature = "schedtask"))]
+fn schedtask_launcher(helper_path: String) -> Arc<dyn ProcessLauncherPort> {
+    Arc::new(agent::adapters::launcher_schedtask::SchedTaskLauncher::new(helper_path))
+}
+
+#[cfg(not(all(windows, feature = "schedtask")))]
+fn schedtask_launcher(_helper_path: String) -> Arc<dyn ProcessLauncherPort> {
+    tracing::warn!("sched-task launcher not compiled in (build with --features schedtask)");
+    Arc::new(agent::adapters::launcher_unavailable::UnavailableLauncher::new(
+        "build with --features schedtask",
     ))
 }
 
@@ -350,6 +406,8 @@ async fn console(args: &Args) -> anyhow::Result<()> {
         )
     };
     println!("config: {broker_kind}");
+    // Held for the whole run: dropping the guard shuts the transport down.
+    let _sentry_guard = init_sentry(&session_deps.config);
 
     // The IPC server wants the transport pieces; clone before the deps move.
     let ipc_broker = Arc::clone(&session_deps.broker);
@@ -565,6 +623,8 @@ async fn run_service_body(args: Vec<std::ffi::OsString>) -> anyhow::Result<()> {
     let args = Args::parse_from(args);
     let nonce = generate_nonce();
     let deps = production_session_deps(&args.config_path, nonce.clone()).await?;
+    // Held for the whole service body: dropping the guard shuts egress down.
+    let _sentry_guard = init_sentry(&deps.config);
 
     // The IPC server wants the transport pieces; clone before the deps move.
     let ipc_broker = Arc::clone(&deps.broker);

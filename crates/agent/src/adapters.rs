@@ -22,6 +22,8 @@ pub mod upload_fake;
 pub mod etw_adapter;
 #[cfg(all(windows, feature = "ipc"))]
 pub mod ipc_server;
+#[cfg(all(windows, feature = "schedtask"))]
+pub mod launcher_schedtask;
 #[cfg(feature = "launcher")]
 pub mod launcher_token;
 #[cfg(all(windows, feature = "killer"))]

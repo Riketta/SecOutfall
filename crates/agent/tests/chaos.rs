@@ -4,7 +4,10 @@
 //! - the broker dying mid-finalize must not prevent the scope persist;
 //! - a locked (share-none) drop file is skipped, collection continues;
 //! - a drop that vanishes before collection is a debug note, not an error;
-//! - Unicode drop paths survive copy + upload naming.
+//! - Unicode drop paths survive copy + upload naming;
+//! - a drops volume that refuses every write (disk full) never blocks
+//!   finalization or the scope persist;
+//! - a failed copy leaves no `.part` litter and does not poison collection.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::{
@@ -287,6 +290,88 @@ async fn locked_drop_is_skipped_and_collection_continues() {
     harness.kernel.shutdown().await;
 }
 
+/// Disk-full analog: the drops volume refuses every write (here: the target
+/// path is occupied by a file, so no directory can exist). The session must
+/// still finalize and persist — telemetry loss is acceptable, a lost analysis
+/// record is not.
+#[tokio::test]
+async fn unusable_drops_target_does_not_block_finalization() {
+    let base = temp_dir("disk-full");
+    // Occupy the configured drops path with a plain file.
+    let drops_file = base.join("drops");
+    std::fs::write(&drops_file, b"not a directory").unwrap();
+    let mut config = base_config(&drops_file);
+    config.drops.extensions = vec![".txt".to_owned()];
+    let fake = Arc::new(agent::adapters::broker_fake::FakeBroker::default());
+    let harness = boot(&config, fake).await;
+
+    let source = base.join("drop.txt");
+    std::fs::write(&source, b"artifact").unwrap();
+    harness
+        .feed(&[
+            process_started(999, None, "explorer.exe"),
+            process_started(1000, None, "evil.exe"),
+            file_written(1000, source.to_str().unwrap()),
+            file_closed(1000, source.to_str().unwrap()),
+        ])
+        .await;
+    harness.settle().await;
+
+    assert!(drops_file.is_file(), "the occupation is untouched");
+    let repo = harness.deadline_and_shutdown().await;
+    let state = repo.load().await.unwrap();
+    assert_eq!(state.sessions.len(), 1, "session finalized");
+    assert!(state.sessions.first().unwrap().ended_at_ms.is_some(), "finalize completed");
+}
+
+/// A copy that fails partway (here: the "file" is a directory, so the open
+/// dies after the pre-flight stat) must leave no `.part` litter in the drops
+/// directory, and the next drop still collects — the pipeline is not poisoned.
+#[tokio::test]
+async fn failed_copy_leaves_no_part_litter_and_collection_survives() {
+    let drops = temp_dir("part-litter");
+    let source_dir = temp_dir("part-src");
+    let config = base_config(&drops);
+    let fake = Arc::new(agent::adapters::broker_fake::FakeBroker::default());
+    let harness = boot(&config, fake).await;
+
+    // A directory with a dropping extension: matches the filter, then fails
+    // at open (Windows: ACCESS_DENIED) after the stat passed.
+    let weird = source_dir.join("weird.txt");
+    std::fs::create_dir(&weird).unwrap();
+    harness
+        .feed(&[
+            process_started(999, None, "explorer.exe"),
+            process_started(1000, None, "evil.exe"),
+            file_written(1000, weird.to_str().unwrap()),
+            file_closed(1000, weird.to_str().unwrap()),
+        ])
+        .await;
+    harness.settle().await;
+    let entries: Vec<String> = std::fs::read_dir(&drops)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(entries.is_empty(), "no copy and no .part litter: {entries:?}");
+
+    // The next, healthy drop flows normally.
+    let healthy = source_dir.join("healthy.txt");
+    std::fs::write(&healthy, b"healthy").unwrap();
+    harness
+        .feed(&[
+            file_written(1000, healthy.to_str().unwrap()),
+            file_closed(1000, healthy.to_str().unwrap()),
+        ])
+        .await;
+    harness.settle().await;
+    let copies: Vec<String> = std::fs::read_dir(&drops)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(copies.len(), 1, "collection survived the failed copy: {copies:?}");
+
+    harness.kernel.shutdown().await;
+}
 /// A drop that vanishes before collection is a debug note, not a failure;
 /// Unicode paths survive the copy pipeline untouched.
 #[tokio::test]
