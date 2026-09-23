@@ -20,9 +20,13 @@ where
     E: Clone + Send,
 {
     /// Create a bus with a bounded queue of `capacity` events per lag window.
+    /// A `capacity` of 0 is clamped to 1 (tokio's broadcast channel panics on
+    /// zero; a config-derived zero must degrade to "lag on the second event",
+    /// never panic the kernel).
     #[must_use]
     pub fn new(capacity: usize) -> Self {
-        let (sender, _) = broadcast::channel(capacity);
+        debug_assert!(capacity > 0, "bus capacity 0 is a composition-root bug; clamped to 1");
+        let (sender, _) = broadcast::channel(capacity.max(1));
         Self { sender }
     }
 }

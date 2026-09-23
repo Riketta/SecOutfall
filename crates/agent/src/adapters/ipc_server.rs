@@ -426,9 +426,12 @@ impl ClientSession {
                     // The gate is armed only when the supervisor actually
                     // launched the user actor (it stores the child pid, never
                     // 0). Gate 0 = nonce-only verification — launch failed or
-                    // the sched-task mechanism reported no pid. When armed, a
-                    // pid we cannot even query counts as foreign.
-                    let pid_ok = gate == 0 || pid == gate;
+                    // the sched-task mechanism reported no pid. When armed,
+                    // the client must BE the launched child OR run as
+                    // LocalSystem (the sched-task path starts the UA as
+                    // SYSTEM without a reportable pid); a pid we cannot even
+                    // query counts as foreign.
+                    let pid_ok = gate == 0 || pid == gate || client_is_system(server);
                     if !nonce_ok || !pid_ok {
                         tracing::warn!(client_pid = pid, expected_pid = gate, "HELLO rejected");
                         let body = error_frame_body("handshake rejected")?;
@@ -569,6 +572,111 @@ fn client_pid(server: &NamedPipeServer) -> u32 {
         )
     };
     result.map_or(0, |()| pid)
+}
+
+/// Does the pipe's client process run as `LocalSystem` (`S-1-5-18`)?
+///
+/// The second half of the armed-gate identity check: the child pid is
+/// primary, this covers the sched-task launch path where the user actor
+/// legitimately runs as SYSTEM but its pid was never reported. Any FFI
+/// failure answers `false` — the pid comparison still applies, so a query
+/// failure can only deny, never grant.
+fn client_is_system(pipe: &NamedPipeServer) -> bool {
+    use windows::{
+        Win32::{
+            Foundation::{
+                CloseHandle,
+                HANDLE,
+                HLOCAL,
+                LocalFree,
+            },
+            Security::{
+                Authorization::ConvertSidToStringSidW,
+                GetTokenInformation,
+                TOKEN_QUERY,
+                TOKEN_USER,
+                TokenUser,
+            },
+            System::Threading::{
+                OpenProcess,
+                OpenProcessToken,
+                PROCESS_QUERY_LIMITED_INFORMATION,
+            },
+        },
+        core::PWSTR,
+    };
+
+    const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
+
+    let pid = client_pid(pipe);
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: the pid belongs to the connected client process; the handle is
+    // closed on every path below.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) };
+    let Ok(process) = process else {
+        return false;
+    };
+    let mut token = HANDLE::default();
+    // SAFETY: `token` is a valid, initialized output handle; closed below.
+    let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, std::ptr::from_mut(&mut token)) };
+    // SAFETY: owned handle, closed exactly once.
+    let _ = unsafe { CloseHandle(process) };
+    if opened.is_err() {
+        return false;
+    }
+
+    // Query the token user: first call fails with the needed size.
+    let mut needed = 0_u32;
+    // SAFETY: the sizing call expects `None` and reports the length.
+    let _ =
+        unsafe { GetTokenInformation(token, TokenUser, None, 0, std::ptr::from_mut(&mut needed)) };
+    let buffer_len = usize::try_from(needed).unwrap_or(0);
+    if buffer_len == 0 {
+        // SAFETY: owned handle, closed exactly once.
+        let _ = unsafe { CloseHandle(token) };
+        return false;
+    }
+    let mut buffer = vec![0_u8; buffer_len];
+    // SAFETY: `buffer` is `needed` bytes long; the class writes a TOKEN_USER
+    // (with embedded SID) into it.
+    let filled = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            needed,
+            std::ptr::from_mut(&mut needed),
+        )
+    };
+    // SAFETY: owned handle, closed exactly once.
+    let _ = unsafe { CloseHandle(token) };
+    if filled.is_err() {
+        return false;
+    }
+
+    // SAFETY: the buffer now holds a TOKEN_USER per the contract above; it
+    // is read unaligned because a `Vec<u8>` only guarantees 1-byte alignment.
+    let token_user = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<TOKEN_USER>()) };
+    let mut sid_string = PWSTR::null();
+    // SAFETY: `sid_string` is a valid out-pointer; the returned string is
+    // freed with LocalFree below.
+    if unsafe { ConvertSidToStringSidW(token_user.User.Sid, std::ptr::from_mut(&mut sid_string)) }
+        .is_err()
+    {
+        return false;
+    }
+    if sid_string.is_null() {
+        return false;
+    }
+    // SAFETY: `sid_string` points at a NUL-terminated wide string allocated
+    // by ConvertSidToStringSidW above.
+    let sid = unsafe { sid_string.to_string() }.ok();
+    // SAFETY: the string was allocated by ConvertSidToStringSidW and is
+    // freed exactly once.
+    unsafe { LocalFree(HLOCAL(sid_string.0.cast())) };
+    sid.as_deref() == Some(LOCAL_SYSTEM_SID)
 }
 
 fn io_plain(message: String) -> IpcServerError {

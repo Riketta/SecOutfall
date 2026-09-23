@@ -29,8 +29,9 @@ proptest! {
         if let Ok(decoded) = FrameHeader::from_bytes(&header.to_bytes()) {
             prop_assert_eq!(decoded, header);
         } else {
-            // Rejected headers are exactly the ones with unknown types.
-            prop_assert!(!message_type::is_known(message_type));
+            // Rejected headers are exactly the ones with unknown types or
+            // nonzero reserved flags (IPC v1 defines neither).
+            prop_assert!(!message_type::is_known(message_type) || flags != 0);
         }
     }
 
@@ -44,6 +45,7 @@ proptest! {
             if let Ok(header) = FrameHeader::from_bytes(&bytes) {
                 prop_assert!(usize::try_from(header.payload_len).unwrap_or(usize::MAX) <= MAX_PAYLOAD_LEN);
                 prop_assert!(message_type::is_known(header.message_type));
+                prop_assert_eq!(header.flags, 0);
             }
         } else {
             prop_assert!(FrameHeader::from_bytes(&bytes).is_err());
@@ -61,6 +63,26 @@ proptest! {
         prop_assert_eq!(
             FrameHeader::from_bytes(&bytes),
             Err(FrameError::PayloadTooLong(payload_len))
+        );
+    }
+
+    /// Reserved flags are absolute: nonzero `flags` never parses for any
+    /// known type, and the error names the offending bits.
+    #[test]
+    fn reserved_flags_are_always_rejected(
+        flags in 1_u16..=u16::MAX,
+        message_type in prop_oneof![
+            Just(message_type::HELLO),
+            Just(message_type::WELCOME),
+            Just(message_type::GET_CONFIG),
+            Just(message_type::SCREENSHOT),
+            Just(message_type::ERROR),
+        ],
+    ) {
+        let bytes = FrameHeader { payload_len: 0, message_type, flags }.to_bytes();
+        prop_assert_eq!(
+            FrameHeader::from_bytes(&bytes),
+            Err(FrameError::ReservedFlags(flags))
         );
     }
 

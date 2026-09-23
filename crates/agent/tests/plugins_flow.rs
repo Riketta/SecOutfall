@@ -1,14 +1,25 @@
 //! Phase-6 plugin flows end to end: drops collection (copy + dedup + caps +
 //! upload), screenshot intake (quota + save + upload + kill-switch) and
 //! target launch through shell associations (with scope-expectation
-//! extension). Real filesystem where the plugins touch it; fakes everywhere
-//! else. Deterministic on the current-thread runtime.
+//! extension). Launches (target + user actor) run OFF the pipeline on job
+//! queues — tests either settle for them or wait on the launch recorder.
+//! Real filesystem where the plugins touch it; fakes everywhere else.
+//! Deterministic on the current-thread runtime.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::{
     path::PathBuf,
-    sync::Arc,
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{
+            AtomicU32,
+            Ordering,
+        },
+    },
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use agent::{
@@ -35,7 +46,15 @@ use agent::{
     },
     domain::scope::SharedScopeState,
     plugins::statistics::SessionStatistics,
-    ports::scope_repository::ScopeRepository,
+    ports::{
+        process_launcher::{
+            LaunchError,
+            LaunchOutcome,
+            LaunchSpec,
+            ProcessLauncherPort,
+        },
+        scope_repository::ScopeRepository,
+    },
 };
 use kernel::{
     app::api_ports::EventInletPort,
@@ -107,19 +126,34 @@ struct Harness {
     clock: Arc<FakeClock>,
     stats: Arc<SessionStatistics>,
     state: SharedScopeState,
+    /// The expected-user-actor pid gate shared with the IPC server.
+    pid_gate: Arc<AtomicU32>,
 }
 
-/// Assemble + boot one session with fakes.
+/// Assemble + boot one session with fakes and a plain fake launcher.
 async fn boot(config: &AgentConfig, shell: &Arc<FakeShellAssociation>) -> Harness {
+    let recorder = Arc::new(FakeLauncher::default());
+    boot_with_launcher(config, shell, Arc::clone(&recorder), recorder).await
+}
+
+/// Boot with a custom pipeline launcher: `recorder` is exposed on the
+/// harness for assertions, `installed` is what the plugins actually call
+/// (pass the recorder itself for the plain fake).
+async fn boot_with_launcher(
+    config: &AgentConfig,
+    shell: &Arc<FakeShellAssociation>,
+    recorder: Arc<FakeLauncher>,
+    installed: Arc<dyn ProcessLauncherPort>,
+) -> Harness {
     let clock = Arc::new(FakeClock::new(1_465_182_366_000));
     let broker = Arc::new(FakeBroker::default());
     let uploader = Arc::new(FakeUploader::default());
-    let launcher = Arc::new(FakeLauncher::default());
     let killer =
         Arc::new(agent::adapters::process_killer_fake::FakeProcessKiller::with_killed_per_name(1));
     let counters = Arc::new(SessionStatistics::default());
     let repo = Arc::new(InMemoryScopeRepository::default());
     let state = load_scope_state(repo.as_ref()).await.unwrap();
+    let pid_gate = Arc::new(AtomicU32::new(0));
     let kernel = assemble(AgentDeps {
         config: Arc::new(config.clone()),
         scope_state: Arc::clone(&state),
@@ -127,8 +161,7 @@ async fn boot(config: &AgentConfig, shell: &Arc<FakeShellAssociation>) -> Harnes
         broker: Arc::clone(&broker) as Arc<dyn agent::ports::broker::BrokerPort>,
         clock: Arc::clone(&clock) as Arc<dyn agent::ports::clock::SystemClockPort>,
         uploader: Arc::clone(&uploader) as Arc<dyn agent::ports::uploader::FileUploadPort>,
-        launcher: Arc::clone(&launcher)
-            as Arc<dyn agent::ports::process_launcher::ProcessLauncherPort>,
+        launcher: installed,
         shell: Arc::clone(shell) as Arc<dyn agent::ports::shell_association::ShellAssociationPort>,
         killer: Arc::clone(&killer) as Arc<dyn agent::ports::process_killer::ProcessKillerPort>,
         shifter: Arc::clone(&clock) as Arc<dyn agent::ports::clock::ClockShiftPort>,
@@ -136,10 +169,20 @@ async fn boot(config: &AgentConfig, shell: &Arc<FakeShellAssociation>) -> Harnes
         bus: InMemoryEventBus::new(4096),
         user_actor_nonce: "test-nonce".to_owned(),
         seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        user_actor_pid_gate: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        user_actor_pid_gate: Arc::clone(&pid_gate),
     });
     kernel.boot().await.unwrap();
-    Harness { kernel, broker, uploader, launcher, killer, clock, stats: counters, state }
+    Harness {
+        kernel,
+        broker,
+        uploader,
+        launcher: recorder,
+        killer,
+        clock,
+        stats: counters,
+        state,
+        pid_gate,
+    }
 }
 
 impl Harness {
@@ -165,6 +208,35 @@ impl Harness {
     async fn shutdown(&self) {
         self.kernel.shutdown().await;
     }
+}
+
+/// Launcher wrapper that stalls every launch — simulates a slow
+/// `SchedTaskLauncher` (up to a 15 s budget) so tests can observe the
+/// pipeline running while a launch is in flight. Delegates to the fake for
+/// recording.
+struct DelayedLauncher {
+    inner: Arc<FakeLauncher>,
+    delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl ProcessLauncherPort for DelayedLauncher {
+    async fn launch(&self, spec: &LaunchSpec) -> Result<LaunchOutcome, LaunchError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.launch(spec).await
+    }
+}
+
+/// Poll until `predicate` holds; bounded so a regression fails fast instead
+/// of hanging.
+async fn wait_until(what: &str, predicate: impl Fn() -> bool) {
+    for _ in 0..400 {
+        if predicate() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("timed out waiting for {what}");
 }
 
 #[tokio::test]
@@ -363,13 +435,15 @@ async fn non_exe_target_launches_via_association_and_extends_scope() {
 
     let launched = harness.launcher.launched();
     // Phase 8: the marker also triggers the user-actor supervisor, so the
-    // boot performs two launches — the target (first) and the user actor.
+    // boot performs two launches — the target and the user actor. Both run
+    // on independent off-pipeline queues, so their completion order is not
+    // asserted.
     assert_eq!(launched.len(), 2, "target + user actor on the marker");
-    assert_eq!(launched.first().unwrap().path, "C:\\Windows\\System32\\wscript.exe");
-    assert_eq!(
-        launched.first().unwrap().args,
-        vec!["C:\\Samples\\evil.js".to_owned(), "-q".to_owned()]
-    );
+    let target = launched
+        .iter()
+        .find(|spec| spec.path == "C:\\Windows\\System32\\wscript.exe")
+        .expect("interpreter launch recorded");
+    assert_eq!(target.args, vec!["C:\\Samples\\evil.js".to_owned(), "-q".to_owned()]);
 
     let launched_event = harness
         .broker
@@ -406,6 +480,116 @@ async fn non_exe_target_launches_via_association_and_extends_scope() {
     assert_eq!(harness.launcher.launched().len(), 2, "no relaunch within one boot");
 
     harness.shutdown().await;
+}
+
+/// The launcher publishes the interpreter's scope expectation BEFORE the
+/// process is created, and the tracker applies expectations synchronously on
+/// the pipeline path — so the interpreter's very first `process.started`
+/// (fed here the moment the launch is recorded, with no settle) joins the
+/// scope and its drop is collected.
+#[tokio::test]
+async fn interpreter_expectation_precedes_first_observation() {
+    let drops_dir = temp_dir("drops-interp");
+    let source_dir = temp_dir("interp-src");
+    std::fs::write(source_dir.join("payload.txt"), b"interpreter drop").unwrap();
+
+    let mut config = base_config();
+    config.target.path = "C:\\Samples\\evil.js".into();
+    config.drops.path = drops_dir.display().to_string();
+    config.drops.upload_uri = Some("http://collector/drops".to_owned());
+
+    let shell = Arc::new(FakeShellAssociation::new());
+    shell.register(".js", "\"C:\\Windows\\System32\\wscript.exe\" \"%1\"");
+    let harness = boot(&config, &shell).await;
+
+    // Marker → launch queue: resolve the interpreter, publish the scope
+    // expectation, create the process. Wait for the exact moment the launch
+    // is recorded — since the expectation is published strictly before the
+    // launch, it is guaranteed to be queued in the tracker by now.
+    harness.feed(&[process_started(999, None, "explorer.exe")]).await;
+    wait_until("interpreter launch", || {
+        harness.launcher.launched().iter().any(|spec| spec.path.ends_with("wscript.exe"))
+    })
+    .await;
+
+    // No settle: process the interpreter's first observation immediately.
+    let drop = source_dir.join("payload.txt").display().to_string();
+    harness
+        .feed(&[
+            process_started(700, None, "wscript.exe"),
+            file_written(700, &drop, 16),
+            file_closed(700, &drop),
+        ])
+        .await;
+
+    let scoped = harness
+        .state
+        .lock()
+        .current_session()
+        .unwrap()
+        .scoped_processes
+        .iter()
+        .any(|process| process.name == "wscript.exe");
+    assert!(scoped, "interpreter must join the scope on its first process.started");
+    let observed = harness.state.lock().current_session().unwrap().observed_drops.contains(&drop);
+    assert!(observed, "interpreter drop attributed to the scoped interpreter");
+
+    harness.settle().await;
+    let sequence = harness.broker.event_sequence();
+    assert!(sequence.contains(&EventType::DropObserved), "drop reported on the wire");
+    assert!(sequence.contains(&EventType::DropCopied), "interpreter drop collected");
+    assert_eq!(harness.uploader.uploads().len(), 1, "interpreter drop uploaded");
+    assert!(std::fs::read_dir(&drops_dir).unwrap().next().is_some(), "drop copied locally");
+
+    harness.shutdown().await;
+    let _ = std::fs::remove_dir_all(&drops_dir);
+    let _ = std::fs::remove_dir_all(&source_dir);
+}
+
+/// Launches run off-pipeline: while a (delayed) launch is in flight, the
+/// pipeline keeps processing events — the marker's launch job must not
+/// stall subsequent source events.
+#[tokio::test]
+async fn launch_in_flight_does_not_block_the_pipeline() {
+    let drops_dir = temp_dir("drops-nonblock");
+    let mut config = base_config();
+    config.drops.path = drops_dir.display().to_string();
+
+    let recorder = Arc::new(FakeLauncher::default());
+    let installed = Arc::new(DelayedLauncher {
+        inner: Arc::clone(&recorder),
+        delay: Duration::from_millis(500),
+    });
+    let shell = Arc::new(FakeShellAssociation::new());
+    let harness = boot_with_launcher(&config, &shell, Arc::clone(&recorder), installed).await;
+
+    // Marker submits the launch; the pipeline must keep flowing while the
+    // launch stalls in the fake. An inline launch would hold each event for
+    // >= 500 ms (target) plus >= 500 ms (user actor).
+    let started = Instant::now();
+    harness.feed(&[process_started(999, None, "explorer.exe")]).await;
+    harness.feed(&[process_started(1000, None, "evil.exe")]).await;
+    let feed_elapsed = started.elapsed();
+    assert!(
+        feed_elapsed < Duration::from_millis(400),
+        "pipeline blocked by the in-flight launch for {feed_elapsed:?}"
+    );
+    assert!(harness.launcher.launched().is_empty(), "launch still in flight");
+
+    // Source events are processed (and attributed) while the launch pends.
+    let drop_path = "C:\\Users\\victim\\while-in-flight.txt";
+    harness.feed(&[file_written(1000, drop_path, 8)]).await;
+    let observed =
+        harness.state.lock().current_session().unwrap().observed_drops.contains(drop_path);
+    assert!(observed, "drop observed while the launch was still in flight");
+
+    harness.settle().await;
+    assert_eq!(harness.launcher.launched().len(), 2, "target + user actor eventually launch");
+    let sequence = harness.broker.event_sequence();
+    assert!(sequence.contains(&EventType::DropObserved));
+
+    harness.shutdown().await;
+    let _ = std::fs::remove_dir_all(&drops_dir);
 }
 
 #[tokio::test]
@@ -557,6 +741,15 @@ async fn user_actor_supervisor_launches_with_nonce_on_marker() {
         launches.iter().filter(|spec| spec.path.contains("user-actor")).count(),
         1,
         "no user-actor relaunch within one boot"
+    );
+
+    // The pid gate is armed from the launch job (0 = "never launched" — the
+    // IPC server would reject every HELLO). The fake hands out pids 0 and 1
+    // for the two marker-triggered launches; 0 is clamped to 1.
+    assert_ne!(
+        harness.pid_gate.load(Ordering::SeqCst),
+        0,
+        "pid gate must be armed by the off-pipeline launch job"
     );
 
     harness.shutdown().await;

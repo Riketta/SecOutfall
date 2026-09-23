@@ -442,7 +442,11 @@ async fn send_frame(
 }
 
 /// Cloneable sink handle; frames queue (bounded) and are flushed by the run
-/// loop. Sends fail fast only when the whole client is dropped.
+/// loop. `send` NEVER blocks on a saturated queue: an over-capacity frame is
+/// dropped at the sink (doctrine: coalesce + loss counter, never block the
+/// focus pipeline — the kernel inlet is inline, so a blocking sink would
+/// freeze focus tracking and the pump thread). Callers release the capture
+/// quota slot on any error.
 pub struct IpcScreenshotSink {
     tx: mpsc::Sender<(u32, Vec<u8>)>,
 }
@@ -452,11 +456,13 @@ impl ScreenshotSinkPort for IpcScreenshotSink {
     async fn send(&self, seq: u32, jpeg: Vec<u8>) -> Result<(), ScreenshotSinkError> {
         // Reject at the SOURCE, never queue an unwireable frame: the peer
         // must reject >16 MiB frames, and resending the poisoned frame after
-        // every reconnect would loop forever. The caller (focus-watch)
-        // releases the capture quota slot on any sink error.
+        // every reconnect would loop forever.
         if protocol::ipc::messages::SCREENSHOT_SEQ_LEN + jpeg.len() > MAX_PAYLOAD_LEN {
             return Err(ScreenshotSinkError::Oversize);
         }
-        self.tx.send((seq, jpeg)).await.map_err(|_| ScreenshotSinkError::Closed)
+        self.tx.try_send((seq, jpeg)).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => ScreenshotSinkError::Full,
+            mpsc::error::TrySendError::Closed(_) => ScreenshotSinkError::Closed,
+        })
     }
 }

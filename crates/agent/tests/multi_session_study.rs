@@ -50,6 +50,20 @@ use protocol::{
     },
 };
 
+/// `broker.verbosity = "partial"` parses at the schema level but validation
+/// rejects it (the reporter would silently treat it as `none`). Hosted here
+/// because `protocol/src/config.rs` is frozen for parallel work.
+#[test]
+fn partial_verbosity_parses_but_fails_validation() {
+    let parsed = AgentConfig::from_toml_str(
+        "[broker]\nverbosity = \"partial\"\n\n[target]\npath = 'C:/t.exe'\n",
+    )
+    .unwrap();
+    assert_eq!(parsed.broker.verbosity, protocol::config::EventVerbosity::Partial);
+    let error = parsed.validate().unwrap_err();
+    assert!(error.to_string().contains("partial"), "{error}");
+}
+
 fn base_config(uptimes: Vec<u64>, autoshutdown: bool) -> AgentConfig {
     let mut config = AgentConfig::default();
     config.target.path = "C:\\Targets\\evil.exe".into();
@@ -111,14 +125,12 @@ struct Boot {
     broker: Arc<FakeBroker>,
 }
 
-/// One boot against the shared repo: assemble, boot, feed, optional deadline,
-/// shutdown. Deterministic on the current-thread test runtime.
-async fn run_boot(
+/// Assemble the kernel against the shared repo and boot it (the session opens
+/// in `init`). Returns the kernel and the fake broker wired into it.
+async fn assemble_boot(
     config: &AgentConfig,
     repo: &Arc<InMemoryScopeRepository>,
-    script: &[SandboxEvent],
-    deadline: bool,
-) -> Boot {
+) -> (AgentKernel, Arc<FakeBroker>) {
     let clock = Arc::new(FakeClock::new(1_465_182_366_000));
     let broker = Arc::new(FakeBroker::default());
     let state = load_scope_state(repo.as_ref()).await.unwrap();
@@ -144,8 +156,19 @@ async fn run_boot(
         seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         user_actor_pid_gate: Arc::new(std::sync::atomic::AtomicU32::new(0)),
     });
-
     kernel.boot().await.unwrap();
+    (kernel, broker)
+}
+
+/// One boot against the shared repo: assemble, boot, feed, optional deadline,
+/// shutdown. Deterministic on the current-thread test runtime.
+async fn run_boot(
+    config: &AgentConfig,
+    repo: &Arc<InMemoryScopeRepository>,
+    script: &[SandboxEvent],
+    deadline: bool,
+) -> Boot {
+    let (kernel, broker) = assemble_boot(config, repo).await;
     feed(&kernel, script).await;
     if deadline {
         kernel.accept(SandboxEvent::SessionDeadline).await;
@@ -154,6 +177,23 @@ async fn run_boot(
     kernel.shutdown().await;
 
     // Study/reboot must come from the control channel, telemetry from events.
+    Boot { broker }
+}
+
+/// A boot that ends in a HARD VM RESET: assemble, boot, feed, fire the periodic
+/// persist tick (so the open session is on disk), then drop the kernel without
+/// `shutdown()` — no `ServiceStop`, no deadline, no finalize. A power loss
+/// mid-session.
+async fn run_boot_hard_reset(
+    config: &AgentConfig,
+    repo: &Arc<InMemoryScopeRepository>,
+    script: &[SandboxEvent],
+) -> Boot {
+    let (kernel, broker) = assemble_boot(config, repo).await;
+    feed(&kernel, script).await;
+    kernel.accept(SandboxEvent::PersistTick).await;
+    tokio::task::yield_now().await;
+    drop(kernel);
     Boot { broker }
 }
 
@@ -366,6 +406,90 @@ async fn autoshutdown_finalizes_on_real_scope_death_only_once() {
         boot.broker.of_channel(Channel::Control).first().unwrap().event_type,
         EventType::StudyRebootRequested
     );
+}
+
+/// Hard VM reset mid-session: the open session 0 lands on disk (persist tick),
+/// the VM bounces WITHOUT finalize, and the next boot must stamp session 0 as
+/// abandoned and open a FRESH session 1 — never reuse the stale id. Legacy
+/// reused it: the second boot re-published `session.started` for session 0 and
+/// the study stalled.
+#[tokio::test]
+async fn unclean_reboot_abandons_stale_session_and_opens_a_fresh_one() {
+    let config = base_config(vec![6000, 6000], false);
+    let repo = Arc::new(InMemoryScopeRepository::default());
+
+    // Session 0 scopes the target and observes a drop, then the VM loses power
+    // before any finalize (no deadline, no shutdown): the persisted record
+    // stays open (`ended_at_ms == None`).
+    let boot0 = run_boot_hard_reset(
+        &config,
+        &repo,
+        &[
+            process_started(999, None, "explorer.exe"),
+            process_started(1000, None, "evil.exe"),
+            file_written(1000, "C:\\Users\\victim\\a.txt"),
+        ],
+    )
+    .await;
+    assert!(
+        !boot0.broker.event_sequence().contains(&EventType::SessionFinalizing),
+        "a hard reset must not finalize"
+    );
+    let on_disk = repo.load().await.unwrap();
+    assert_eq!(on_disk.sessions.len(), 1, "the persist tick saved the open session 0");
+    assert!(on_disk.sessions.first().unwrap().ended_at_ms.is_none(), "session 0 left open");
+    let boot0_study = boot0.broker.of_channel(Channel::Event).first().unwrap().study;
+    assert!(!boot0_study.is_nil());
+
+    // Second boot: the stale record is stamped abandoned + ended, session 1
+    // opens, and the study continues.
+    let boot1 = run_boot(
+        &config,
+        &repo,
+        &[
+            process_started(4000, None, "explorer.exe"),
+            process_started(3000, None, "evil.exe"),
+            file_written(3000, "C:\\Users\\victim\\b.txt"),
+        ],
+        true,
+    )
+    .await;
+
+    // Wire: every envelope is stamped session 1 — no duplicate session-0
+    // traffic, exactly one `session.started`.
+    let events = boot1.broker.of_channel(Channel::Event);
+    assert!(
+        events.iter().all(|envelope| envelope.session == 1),
+        "the stale session 0 must not be reused: {:?}",
+        boot1.broker.event_sequence()
+    );
+    assert_eq!(
+        events.iter().filter(|envelope| envelope.event_type == EventType::SessionStarted).count(),
+        1,
+        "exactly one session.started on the second boot"
+    );
+    assert_eq!(events.first().unwrap().study, boot0_study, "study id survives the hard reset");
+    // The abandoned session consumed its planned slot (boot 0 of 2), so the
+    // planned table is exhausted after session 1: shutdown, not reboot.
+    assert_eq!(
+        boot1.broker.of_channel(Channel::Control).first().unwrap().event_type,
+        EventType::StudyShutdownRequested
+    );
+
+    // Persisted record: session 0 abandoned with an end stamp, session 1 clean
+    // and finalized.
+    let state = repo.load().await.unwrap();
+    assert_eq!(state.sessions.len(), 2);
+    let first = state.sessions.first().unwrap();
+    assert_eq!(first.id, 0);
+    assert!(first.abandoned, "session 0 stamped abandoned");
+    assert!(first.ended_at_ms.is_some(), "session 0 end-stamped at the next boot");
+    assert_eq!(first.scoped_processes.len(), 1, "session 0 keeps its scoped evidence");
+    let second = state.sessions.get(1).unwrap();
+    assert_eq!(second.id, 1);
+    assert!(!second.abandoned);
+    assert!(second.ended_at_ms.is_some(), "session 1 finalized normally");
+    assert_eq!(second.observed_drops.len(), 1, "session 1 drops attributed to session 1");
 }
 
 #[tokio::test]

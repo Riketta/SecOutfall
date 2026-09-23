@@ -1,10 +1,15 @@
-//! Atomic JSON file scope repository (`scope.json`, temp + rename).
+//! Atomic JSON file scope repository (`scope.json`, temp + fsync + rename).
 //!
 //! Doctrine: never truncate persistent state in place. The temp file is written
-//! fully, then renamed over the target — a crash mid-write leaves the previous
-//! state intact.
+//! fresh, fsynced, then renamed over the target — a crash mid-write leaves the
+//! previous state intact, and a VM power bounce in the rename window cannot
+//! leave a stale or empty `scope.json` (a nil study id would silently start a
+//! new study).
 
-use tokio::fs;
+use tokio::{
+    fs,
+    io::AsyncWriteExt,
+};
 
 use crate::{
     domain::scope::ScopeState,
@@ -40,8 +45,32 @@ impl ScopeRepository for JsonScopeRepository {
     async fn save(&self, state: &ScopeState) -> Result<(), ScopeRepositoryError> {
         let bytes = serde_json::to_vec_pretty(state)?;
         let temp = self.path.with_extension("json.tmp");
-        fs::write(&temp, bytes).await?;
+        // A temp left behind by a crash must not block the fresh create below.
+        match fs::remove_file(&temp).await {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error.into());
+            }
+            _ => {}
+        }
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp).await?;
+        file.write_all(&bytes).await?;
+        // Durability BEFORE the rename: this agent reboots the VM every
+        // session, so a power bounce inside the rename window is routine —
+        // without fsync it can persist an empty or stale scope DB.
+        file.sync_all().await?;
+        // Close the handle deterministically before renaming: on Windows the
+        // rename fails while the source is still open, and tokio closes the
+        // file lazily on its blocking pool.
+        drop(file.into_std().await);
         fs::rename(&temp, &self.path).await?;
+        // Best-effort directory fsync so the rename itself survives a power
+        // loss. Not done on Windows: `File::open` on a directory fails there.
+        #[cfg(unix)]
+        if let Some(parent) = self.path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
 }
@@ -73,6 +102,18 @@ mod tests {
         let path = temp_path("roundtrip");
         let repo = JsonScopeRepository::new(&path);
         let state = ScopeState { study_id: Uuid::from_u128(42), ..ScopeState::default() };
+
+        repo.save(&state).await.unwrap();
+        assert_eq!(repo.load().await.unwrap(), state);
+        assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn leftover_temp_from_a_crash_does_not_block_save() {
+        let path = temp_path("leftover-temp");
+        fs::write(path.with_extension("json.tmp"), b"stale junk").await.unwrap();
+        let repo = JsonScopeRepository::new(&path);
+        let state = ScopeState { study_id: Uuid::from_u128(7), ..ScopeState::default() };
 
         repo.save(&state).await.unwrap();
         assert_eq!(repo.load().await.unwrap(), state);

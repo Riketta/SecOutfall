@@ -58,6 +58,7 @@ fn open_session_state(scheduled: Option<u64>) -> SharedScopeState {
             scheduled_duration_secs: scheduled,
             started_at_ms: 0,
             ended_at_ms: None,
+            abandoned: false,
             scoped_processes: Vec::new(),
             observed_drops: std::collections::BTreeSet::default(),
         }],

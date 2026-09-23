@@ -54,6 +54,10 @@ pub enum ScreenshotSinkError {
     /// The transport is not connected; the frame is lost.
     #[error("screenshot sink closed")]
     Closed,
+    /// The bounded queue is saturated; the frame is dropped (overflow
+    /// policy: coalesce + loss counter — the sink never blocks its caller).
+    #[error("screenshot queue saturated; frame dropped")]
+    Full,
     /// The frame would exceed the wire cap (`MAX_PAYLOAD_LEN`); sending it
     /// would poison the connection (the peer must reject it and disconnect).
     #[error("screenshot exceeds the IPC frame cap")]

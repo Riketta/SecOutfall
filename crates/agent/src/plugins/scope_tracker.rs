@@ -3,6 +3,16 @@
 //! Publishes derived bus events (`TargetLaunched`, `ProcessEnteredScope`,
 //! `ProcessExitedScope`, `DropObserved`, `DropClosed`, `ScopeDied`); the dead-
 //! scope check is the FIXED logic (empty session != dead).
+//!
+//! Scope expectations (the target launcher's `ExtendScopeExpectation` for
+//! interpreter-resolved samples) are applied SYNCHRONOUSLY on the pipeline
+//! path: every `pre` drains the bus subscription before membership is
+//! evaluated. The launcher publishes the expectation BEFORE creating the
+//! process, so the interpreter's first `process.started` can never overtake
+//! it. The previous shape — a spawned consumer task applying expectations
+//! concurrently — lost that race: the pipeline could evaluate the
+//! interpreter's start before the consumer ran, leaving it unscoped (drops
+//! never collected).
 
 use std::sync::Arc;
 
@@ -19,8 +29,7 @@ use kernel::{
     bus::InMemoryEventBus,
 };
 use parking_lot::Mutex;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
+use tokio::sync::broadcast::Receiver;
 
 use crate::{
     app::event::{
@@ -48,9 +57,9 @@ pub struct ScopeTrackerPlugin {
     every_session: bool,
     bus: InMemoryEventBus<AgentBusEvent>,
     clock: Arc<dyn SystemClockPort>,
-    /// Bus consumer for `ExtendScopeExpectation` (from the target launcher).
-    consumer: Mutex<Option<JoinHandle<()>>>,
-    cancel: CancellationToken,
+    /// Bus subscription drained synchronously at the top of every `pre`
+    /// (see the module docs for why this is not a spawned consumer).
+    expectations: Mutex<Option<Receiver<AgentBusEvent>>>,
 }
 
 impl ScopeTrackerPlugin {
@@ -72,8 +81,35 @@ impl ScopeTrackerPlugin {
             every_session,
             bus,
             clock,
-            consumer: Mutex::new(None),
-            cancel: CancellationToken::new(),
+            expectations: Mutex::new(None),
+        }
+    }
+
+    /// Apply every pending scope expectation from the bus. Runs at the top of
+    /// `pre`, before membership is evaluated: the launcher publishes the
+    /// expectation before creating the interpreter process, so by the time
+    /// the interpreter's `process.started` reaches `pre` the expectation is
+    /// guaranteed to be sitting in this queue — race-free by ordering, not
+    /// by timing.
+    fn drain_expectations(&self) {
+        let mut subscription = self.expectations.lock();
+        let Some(subscription) = subscription.as_mut() else {
+            return;
+        };
+        loop {
+            match subscription.try_recv() {
+                Ok(AgentBusEvent::ExtendScopeExpectation { name }) => {
+                    self.tracker.lock().expect(&name);
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(count)) => {
+                    tracing::warn!(lost = count, "scope-tracker bus lag");
+                }
+                Err(
+                    tokio::sync::broadcast::error::TryRecvError::Empty
+                    | tokio::sync::broadcast::error::TryRecvError::Closed,
+                ) => break,
+            }
         }
     }
 }
@@ -95,38 +131,14 @@ impl PluginPort for ScopeTrackerPlugin {
 
         // The launcher resolves non-exe targets through interpreters (a `.js`
         // sample runs as `wscript.exe`) and tells us over the bus which image
-        // to expect next.
-        let mut receiver = self.bus.subscribe();
-        let cancel = self.cancel.clone();
-        let tracker = Arc::clone(&self.tracker);
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => break,
-                    event = receiver.recv() => match event {
-                        Ok(AgentBusEvent::ExtendScopeExpectation { name }) => {
-                            tracker.lock().expect(&name);
-                        }
-                        Ok(_) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
-                            tracing::warn!(lost = count, "scope-tracker bus lag");
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    },
-                }
-            }
-        });
-        *self.consumer.lock() = Some(handle);
+        // to expect next. Consumed inline — see `drain_expectations`.
+        *self.expectations.lock() = Some(self.bus.subscribe());
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), kernel::models::PluginError> {
-        self.cancel.cancel();
-        let handle = self.consumer.lock().take();
-        if let Some(handle) = handle {
-            let _ = handle.await;
-        }
+        // Nothing spawned: the subscription is drained inline in `pre` and
+        // dies with the plugin.
         Ok(())
     }
 }
@@ -138,6 +150,9 @@ impl MiddlewarePluginPort<SandboxEvent, crate::app::builder::AgentServices> for 
         event: &mut SandboxEvent,
         _services: &crate::app::builder::AgentServices,
     ) -> Next {
+        // Expectations first: this is what makes the launcher's
+        // publish-before-create ordering airtight for the event below.
+        self.drain_expectations();
         match event {
             SandboxEvent::Source(SourceEvent::ProcessStarted(data)) => {
                 let now = self.clock.now_ms();

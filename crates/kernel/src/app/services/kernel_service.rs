@@ -57,22 +57,39 @@ where
     /// Boot: `init` all plugins first, then `start` all — a plugin's start may
     /// rely on others being ready.
     ///
+    /// On a failed hook, every already-processed plugin is rolled back in
+    /// reverse (`stop`), so a failed boot never leaves half-live plugins
+    /// behind. `stop` is contractually idempotent and must tolerate plugins
+    /// that are initialized-but-not-started (or whose start failed midway).
+    ///
     /// # Errors
-    /// Aborts on the first failed lifecycle hook.
+    /// [`KernelError::Lifecycle`] naming the first failed plugin, after the
+    /// rollback completed.
     pub async fn boot(&self) -> Result<(), KernelError> {
-        for plugin in &self.plugins {
-            plugin
-                .init()
-                .await
-                .map_err(|source| KernelError::Lifecycle { plugin: plugin.name(), source })?;
+        for (index, plugin) in self.plugins.iter().enumerate() {
+            if let Err(source) = plugin.init().await {
+                self.rollback(index).await;
+                return Err(KernelError::Lifecycle { plugin: plugin.name(), source });
+            }
         }
-        for plugin in &self.plugins {
-            plugin
-                .start()
-                .await
-                .map_err(|source| KernelError::Lifecycle { plugin: plugin.name(), source })?;
+        for (index, plugin) in self.plugins.iter().enumerate() {
+            if let Err(source) = plugin.start().await {
+                // Include the failing plugin: its partial start may hold
+                // resources only `stop` can release.
+                self.rollback(index + 1).await;
+                return Err(KernelError::Lifecycle { plugin: plugin.name(), source });
+            }
         }
         Ok(())
+    }
+
+    /// Best-effort reverse-order `stop` of the first `count` plugins.
+    async fn rollback(&self, count: usize) {
+        for plugin in self.plugins.iter().take(count).rev() {
+            if let Err(error) = plugin.stop().await {
+                tracing::warn!(plugin = plugin.name(), %error, "boot rollback stop failed");
+            }
+        }
     }
 
     /// Shutdown: `stop` all plugins in reverse registration order. Best-effort:

@@ -60,6 +60,10 @@ pub enum FrameError {
     /// Unknown message type — IPC v1 is strict; forward compat is a version bump.
     #[error("unknown message type {0:#06x}")]
     UnknownType(u16),
+    /// Reserved `flags` bits set — IPC v1 defines none; nonzero flags would
+    /// be silently misread by a peer expecting v1 semantics.
+    #[error("reserved flags bits set: {0:#06x}")]
+    ReservedFlags(u16),
     /// Screenshot payload shorter than the 4-byte sequence prefix.
     #[error("screenshot payload needs {0} bytes minimum, got {1}")]
     MalformedScreenshot(usize, usize),
@@ -75,12 +79,14 @@ impl FrameHeader {
         [l0, l1, l2, l3, m0, m1, f0, f1]
     }
 
-    /// Decode from the wire; validates the payload cap and known message types.
+    /// Decode from the wire; validates the payload cap, known message types,
+    /// and the reserved flags field.
     ///
     /// # Errors
     /// - [`FrameError::Truncated`] when fewer than [`HEADER_LEN`] bytes are given.
     /// - [`FrameError::PayloadTooLong`] when `payload_len` exceeds the cap.
     /// - [`FrameError::UnknownType`] when `message_type` is not defined in IPC v1.
+    /// - [`FrameError::ReservedFlags`] when `flags` is nonzero (none are defined).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, FrameError> {
         if bytes.len() < HEADER_LEN {
             return Err(FrameError::Truncated(bytes.len()));
@@ -102,6 +108,9 @@ impl FrameHeader {
         }
         if !message_type::is_known(message_type) {
             return Err(FrameError::UnknownType(message_type));
+        }
+        if flags != 0 {
+            return Err(FrameError::ReservedFlags(flags));
         }
         Ok(Self { payload_len, message_type, flags })
     }

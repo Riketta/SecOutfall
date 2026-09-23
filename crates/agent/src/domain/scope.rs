@@ -62,6 +62,12 @@ pub struct SessionRecord {
     pub started_at_ms: i64,
     /// Wall clock at finalization; `None` while running.
     pub ended_at_ms: Option<i64>,
+    /// `true` when this session was found still open at the NEXT boot — the
+    /// VM lost power or hard-reset before finalization. Stamped at boot time
+    /// (never by a finalize path); a fresh session is opened afterwards so
+    /// session ids keep advancing one-per-boot.
+    #[serde(default)]
+    pub abandoned: bool,
     /// Processes that joined the scope this session.
     pub scoped_processes: Vec<ScopedProcessRecord>,
     /// Drop paths observed this session (deduplicated, sorted).
@@ -127,14 +133,19 @@ impl ScopeTracker {
             scheduled_duration_secs,
             started_at_ms: now_ms,
             ended_at_ms: None,
+            abandoned: false,
             scoped_processes: Vec::new(),
             observed_drops: BTreeSet::new(),
         });
     }
 
     /// Apply a `process.started`. Returns `true` when the process entered the
-    /// scope: its image is expected, its parent is scoped, or its pid is already
-    /// known (PID reuse guard keeps records unique per session).
+    /// scope: its image is expected, or its parent is a LIVE scoped process.
+    ///
+    /// A pid already present in the session replaces its record: Windows
+    /// recycles pids, and the previous holder either died without a stop
+    /// event (a stale record would fake scope liveness or hide real scope
+    /// death) or the event is a duplicate (replacing is harmless).
     pub fn process_entered(
         &self,
         state: &mut ScopeState,
@@ -150,9 +161,7 @@ impl ScopeTracker {
         let Some(session) = state.current_session_mut() else {
             return false;
         };
-        if session.scoped_processes.iter().any(|process| process.pid == data.pid) {
-            return false;
-        }
+        session.scoped_processes.retain(|process| process.pid != data.pid);
         session.scoped_processes.push(ScopedProcessRecord {
             pid: data.pid,
             parent_pid: data.parent_pid,
@@ -187,12 +196,15 @@ impl ScopeTracker {
         true
     }
 
-    /// Is `pid` a running-or-past member of the current session's scope?
+    /// Is `pid` a LIVE member of the current session's scope? Dead records
+    /// never match: a recycled pid must neither inherit the scope (a new
+    /// process spawned by an unrelated owner of a recycled pid) nor
+    /// attribute drops to it.
     #[must_use]
     pub fn is_scoped(&self, state: &ScopeState, pid: u32) -> bool {
-        state
-            .current_session()
-            .is_some_and(|session| session.scoped_processes.iter().any(|p| p.pid == pid))
+        state.current_session().is_some_and(|session| {
+            session.scoped_processes.iter().any(|p| p.pid == pid && p.ended_at_ms.is_none())
+        })
     }
 
     /// TRUE scope-death check (legacy had this inverted): the scope is dead only
@@ -336,14 +348,45 @@ mod tests {
     }
 
     #[test]
-    fn pid_reuse_does_not_duplicate_scope_records() {
+    fn pid_reuse_replaces_the_stale_record() {
         let mut state = state();
         let mut tracker = ScopeTracker::default();
         tracker.open_session(&mut state, 0, None);
         tracker.expect("evil.exe");
         assert!(tracker.entered(&mut state, 100, "evil.exe", 1));
-        assert!(!tracker.entered(&mut state, 100, "evil.exe", 2));
-        assert_eq!(state.current_session().unwrap().scoped_processes.len(), 1);
+        // Same pid again — Windows recycled it after an unreported death (or
+        // the event is a duplicate): the newest record wins, exactly one
+        // record remains, and its clock is the newer sighting.
+        assert!(tracker.entered(&mut state, 100, "evil.exe", 2));
+        let records = &state.current_session().unwrap().scoped_processes;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records.first().unwrap().started_at_ms, 2);
+        assert!(records.first().unwrap().ended_at_ms.is_none());
+    }
+
+    #[test]
+    fn dead_scope_members_neither_inherit_nor_attribute() {
+        let mut state = state();
+        let mut tracker = ScopeTracker::default();
+        tracker.open_session(&mut state, 0, None);
+        tracker.expect("evil.exe");
+        assert!(tracker.entered(&mut state, 100, "evil.exe", 1));
+        assert!(tracker.exited(&mut state, 100, "evil.exe", 2));
+
+        // The exited pid no longer counts as live: a new process claiming it
+        // as parent does NOT join the scope (pid-recycled parent), and its
+        // writes do not count as drops.
+        let child = ProcessStartedData {
+            pid: 300,
+            parent_pid: Some(100),
+            name: "cmd.exe".to_owned(),
+            image_path: None,
+            command_line: None,
+            os_session_id: Some(1),
+        };
+        assert!(!tracker.process_entered(&mut state, &child, 3));
+        let filter = DropFilter::new(&["*".to_owned()]);
+        assert_eq!(tracker.drop_observed(&mut state, &written(100, "C:\\x.txt"), &filter), None);
     }
 
     #[test]

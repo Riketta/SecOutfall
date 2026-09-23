@@ -42,12 +42,13 @@ fn logged(log: &Log) -> Vec<String> {
 struct LifecyclePlugin {
     name: &'static str,
     fail_init: bool,
+    fail_start: bool,
     log: Log,
 }
 
 impl LifecyclePlugin {
     fn new(name: &'static str, log: &Log) -> Self {
-        Self { name, fail_init: false, log: Arc::clone(log) }
+        Self { name, fail_init: false, fail_start: false, log: Arc::clone(log) }
     }
 }
 
@@ -67,6 +68,9 @@ impl PluginPort for LifecyclePlugin {
 
     async fn start(&self) -> Result<(), PluginError> {
         record(&self.log, format!("{}:start", self.name));
+        if self.fail_start {
+            return Err(PluginError::new(self.name, "start forced failure"));
+        }
         Ok(())
     }
 
@@ -166,7 +170,31 @@ async fn boot_fails_on_first_init_error() {
     let result = kernel.boot().await;
 
     assert!(matches!(result, Err(KernelError::Lifecycle { plugin: "bad", .. })));
-    assert_eq!(logged(&log), vec!["ok:init", "bad:init"]);
+    // The already-initialized plugin is rolled back in reverse.
+    assert_eq!(logged(&log), vec!["ok:init", "bad:init", "ok:stop"]);
+}
+
+#[tokio::test]
+async fn boot_failure_mid_start_rolls_back_everything_processed() {
+    let log: Log = Arc::default();
+    let mut failing = LifecyclePlugin::new("bad", &log);
+    failing.fail_start = true;
+    let kernel = KernelService::<TestEvent, (), InMemoryEventBus<TestEvent>, TestEvent>::new(
+        vec![Arc::new(LifecyclePlugin::new("first", &log)), Arc::new(failing)],
+        Vec::new(),
+        InMemoryEventBus::<TestEvent>::new(8),
+        (),
+    );
+
+    let result = kernel.boot().await;
+
+    assert!(matches!(result, Err(KernelError::Lifecycle { plugin: "bad", .. })));
+    // The started plugin AND the failing one (partial start may hold
+    // resources only `stop` can release) are rolled back in reverse.
+    assert_eq!(
+        logged(&log),
+        vec!["first:init", "bad:init", "first:start", "bad:start", "bad:stop", "first:stop"]
+    );
 }
 
 #[tokio::test]

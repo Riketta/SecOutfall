@@ -12,6 +12,9 @@
 //!   runs dynamic (no scheduled deadline) and finalize resolves to a clean
 //!   decision instead of `IndexOutOfRangeException`.
 //! - Dead-scope early finalization only fires when the scope actually died.
+//! - An unclean reboot (hard VM reset) can no longer stall the study: the
+//!   leftover open session is stamped `abandoned` at the next boot and a
+//!   fresh session opens — ids always advance one-per-boot.
 //! - Clock offset math is pure UTC at the port level (bug #11: legacy mixed
 //!   `SetSystemTime` UTC with local `DateTime.Now`).
 //! - The periodic persist tick (`PersistTick`) keeps the scope DB fresh so a
@@ -164,14 +167,28 @@ impl SessionManagerPlugin {
     }
 }
 
-/// Open the session exactly once per boot: after a finalized last session, or on
-/// a fresh/absent scope DB. Called from `init`.
+/// Open the session exactly once per boot: stamp a leftover open session as
+/// abandoned, then always push a fresh record. Called from `init`.
+///
+/// An open session at init time can only be an unclean-reboot leftover: the
+/// finalize path always stamps `ended_at_ms` BEFORE the reboot/shutdown
+/// request, so a persisted session without an end timestamp means the VM lost
+/// power or was hard-reset mid-session. Reusing that record would stall the
+/// study (the second boot would re-publish `session.started` for the same id);
+/// instead the stale record is closed as `abandoned` evidence and a fresh
+/// session opens, keeping ids one-per-boot.
 fn open_session_if_needed(deps: &SessionManagerDeps) {
     let now_ms = deps.clock.now_ms();
     let mut state = deps.state.lock();
-    let need_new = state.sessions.last().is_none_or(|session| session.ended_at_ms.is_some());
-    if !need_new {
-        return;
+    if let Some(session) = state.sessions.last_mut() {
+        if session.ended_at_ms.is_none() {
+            tracing::warn!(
+                abandoned_session = session.id,
+                "unclean reboot: session still open at boot; stamping abandoned"
+            );
+            session.ended_at_ms = Some(now_ms);
+            session.abandoned = true;
+        }
     }
     let id = u32::try_from(state.sessions.len()).unwrap_or(u32::MAX);
     let scheduled = deps.uptimes.get(id as usize).copied();
@@ -180,6 +197,7 @@ fn open_session_if_needed(deps: &SessionManagerDeps) {
         scheduled_duration_secs: scheduled,
         started_at_ms: now_ms,
         ended_at_ms: None,
+        abandoned: false,
         scoped_processes: Vec::new(),
         observed_drops: std::collections::BTreeSet::default(),
     });

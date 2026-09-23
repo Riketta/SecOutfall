@@ -6,6 +6,12 @@
 //! launcher uses. One attempt per boot; the per-boot nonce is passed on the
 //! command line and must be echoed in the IPC `HELLO` (anti-impostor).
 //!
+//! Like the target launcher, the launch runs OFF the pipeline on a bounded
+//! job queue: `pre` submits and returns immediately, so a slow launch
+//! mechanism never stalls ETW processing. The launched pid is stored into
+//! the shared pid gate FROM the job context (the gate is what the IPC
+//! server checks at `HELLO`).
+//!
 //! The `user_actor.started` wire event is NOT emitted here — it is evidence-
 //! based: the IPC server publishes it when a `HELLO` actually verifies.
 
@@ -26,12 +32,14 @@ use kernel::app::plugin_ports::{
     },
     plugin_port::PluginPort,
 };
+use parking_lot::Mutex;
 use protocol::config::AgentConfig;
 
 use crate::{
     app::{
         builder::AgentServices,
         event::SandboxEvent,
+        worker::JobQueue,
     },
     domain::marker::is_marker_process,
     ports::process_launcher::{
@@ -39,6 +47,10 @@ use crate::{
         ProcessLauncherPort,
     },
 };
+
+/// Launch-queue capacity. One attempt per boot in practice; bounded per
+/// doctrine.
+const LAUNCH_QUEUE_CAPACITY: usize = 8;
 
 /// Argument that carries the per-boot nonce to the user actor.
 pub const NONCE_ARGUMENT: &str = "--nonce";
@@ -63,13 +75,15 @@ pub struct UserActorSupervisorPlugin {
     deps: UserActorSupervisorDeps,
     /// One launch attempt per boot.
     attempted: AtomicBool,
+    /// Off-pipeline launch queue (spawned in `start`, stopped in `stop`).
+    queue: Mutex<Option<JobQueue<LaunchSpec>>>,
 }
 
 impl UserActorSupervisorPlugin {
     /// Assemble the plugin.
     #[must_use]
     pub fn new(deps: UserActorSupervisorDeps) -> Self {
-        Self { deps, attempted: AtomicBool::new(false) }
+        Self { deps, attempted: AtomicBool::new(false), queue: Mutex::new(None) }
     }
 
     /// Build the launch spec: the configured user-actor binary with the nonce
@@ -83,12 +97,60 @@ impl UserActorSupervisorPlugin {
             working_dir: None,
         }
     }
+
+    /// One launch job: create the process and arm the IPC server's
+    /// anti-impostor gate from the job context (the pipeline never waits
+    /// for this).
+    async fn launch_job(
+        launcher: Arc<dyn ProcessLauncherPort>,
+        pid_gate: Arc<AtomicU32>,
+        spec: &LaunchSpec,
+    ) {
+        match launcher.launch(spec).await {
+            Ok(outcome) => {
+                if let Some(pid) = outcome.pid {
+                    // Arm the IPC server's anti-impostor check; 0 is the
+                    // "ungated" sentinel, real pids are never 0.
+                    pid_gate.store(pid.max(1), Ordering::SeqCst);
+                }
+                tracing::info!(path = %spec.path, pid = ?outcome.pid, "user actor launched");
+            }
+            Err(error) => {
+                // A failed launch must not crash the session (the
+                // screenshots/reactive features degrade gracefully).
+                tracing::error!(path = %spec.path, %error, "user actor launch failed");
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl PluginPort for UserActorSupervisorPlugin {
     fn name(&self) -> &'static str {
         "user-actor-supervisor"
+    }
+
+    async fn start(&self) -> Result<(), kernel::models::PluginError> {
+        let launcher = Arc::clone(&self.deps.launcher);
+        let pid_gate = Arc::clone(&self.deps.pid_gate);
+        let queue: JobQueue<LaunchSpec> = JobQueue::spawn(LAUNCH_QUEUE_CAPACITY, move |spec| {
+            let launcher = Arc::clone(&launcher);
+            let pid_gate = Arc::clone(&pid_gate);
+            async move { Self::launch_job(launcher, pid_gate, &spec).await }
+        });
+        *self.queue.lock() = Some(queue);
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<(), kernel::models::PluginError> {
+        // A launch still queued at shutdown is abandoned (counted by the
+        // queue) — the session is ending anyway. The take result is bound
+        // first so the lock guard cannot cross the await.
+        let queue = self.queue.lock().take();
+        if let Some(queue) = queue {
+            queue.stop().await;
+        }
+        Ok(())
     }
 }
 
@@ -99,21 +161,17 @@ impl MiddlewarePluginPort<SandboxEvent, AgentServices> for UserActorSupervisorPl
             if is_marker_process(&self.deps.config.platform.non_s0_process, &data.name)
                 && !self.attempted.swap(true, Ordering::SeqCst)
             {
+                // Submit, never await: the pipeline keeps draining while the
+                // launch runs off-pipeline.
                 let spec = self.launch_spec();
-                match self.deps.launcher.launch(&spec).await {
-                    Ok(outcome) => {
-                        if let Some(pid) = outcome.pid {
-                            // Arm the IPC server's anti-impostor check; 0 is
-                            // the "ungated" sentinel, real pids are never 0.
-                            self.deps.pid_gate.store(pid.max(1), Ordering::SeqCst);
-                        }
-                        tracing::info!(path = %spec.path, pid = ?outcome.pid, "user actor launched");
-                    }
-                    Err(error) => {
-                        // A failed launch must not crash the session (the
-                        // screenshots/reactive features degrade gracefully).
-                        tracing::error!(path = %spec.path, %error, "user actor launch failed");
-                    }
+                let accepted =
+                    self.queue.lock().as_ref().is_some_and(|queue| queue.handle().submit(spec));
+                if !accepted {
+                    tracing::error!(
+                        path = %self.deps.config.user_actor.path,
+                        "launch queue refused the user-actor job — the launch is lost \
+                         (screenshots/reactive degraded for this session)"
+                    );
                 }
             }
         }

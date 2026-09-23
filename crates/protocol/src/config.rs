@@ -46,7 +46,13 @@ use serde::{
 pub enum EventVerbosity {
     /// Report nothing but control/keepalive.
     None,
-    /// Report scope-relevant events only (policy defined by the reporter plugin).
+    /// Report scope-relevant events only (policy defined by the reporter
+    /// plugin).
+    ///
+    /// RESERVED, NOT IMPLEMENTED: the reporter currently gates on `full` only,
+    /// so this tier would behave identically to [`EventVerbosity::None`].
+    /// [`AgentConfig::validate`] rejects it until the policy exists — a
+    /// silently-different verbosity tier is a footgun.
     Partial,
     /// Report everything the source produces.
     #[default]
@@ -375,6 +381,10 @@ impl AgentConfig {
         }
         if self.broker.event_channel.is_empty() {
             problems.push("broker.event_channel must not be empty");
+        }
+        if self.broker.verbosity == EventVerbosity::Partial {
+            problems
+                .push("broker.verbosity `partial` is not implemented yet; use `full` or `none`");
         }
         if self.drops.max_size == 0 {
             problems.push("drops.max_size must be positive");
