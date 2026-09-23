@@ -20,6 +20,17 @@ workspace = true
 [dependencies]
 agent.workspace = true
 anyhow.workspace = true
+async-nats.workspace = true
+futures-util.workspace = true
 kernel.workspace = true
 protocol.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "net",
+    "process",
+    "signal",
+] }

@@ -4,3 +4,5 @@ Cargo.lock.bak
 .DS_Store
 Thumbs.db
 /scope.json
+# Drop-copy tests must never write into the source tree; ignore any strays.
+/crates/agent/Drops/

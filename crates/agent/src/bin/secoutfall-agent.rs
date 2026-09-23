@@ -4,11 +4,14 @@
 //! - *(default)* `console` — full runtime on this host; Ctrl+C finalizes.
 //! - `simulate` — the phase-3 scripted single-session demo (fakes only).
 //! - `service` — SCM service mode (`--features service`).
+//! - `install` / `uninstall` — manage the SCM entry (`--features service`).
 //! - `etw-probe [seconds]` — live kernel-trace spike probe (`--features etw`).
 //!
 //! Flags:
 //! - `--config <path>` — TOML config location (default `C:\Agent.toml`;
-//!   ignored by `simulate` and `etw-probe`).
+//!   used by console/service/install, ignored by `simulate`/`etw-probe`).
+//! - `--start` — with `install`: start the service immediately after creating
+//!   it (otherwise it starts at the next boot).
 //! - `--demo` — console mode over fakes (demo config + captured broker) for
 //!   dev boxes without a NATS broker; never use in a real VM.
 
@@ -41,6 +44,8 @@ async fn main() -> anyhow::Result<()> {
     match args.mode.as_deref() {
         Some("simulate") => simulate().await,
         Some("service") => service_mode(&args).await,
+        Some("install") => service_install(&args),
+        Some("uninstall") => service_uninstall(),
         Some("etw-probe") => etw_probe().await,
         _ => console(&args).await,
     }
@@ -54,6 +59,8 @@ struct Args {
     config_path: PathBuf,
     /// Console mode over fakes (dev only).
     demo: bool,
+    /// `install`: start the service after creating it.
+    start: bool,
 }
 
 impl Args {
@@ -66,8 +73,12 @@ impl Args {
     where
         I: IntoIterator<Item = std::ffi::OsString>,
     {
-        let mut parsed =
-            Self { mode: None, config_path: PathBuf::from("C:\\Agent.toml"), demo: false };
+        let mut parsed = Self {
+            mode: None,
+            config_path: PathBuf::from("C:\\Agent.toml"),
+            demo: false,
+            start: false,
+        };
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             match arg.to_string_lossy().as_ref() {
@@ -77,6 +88,7 @@ impl Args {
                     }
                 }
                 "--demo" => parsed.demo = true,
+                "--start" => parsed.start = true,
                 positional => {
                     if parsed.mode.is_none() {
                         parsed.mode = Some(positional.to_owned());
@@ -446,6 +458,45 @@ async fn service_mode(_args: &Args) -> anyhow::Result<()> {
 #[allow(clippy::unused_async)] // signature parity with the real service mode
 async fn service_mode(_args: &Args) -> anyhow::Result<()> {
     anyhow::bail!("service mode requires building with --features service")
+}
+
+/// Create the SCM entry pointing at this exe (feature `service`).
+#[cfg(all(windows, feature = "service"))]
+fn service_install(args: &Args) -> anyhow::Result<()> {
+    agent::adapters::service_control::install(
+        &args.config_path,
+        agent::adapters::service_control::InstallOptions { start_after_install: args.start },
+    )?;
+    println!(
+        "service `{}` installed (config: {}){}",
+        agent::adapters::service_control::SERVICE_NAME,
+        args.config_path.display(),
+        if args.start { "; started" } else { "" }
+    );
+    Ok(())
+}
+
+/// Console fallback when built without the `service` feature.
+#[cfg(not(all(windows, feature = "service")))]
+fn service_install(_args: &Args) -> anyhow::Result<()> {
+    anyhow::bail!("install requires building with --features service")
+}
+
+/// Stop and delete the SCM entry (feature `service`).
+#[cfg(all(windows, feature = "service"))]
+fn service_uninstall() -> anyhow::Result<()> {
+    agent::adapters::service_control::uninstall()?;
+    println!(
+        "service `{}` uninstalled; the entry disappears once the current process exits",
+        agent::adapters::service_control::SERVICE_NAME
+    );
+    Ok(())
+}
+
+/// Console fallback when built without the `service` feature.
+#[cfg(not(all(windows, feature = "service")))]
+fn service_uninstall() -> anyhow::Result<()> {
+    anyhow::bail!("uninstall requires building with --features service")
 }
 
 /// ETW probe: run a live kernel trace for N seconds and summarize what we see.

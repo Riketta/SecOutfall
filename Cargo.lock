@@ -369,8 +369,11 @@ version = "0.1.0"
 dependencies = [
  "agent",
  "anyhow",
+ "async-nats",
+ "futures-util",
  "kernel",
  "protocol",
+ "serde_json",
  "tokio",
 ]
 

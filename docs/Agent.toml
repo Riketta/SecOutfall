@@ -1,0 +1,133 @@
+# SecOutfall agent configuration (`C:\Agent.toml`).
+#
+# Strict schema: unknown or ill-typed keys are rejected at boot, sections that
+# are missing entirely fall back to the defaults shown here. This file lists
+# every key with its default value — keep it in sync with
+# `crates/protocol/src/config.rs` (a golden test in
+# `crates/protocol/tests/config_sample.rs` enforces exactly that).
+#
+# The only value that differs from the built-in defaults is `target.path`:
+# validation refuses an empty sample path, so a ready-to-run sample must name
+# one.
+
+[broker]
+# NATS server URL. The agent retries the connection at startup (18 × 5 s,
+# legacy parity) because the broker may come up after the VM boots.
+uri = "nats://127.0.0.1:4222"
+# Control subject: keepalive / reboot / shutdown requests.
+control_channel = "control"
+# Event subject: all sandbox events and reports.
+event_channel = "events"
+# Event stream verbosity gate: "full" or "minimal".
+verbosity = "full"
+
+[target]
+# The detonated sample. Non-executables are resolved via shell associations.
+path = "C:\\Targets\\sample.exe"
+# Arguments passed to the sample.
+args = []
+# Relaunch the sample in every session, not only session 0.
+every_session = false
+
+[study]
+# Session durations in seconds, one entry per planned session (e.g. 24 studies
+# of 100 min: [6000, 6000, ...]). An EMPTY list means dynamic mode: sessions
+# end when every scoped process has died (legacy bug #6 fixed).
+# uptimes = [6000, 6000, 6000]
+uptimes = []
+# Finalize early (and end the study) once every scoped process died — requires
+# the dead-session detection to actually work; leave off unless you want it.
+autoshutdown = false
+# Extra processes killed at every finalization.
+processes_to_terminate = ["WINWORD", "POWERPNT", "EXCEL", "OfficeClickToRun"]
+# Scope DB location (atomic-write JSON; carries the study id across reboots).
+scope_path = "scope.json"
+# Ransomware canary files; reserved (not yet enforced).
+files_to_validate = []
+
+[drops]
+# Local copy directory.
+path = "Drops"
+# Extension filter. `*` = everything, `none` = extensionless files, entries
+# otherwise match case-insensitively with an optional leading dot.
+extensions = [".txt", ".exe", ".dll", ".bat", ".ps1", ".py", ".js", ".vbs", "none"]
+# Per-file size cap in bytes (10 MiB). ENFORCED in the rewrite — legacy
+# parsed but never applied it (legacy bug #3).
+max_size = 10485760
+# Max drops collected per session; overflow is counted and reported, never
+# buffered into OOM.
+limit_per_session = 30
+# Upload endpoint (`http://<controller>:<port>`). Omit to disable upload;
+# copies stay on disk either way.
+# upload_uri = "http://127.0.0.1:8085"
+
+[screenshots]
+# Local save directory for received screenshots (agent side).
+path = "Screenshots"
+# Save received screenshots locally.
+save = false
+# Max screenshots per session; also the capture quota pushed to the user
+# actor (respected exactly — legacy bug #4 fixed).
+max_per_session = 30
+# Upload endpoint; omit to disable.
+# upload_uri = "http://127.0.0.1:8085"
+
+[time]
+# Fake wall clock at study start, unix seconds. 0 = resync via NTP/w32tm and
+# freeze; any other value is set directly. The clock is DELIBERATELY fake —
+# correlate telemetry by study/session ids, never by wall timestamps.
+timestamp = 0
+# Seconds added to the clock at each finalization (may be negative).
+offset_secs = 0
+
+[platform]
+# Interactive-process launch mechanism: "token" (CreateProcessAsUser with the
+# interactive user's duplicated token) or "sched_task" (legacy EventID-777
+# scheduled-task trick via runas_utility_path).
+launch_mechanism = "token"
+# Marker process whose sighting signals an interactive session.
+non_s0_process = "explorer"
+# Delay before requesting reboot/shutdown at finalization, seconds.
+shutdown_delay_secs = 5
+# Helper binary for the "sched_task" mechanism.
+runas_utility_path = "windows-run-as-system.exe"
+
+[user_actor]
+# User-actor binary path (launched into the interactive session; receives ALL
+# config over IPC and reads no files).
+path = "secoutfall-user-actor.exe"
+# React to focus changes (e.g. installer click-through).
+reactive = false
+# Run scripted activities (notepad / calc / explorer scenarios).
+scripted = false
+# Focus tracking method: "polling" (50 ms GetForegroundWindow) or
+# "win_events" (EVENT_SYSTEM_FOREGROUND hooks).
+focus_method = "win_events"
+# Capture screenshots on focus changes. When false, NO screenshots are
+# produced or sent (legacy bug #4 fixed).
+screencapture = false
+
+[scoring]
+# Session score = maximum over observed signals (legacy parity).
+# Score for a CLI/interpreter process entering the scope.
+cli_started = 4
+# Score for an observed drop.
+drop_observed = 5
+
+[telemetry]
+# Master switch for Sentry-protocol egress to the local GlitchTip. Egress
+# from the analysis VM is visible to malware — keep off unless GlitchTip is
+# deployed. Timestamps will be skewed by the fake clock; correlate by ids.
+sentry_enabled = false
+# Agent DSN; empty disables agent reporting even when enabled.
+dsn = ""
+# Separate user-actor DSN, pushed over IPC (independent failure domain).
+user_actor_dsn = ""
+
+[debug]
+# Do not request reboot/shutdown at finalization (dev hosts!).
+skip_reboot_and_shutdown = false
+# Do not manipulate the system clock.
+skip_time_manipulation = false
+# Log to console in addition to rolling files.
+console = false
