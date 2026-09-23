@@ -1,0 +1,8 @@
+# The fuzz workspace builds libFuzzer targets: nightly + `cargo +nightly fuzz`
+# are required (MSVC/libFuzzer unsupported — Linux CI only). This file stops
+# rustup's upward lookup, so commands run inside fuzz/ never fall back to the
+# workspace's stable pin.
+[toolchain]
+channel = "nightly"
+profile = "minimal"
+components = ["rustfmt"]

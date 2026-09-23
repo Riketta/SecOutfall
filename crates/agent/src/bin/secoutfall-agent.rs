@@ -497,10 +497,15 @@ async fn attach_ipc(
     tracing::info!("user-actor IPC server attached");
 }
 
-/// Fallback when built without the `ipc` feature.
+/// Fallback when built without the `ipc` feature (also the Linux build, where
+/// the real adapter never compiles).
 #[cfg(not(all(windows, feature = "ipc")))]
-#[allow(clippy::needless_pass_by_value, clippy::trivially_copy_pass_by_ref)]
-#[allow(clippy::too_many_arguments)] // signature parity with the real adapter
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::too_many_arguments, // signature parity with the real adapter
+    clippy::unused_async, // ditto: the real adapter awaits
+)]
 async fn attach_ipc(
     _session: &agent::app::runtime::RunningSession,
     _config: &Arc<protocol::config::AgentConfig>,

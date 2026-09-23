@@ -1,6 +1,6 @@
 # SecOutfall
 
-An agentic **Windows malware analysis sandbox**, rewritten in Rust. An in-VM
+An agentic **Windows malware analysis sandbox** written in Rust. An in-VM
 agent detonates a sample (the *target*) inside an isolated Windows VM and
 observes it; an external Controller (separate repository) consumes its reports
 over NATS and HTTP.
@@ -16,9 +16,9 @@ correlate reports by study/session ids, never by wall timestamps.
 > coming from inside the VM is hostile input.
 
 Architecture: hexagonal (ports & adapters) **microkernel** with a middleware
-pipeline and an event bus; event-driven, fire-and-forget core. The rewrite
-doctrine (ports, plugins, wire protocol, legacy bug list, testing rules) lives
-in the repository `AGENTS.md`.
+pipeline and an event bus; event-driven, fire-and-forget core. The
+architecture doctrine, conventions, and development rules live in the
+repository `AGENTS.md`.
 
 ## Crates
 
@@ -27,8 +27,8 @@ in the repository `AGENTS.md`.
 | `kernel` | lib | Generic microkernel: ports, pipeline runner, in-memory event bus, plugin lifecycle. Pure Rust, no Windows deps, tested on any OS. |
 | `protocol` | lib | Shared boundary models: canonical event taxonomy, NATS envelope + payload DTOs (v3), IPC frame schema, strict TOML config. No kernel types leak here. |
 | `agent` | lib + bin `secoutfall-agent` | The session-0 agent. Lib: hexagon (domain, app, plugins, adapters). Bin: thin composition root. |
-| `user-actor` | lib + bin `secoutfall-user-actor` | Interactive-session component (legacy `ExternalModuleUA`): observes the desktop (focus, screenshots) and acts in it (reactive + scripted input). Kernel-light hexagon; all config arrives over IPC, it reads no files. |
-| `devtools` | bins | `dummy-broker` (NATS observer), `session-sim` (fake-source multi-session study simulator). |
+| `user-actor` | lib + bin `secoutfall-user-actor` | Interactive-session component: observes the desktop (focus tracking, screenshots) and acts in it (reactive + scripted input). Kernel-light hexagon; all config arrives over IPC, it reads no files. |
+| `devtools` | bins | `dummy-broker` (NATS traffic observer), `session-sim` (fake-source multi-session study simulator). |
 | `fuzz/` | separate workspace | cargo-fuzz targets (IPC framing, config parsing, screenshot payload decode). Linux + nightly only. |
 
 ## The agent binary
@@ -53,7 +53,7 @@ default documented is [`docs/Agent.toml`](docs/Agent.toml) — parsing is strict
 with the schema.
 
 Feature flags (`agent`): `etw` (kernel-trace consumption), `launcher`
-(`CreateProcessAsUser` token launcher), `schedtask` (legacy EventID-777
+(`CreateProcessAsUser` token launcher), `schedtask` (EventID-777
 scheduled-task launcher via the run-as helper), `associations`
 (shell-association target resolution), `killer` (finalize process
 termination), `time_shift` (`SetSystemTime` fake clock), `ipc` (user-actor
@@ -67,7 +67,7 @@ Feature flags (`user-actor`): `ipc`, `focus-poll`, `focus-winevents`,
 - NATS, two channels (`[broker] control_channel` / `event_channel`), envelope
   `{"v":3,"type","ts","study","session","seq","data"}` — `seq` is monotonic
   per publisher for Controller-side loss detection. The agent publishes only;
-  it never subscribes yet.
+  it never subscribes.
 - HTTP uploads: multipart `meta` (JSON) + `blob` (octet-stream), streamed and
   size-capped.
 - Agent ↔ user-actor: named pipe `\\.\pipe\secoutfall\user-actor-v1`,
@@ -103,12 +103,11 @@ C:\secoutfall-agent.exe install --start   # or let the next boot start it
 ## Telemetry
 
 `tracing` macros everywhere; subscriber = `registry()` + `EnvFilter` +
-non-blocking rolling files + console + `sentry-tracing` layer → a **local
-GlitchTip**. Sentry joins as a layer in the single global registry — no
-conflict with `tracing-subscriber`. Egress is gated by
-`[telemetry] sentry_enabled` (egress from the analysis VM is visible to
-malware). The user actor reports to GlitchTip directly with its own DSN,
-pushed over IPC.
+console + `sentry-tracing` layer → a **local GlitchTip**. Sentry joins as a
+layer in the single global registry — no conflict with
+`tracing-subscriber`. Egress is gated by `[telemetry] sentry_enabled` (egress
+from the analysis VM is visible to malware). The user actor reports to
+GlitchTip directly with its own DSN, pushed over IPC.
 
 ## Testing
 
@@ -118,20 +117,25 @@ cargo test --workspace --all-features   # unit + integration + property + chaos
 
 - Fakes per port for every plugin; deterministic injected clock.
 - `proptest` property suites on the hostile-input boundaries (wire framing,
-  config, scope membership, domain models) — the same call sites the
-  Linux-CI fuzz targets drive.
+  screenshot payloads, config, scope membership, domain models) — the same
+  call sites the Linux-CI fuzz targets drive.
 - Chaos suites: broker death mid-session, share-locked/vanishing/Unicode
-  drops, IPC peer death mid-frame, 200-task focus storms.
-- `twenty_four_session_full_study_simulation` drives a complete 24-boot study
-  (reboot/shutdown control tail, gap-free sequences, stable study id) in ~1 s.
-- `cargo +nightly fmt --all` (the rustfmt config needs nightly), then
-  `cargo clippy --workspace --all-targets --all-features`.
+  drops, unusable drops volume, IPC peer death mid-frame, 200-task focus
+  storms.
+- A complete 24-boot study simulation (reboot/shutdown control tail,
+  gap-free sequences, stable study id) runs in ~1 second as part of the
+  regular suite.
 
-## Status
+## Development
 
-Phases 0–12 of the rewrite are complete (kernel, protocol, agent hexagon +
-plugins, both launch mechanisms, telemetry egress, user actor, scripted
-activities, hardening, ops). Remaining: VM soak and the CI runner decision
-(self-hosted integration runner). `Legacy/` (the original C# implementation)
-and `Reference/` (the architecture template) live in the parent directory,
-outside this repository.
+Toolchains are pinned by files: `rust-toolchain.toml` (workspace: stable,
+clippy + rustfmt) and `fuzz/rust-toolchain.toml` (nightly). Formatting needs
+nightly rustfmt because the `rustfmt.toml` uses unstable options:
+
+```sh
+cargo +nightly fmt --all
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+CI (GitHub Actions) runs fmt + clippy + tests + `cargo-deny` on Linux and
+clippy + tests + build (default and all features) on Windows.
