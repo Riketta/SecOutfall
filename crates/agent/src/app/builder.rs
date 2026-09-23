@@ -114,6 +114,15 @@ pub struct AgentDeps {
     pub statistics: Arc<SessionStatistics>,
     /// Per-boot user-actor nonce; shared with the IPC server adapter.
     pub user_actor_nonce: String,
+    /// THE per-boot wire sequence counter — one per boot, shared by every
+    /// publisher in the process (plugins, scheduler, IPC server). Gaps mean
+    /// lost messages; duplicates mean publisher restarts. Never create a
+    /// second counter for the same boot.
+    pub seq: Arc<std::sync::atomic::AtomicU64>,
+    /// Expected user-actor client pid (0 = unknown/ungated). The supervisor
+    /// stores the pid it launched; the IPC server compares it against
+    /// `GetNamedPipeClientProcessId` at `HELLO` (anti-impostor).
+    pub user_actor_pid_gate: Arc<std::sync::atomic::AtomicU32>,
     /// Derived-event bus (also handed to tests/simulator for extra assertions).
     pub bus: InMemoryEventBus<AgentBusEvent>,
 }
@@ -147,7 +156,7 @@ pub fn target_image_name(config: &AgentConfig) -> String {
 #[allow(clippy::too_many_lines)] // linear wiring, kept on purpose
 #[must_use]
 pub fn assemble(deps: AgentDeps) -> AgentKernel {
-    let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let seq = Arc::clone(&deps.seq);
     let services = AgentServices {
         config: Arc::clone(&deps.config),
         scope_repo: Arc::clone(&deps.scope_repo),
@@ -234,6 +243,7 @@ pub fn assemble(deps: AgentDeps) -> AgentKernel {
         config: Arc::clone(&deps.config),
         launcher: Arc::clone(&deps.launcher),
         nonce: deps.user_actor_nonce,
+        pid_gate: Arc::clone(&deps.user_actor_pid_gate),
     }));
 
     let plugins: Vec<Arc<dyn PluginPort>> = vec![

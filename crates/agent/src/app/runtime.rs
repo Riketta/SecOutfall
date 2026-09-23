@@ -62,6 +62,12 @@ pub struct SessionDeps {
     pub statistics: Arc<crate::plugins::statistics::SessionStatistics>,
     /// Per-boot user-actor nonce; shared with the IPC server adapter.
     pub user_actor_nonce: String,
+    /// THE per-boot wire sequence counter (shared with the IPC server and
+    /// every plugin — see [`AgentDeps::seq`]).
+    pub seq: Arc<std::sync::atomic::AtomicU64>,
+    /// Expected user-actor client pid gate (shared with the IPC server; see
+    /// [`AgentDeps::user_actor_pid_gate`]).
+    pub user_actor_pid_gate: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// A running session: the assembled kernel plus its driving handles.
@@ -82,7 +88,7 @@ impl RunningSession {
         deps: SessionDeps,
     ) -> Result<(Self, mpsc::Sender<SandboxEvent>, mpsc::Receiver<SandboxEvent>), anyhow::Error>
     {
-        let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let seq = deps.seq.clone();
         let state = load_scope_state(deps.scope_repo.as_ref()).await?;
         let bus = kernel::bus::InMemoryEventBus::new(4096);
         let kernel = Arc::new(assemble(AgentDeps {
@@ -98,6 +104,8 @@ impl RunningSession {
             shifter: Arc::clone(&deps.shifter),
             statistics: Arc::clone(&deps.statistics),
             user_actor_nonce: deps.user_actor_nonce,
+            seq: Arc::clone(&seq),
+            user_actor_pid_gate: Arc::clone(&deps.user_actor_pid_gate),
             bus,
         }));
         kernel.boot().await?;

@@ -264,36 +264,65 @@ fn parse_event(record: &ferrisetw::EventRecord, locator: &SchemaLocator) -> Opti
     Some(parsed)
 }
 
+/// The shared payload of the registry key-operation events; `None` when the
+/// mandatory fields are missing from the schema (defensive: classic kernel
+/// registry schemas vary by Windows version).
+fn registry_key_data(
+    pid: Option<u32>,
+    key_name: Option<String>,
+    key_handle: Option<u64>,
+) -> Option<RegistryKeyData> {
+    Some(RegistryKeyData { pid: pid?, key_name: key_name?, key_handle })
+}
+
+/// Map one registry event, variant for variant. A fallthrough here must never
+/// fabricate a different event kind (legacy mislabeled everything as
+/// `key_created`) — unexpected types are logged and dropped.
 fn parse_registry(parser: &Parser<'_, '_>, event: EventType) -> Option<SourceEvent> {
     let key_name = opt_string(parser, &["KeyName"]);
     let key_handle = opt_u64(parser, &["KeyHandle"]);
+    let pid = opt_u32(parser, &["PID", "ProcessId"]);
     match event {
+        EventType::RegistryKeyCreated => {
+            Some(SourceEvent::RegistryKeyCreated(registry_key_data(pid, key_name, key_handle)?))
+        }
+        EventType::RegistryKeyOpened => {
+            Some(SourceEvent::RegistryKeyOpened(registry_key_data(pid, key_name, key_handle)?))
+        }
+        EventType::RegistryKeyDeleted => {
+            Some(SourceEvent::RegistryKeyDeleted(registry_key_data(pid, key_name, key_handle)?))
+        }
+        EventType::RegistryKeyQueried => {
+            Some(SourceEvent::RegistryKeyQueried(registry_key_data(pid, key_name, key_handle)?))
+        }
+        EventType::RegistryKeyClosed => {
+            Some(SourceEvent::RegistryKeyClosed(registry_key_data(pid, key_name, key_handle)?))
+        }
         EventType::RegistryValueQueried => {
             Some(SourceEvent::RegistryValueQueried(RegistryValueQueriedData {
-                pid: parser.try_parse::<u32>("PID").ok()?,
+                pid: pid?,
                 key_name: key_name?,
                 value_name: opt_string(parser, &["ValueName"]),
                 key_handle,
             }))
         }
         EventType::RegistryValueSet => Some(SourceEvent::RegistryValueSet(RegistryValueSetData {
-            pid: parser.try_parse::<u32>("PID").ok()?,
+            pid: pid?,
             key_name: key_name?,
             value_name: opt_string(parser, &["ValueName"]),
             key_handle,
             value_type: opt_string(parser, &["ValueType"]),
             data_size: opt_u32(parser, &["DataSize"]),
         })),
-        _ => Some(SourceEvent::RegistryKeyCreated(RegistryKeyData {
-            pid: parser.try_parse::<u32>("PID").ok()?,
-            key_name: key_name?,
-            key_handle,
-        })),
+        unexpected => {
+            tracing::debug!(?unexpected, "unmapped registry event ignored");
+            None
+        }
     }
 }
 
 fn parse_file_io(parser: &Parser<'_, '_>, event: EventType) -> Option<SourceEvent> {
-    let pid = parser.try_parse::<u32>("PID").ok();
+    let pid = opt_u32(parser, &["PID", "ProcessId"]);
     let file_object = opt_u64(parser, &["FileObject"]);
     let file_key = opt_u64(parser, &["FileKey"]);
     let file_name = opt_string(parser, &["FileName"]);

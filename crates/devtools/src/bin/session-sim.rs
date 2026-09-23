@@ -68,6 +68,8 @@ async fn main() -> anyhow::Result<()> {
             shifter: Arc::clone(&clock) as Arc<dyn agent::ports::clock::ClockShiftPort>,
             statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
             user_actor_nonce: "sim-nonce".to_owned(),
+            seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            user_actor_pid_gate: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             bus: kernel::bus::InMemoryEventBus::new(1024),
         });
 

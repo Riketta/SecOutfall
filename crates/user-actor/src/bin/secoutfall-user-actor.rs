@@ -279,10 +279,12 @@ async fn start_focus_source_when_configured(
     loop {
         match rx.recv().await {
             Ok(ActorBusEvent::ConfigApplied(config)) => {
+                // Checked on EVERY push (idempotent): an invalid first DSN
+                // must not lock out a valid re-push.
+                init_sentry_once(config.telemetry_dsn.as_ref());
                 if started.swap(true, Ordering::SeqCst) {
                     continue; // re-pushes (GET_CONFIG) do not restart the source
                 }
-                init_sentry_once(config.telemetry_dsn.as_ref());
                 start_focus_source(config.focus_method, Arc::clone(&inlet), cancel.child_token());
             }
             Ok(_) => {}

@@ -2,7 +2,9 @@
 //! the only thing faked is the user-actor at the other end of the pipe.
 //!
 //! Exercises: nonce rejection (one strike), the HELLO→WELCOME config push,
-//! `GET_CONFIG` re-pull, screenshot frame → inlet delivery, clean shutdown.
+//! `GET_CONFIG` re-pull (and its refusal before the handshake), the
+//! pre-handshake deadline, the pid gate, screenshot frame → inlet delivery,
+//! clean shutdown.
 #![cfg(all(windows, feature = "ipc"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -11,6 +13,7 @@ use std::{
     sync::{
         Arc,
         atomic::{
+            AtomicU32,
             AtomicU64,
             Ordering,
         },
@@ -131,6 +134,39 @@ fn hello_payload(nonce: &str) -> Vec<u8> {
 /// for `first_pipe_instance` or cross-connect to each other's servers.
 fn test_pipe(suffix: &str) -> String {
     format!("\\\\.\\pipe\\secoutfall\\test-{suffix}-{}", std::process::id())
+}
+
+/// Boot a server on a private pipe with the test-friendly AU DACL; `apply`
+/// layers test-specific builders (timeout override, pid gate, ...) on top.
+async fn boot_server(
+    pipe: &str,
+    nonce: &str,
+    apply: impl FnOnce(IpcServerAdapter) -> IpcServerAdapter,
+) -> Arc<IpcServerAdapter> {
+    let repo = Arc::new(InMemoryScopeRepository::default());
+    let state: SharedScopeState =
+        agent::app::builder::load_scope_state(repo.as_ref()).await.unwrap();
+    let adapter = apply(
+        IpcServerAdapter::with_sddl(
+            state,
+            Arc::new(UserActorConfig::default()),
+            nonce.to_owned(),
+            // Test-only loosening: the production DACL would deny this
+            // non-elevated test client; AU keeps it connectable.
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)".to_owned(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .with_pipe_name(pipe.to_owned()),
+    );
+    let adapter = Arc::new(adapter);
+    {
+        let adapter = Arc::clone(&adapter);
+        let inlet = Arc::new(RecordingInlet::default());
+        tokio::spawn(async move {
+            let _ = adapter.run(inlet).await;
+        });
+    }
+    adapter
 }
 
 #[tokio::test]
@@ -280,6 +316,110 @@ async fn peer_death_mid_frame_returns_server_to_accept_loop() {
     let welcome: Welcome = serde_json::from_slice(&payload).unwrap();
     assert_eq!(welcome.config, UserActorConfig::default());
     client.expect_disconnect_after_stop(&adapter).await;
+}
+
+/// A control frame before a verified HELLO must be answered with an ERROR,
+/// never with the config push — and the state machine must still accept the
+/// real HELLO afterwards on the same connection.
+#[tokio::test]
+async fn get_config_before_hello_gets_error_not_welcome() {
+    let nonce = "c0ffee99".to_owned();
+    let pipe = test_pipe("pre-hello-config");
+    let _server = boot_server(&pipe, &nonce, |adapter| adapter).await;
+
+    let mut client = TestClient::open(&pipe).await.unwrap();
+    // Correct nonce — useless: the handshake has not happened yet.
+    client
+        .send_frame(
+            message_type::GET_CONFIG,
+            &serde_json::to_vec(&protocol::ipc::messages::GetConfig {}).unwrap(),
+        )
+        .await;
+    let (frame, payload) = client.read_frame().await.unwrap();
+    assert_eq!(frame.message_type, message_type::ERROR, "no config before HELLO");
+    let error: protocol::ipc::messages::ErrorFrame = serde_json::from_slice(&payload).unwrap();
+    assert!(error.error.contains("handshake"), "{error:?}");
+
+    // The connection recovers: the next frame after our HELLO is the WELCOME
+    // (a buggy server would have answered GET_CONFIG with a WELCOME above).
+    client.send_frame(message_type::HELLO, &hello_payload(&nonce)).await;
+    let (frame, payload) = client.read_frame().await.unwrap();
+    assert_eq!(frame.message_type, message_type::WELCOME, "state machine recovers");
+    let welcome: Welcome = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(welcome.config, UserActorConfig::default());
+}
+
+/// A client that never completes HELLO is dropped after the (overridden,
+/// short) handshake deadline — it cannot squat the pipe instance forever.
+#[tokio::test]
+async fn hello_after_deadline_is_rejected() {
+    let nonce = "dead1ine".to_owned();
+    let pipe = test_pipe("handshake-deadline");
+    let _server = boot_server(&pipe, &nonce, |adapter| {
+        adapter.with_handshake_timeout(Duration::from_millis(200))
+    })
+    .await;
+
+    let mut client = TestClient::open(&pipe).await.unwrap();
+    let started = std::time::Instant::now();
+    // Send nothing: the deadline must evict us. The ERROR is best effort —
+    // either it arrives or the connection just ends.
+    match client.read_frame().await {
+        Ok((frame, _payload)) => assert_eq!(frame.message_type, message_type::ERROR),
+        Err(error) => assert_eq!(
+            error.kind(),
+            io::ErrorKind::UnexpectedEof,
+            "server must end the silent connection: {error}"
+        ),
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(100),
+        "evicted before the deadline even fired: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "deadline override ignored (waited {elapsed:?}; production default is 10 s)"
+    );
+    client.expect_disconnect().await;
+}
+
+/// With the pid gate armed (supervisor stored the launched child's pid), a
+/// HELLO from any other pid is rejected even with a valid nonce. The real
+/// client pid cannot be faked here, so the gate is set to a value that cannot
+/// be ours — rejection proves the gate is consulted.
+#[tokio::test]
+async fn expected_pid_gate_rejects_foreign_client() {
+    let nonce = "gatekept1".to_owned();
+    let pipe = test_pipe("pid-gate");
+    let _server = boot_server(&pipe, &nonce, |adapter| {
+        adapter.with_expected_client_pid(Arc::new(AtomicU32::new(u32::MAX - 1)))
+    })
+    .await;
+
+    let mut client = TestClient::open(&pipe).await.unwrap();
+    client.send_frame(message_type::HELLO, &hello_payload(&nonce)).await;
+    let (frame, payload) = client.read_frame().await.unwrap();
+    assert_eq!(frame.message_type, message_type::ERROR, "foreign pid must be rejected");
+    let error: protocol::ipc::messages::ErrorFrame = serde_json::from_slice(&payload).unwrap();
+    assert!(error.error.contains("rejected"), "{error:?}");
+    client.expect_disconnect().await;
+}
+
+/// Gate unset (0) — launch failed or sched-task reported no pid — keeps the
+/// nonce-only verification working.
+#[tokio::test]
+async fn ungated_accepts_valid_nonce() {
+    let nonce = "n0gate00".to_owned();
+    let pipe = test_pipe("ungated");
+    let _server = boot_server(&pipe, &nonce, |adapter| adapter).await;
+
+    let mut client = TestClient::open(&pipe).await.unwrap();
+    client.send_frame(message_type::HELLO, &hello_payload(&nonce)).await;
+    let (frame, payload) = client.read_frame().await.unwrap();
+    assert_eq!(frame.message_type, message_type::WELCOME);
+    let welcome: Welcome = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(welcome.session_id, 0);
 }
 
 impl TestClient {

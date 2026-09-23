@@ -141,6 +141,8 @@ async fn run_boot(
         statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
         bus: InMemoryEventBus::new(1024),
         user_actor_nonce: "test-nonce".to_owned(),
+        seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        user_actor_pid_gate: Arc::new(std::sync::atomic::AtomicU32::new(0)),
     });
 
     kernel.boot().await.unwrap();

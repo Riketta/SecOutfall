@@ -54,6 +54,10 @@ pub enum ScreenshotSinkError {
     /// The transport is not connected; the frame is lost.
     #[error("screenshot sink closed")]
     Closed,
+    /// The frame would exceed the wire cap (`MAX_PAYLOAD_LEN`); sending it
+    /// would poison the connection (the peer must reject it and disconnect).
+    #[error("screenshot exceeds the IPC frame cap")]
+    Oversize,
 }
 
 /// A virtual key named for script use; mapped to Win32 VK codes by adapters.

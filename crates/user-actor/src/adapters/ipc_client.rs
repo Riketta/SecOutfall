@@ -4,11 +4,18 @@
 //! kernel inlet as [`ActorEvent::Welcome`]. Driven: [`IpcScreenshotSink`]
 //! (cloneable) feeds screenshot frames into the same loop through a bounded
 //! channel — backpressure instead of unbounded memory (hostile-input rule).
+//! Oversized frames are rejected at the sink, never queued: a >16 MiB frame
+//! would be rejected by the peer, and resending it after reconnect would
+//! loop forever.
 //!
 //! Connection lifecycle: retry connecting until the server appears (the agent
 //! may start the pipe after us), handshake with the per-boot nonce, and
-//! reconnect on any loss. A handshake **rejection** is fatal: the nonce is
-//! wrong for this boot and retrying cannot fix it.
+//! reconnect on any loss (with a small delay so a peer that accepts-then-
+//! drops cannot spin the loop hot). A handshake **rejection** is fatal: the
+//! nonce is wrong for this boot and retrying cannot fix it. Frame READS run
+//! on a dedicated task: `read_exact` consumes pipe bytes even when its future
+//! is abandoned, so the read must never be dropped mid-frame (a `select!`
+//! over reads desyncs the stream — the historical bug this structure fixes).
 
 use std::{
     sync::Arc,
@@ -52,8 +59,22 @@ use crate::{
 /// Delay between connection attempts while the server pipe does not exist.
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+/// Delay after a lost connection before reconnecting — a peer that accepts
+/// and immediately drops must not spin the loop hot (each new connection
+/// would otherwise get a fresh connect deadline with no backoff).
+const RECONNECT_DELAY: Duration = Duration::from_millis(500);
+
 /// Bounded in-flight screenshot frames before the sink applies backpressure.
 const SINK_CHANNEL_CAPACITY: usize = 4;
+
+/// Bounded queue of frames read from the pipe, awaiting dispatch. The reader
+/// task blocks on send when the loop is busy — pipe backpressure, never data
+/// loss (a dropped in-flight read would desync the stream).
+const INBOUND_CHANNEL_CAPACITY: usize = 8;
+
+/// Grace period for the reader task to notice teardown (cancel token / pipe
+/// close) before it is aborted along with the rest of the connection.
+const READER_TEARDOWN_GRACE: Duration = Duration::from_secs(1);
 
 /// IPC client failures.
 #[derive(Debug, thiserror::Error)]
@@ -149,13 +170,23 @@ impl IpcClientAdapter {
     ) -> Result<(), IpcClientError> {
         loop {
             let client = self.connect().await?;
-            let (mut reader, mut writer) = tokio::io::split(client);
+            let (reader, mut writer) = tokio::io::split(client);
 
             self.send_hello(&mut writer).await?;
-            match self.exchange(&mut reader, &mut writer, inlet.as_ref()).await? {
+            // `exchange` owns both halves: it must be able to close the pipe
+            // (dropping the writer) to un-teardown the reader task.
+            match self.exchange(reader, writer, inlet.as_ref()).await? {
                 ExchangeOutcome::Cancelled => return Ok(()),
                 ExchangeOutcome::Disconnected => {
                     tracing::warn!("agent IPC connection lost; reconnecting");
+                    // Backoff before the next attempt: the loss may be a
+                    // hostile accept-then-drop, and each retry would get a
+                    // fresh connect deadline.
+                    tokio::select! {
+                        biased;
+                        () = self.cancel.cancelled() => return Ok(()),
+                        () = tokio::time::sleep(RECONNECT_DELAY) => {}
+                    }
                 }
                 ExchangeOutcome::Rejected => return Err(IpcClientError::HandshakeRejected),
             }
@@ -214,9 +245,74 @@ impl IpcClientAdapter {
     /// Read/write loop: receive frames (Welcome → inlet; Error → judge),
     /// forward queued screenshots. Runs until EOF, error, cancel, or
     /// rejection.
+    ///
+    /// Frame reads belong to a DEDICATED task: `read_exact` consumes pipe
+    /// bytes even when its future is abandoned, so a `select!` over the read
+    /// (with screenshots also flowing) would drop a mid-frame read and
+    /// permanently desync the stream. The task forwards complete frames (or
+    /// the read error) through a bounded channel the loop can safely await.
     async fn exchange(
         &self,
-        reader: &mut ReadHalf<tokio::net::windows::named_pipe::NamedPipeClient>,
+        reader: ReadHalf<tokio::net::windows::named_pipe::NamedPipeClient>,
+        mut writer: WriteHalf<tokio::net::windows::named_pipe::NamedPipeClient>,
+        inlet: &dyn EventInletPort<ActorEvent>,
+    ) -> Result<ExchangeOutcome, IpcClientError> {
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<
+            Result<Option<ReceivedFrame>, IpcClientError>,
+        >(INBOUND_CHANNEL_CAPACITY);
+        // Frame reads belong to a DEDICATED task: `read_exact` consumes pipe
+        // bytes even when its future is abandoned, so a `select!` over the
+        // read (with screenshots also flowing) would drop a mid-frame read
+        // and permanently desync the stream. The task forwards complete
+        // frames (or the read error) through a bounded channel the loop can
+        // safely await.
+        let reader_tx = inbound_tx.clone();
+        let cancel = self.cancel.clone();
+        let reader_task = tokio::spawn(async move {
+            let mut reader = reader;
+            loop {
+                let frame = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => break,
+                    read = read_frame(&mut reader) => match read {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            // Read errors (incl. protocol violations) mean
+                            // the stream is unusable: report and reconnect.
+                            let _ = reader_tx.send(Err(error)).await;
+                            break;
+                        }
+                    },
+                };
+                let sent = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => break,
+                    sent = reader_tx.send(Ok(frame)) => sent,
+                };
+                if sent.is_err() {
+                    break; // exchange loop is gone
+                }
+            }
+        });
+
+        let outcome = self.dispatch_loop(&mut inbound_rx, &mut writer, inlet).await;
+        // Release the loop's channel half, then close the pipe (dropping the
+        // writer ends the peer's read AND our own blocked read). The reader
+        // may still be parked in `read_exact` on a peer that never closes —
+        // give it the cancel-aware grace period, then abort: the whole
+        // connection is being discarded, so an abandoned partial read is
+        // harmless here.
+        drop(inbound_tx);
+        drop(writer);
+        let _ = tokio::time::timeout(READER_TEARDOWN_GRACE, reader_task).await;
+        outcome
+    }
+
+    /// The dispatch select: all awaited branches are channel receives, which
+    /// are safe to abandon — unlike a partial frame read.
+    async fn dispatch_loop(
+        &self,
+        inbound_rx: &mut mpsc::Receiver<Result<Option<ReceivedFrame>, IpcClientError>>,
         writer: &mut WriteHalf<tokio::net::windows::named_pipe::NamedPipeClient>,
         inlet: &dyn EventInletPort<ActorEvent>,
     ) -> Result<ExchangeOutcome, IpcClientError> {
@@ -227,9 +323,9 @@ impl IpcClientAdapter {
             tokio::select! {
                 biased;
                 () = self.cancel.cancelled() => return Ok(ExchangeOutcome::Cancelled),
-                read = read_frame(reader) => {
-                    match read? {
-                        Some(frame) => {
+                read = inbound_rx.recv() => {
+                    match read {
+                        Some(Ok(Some(frame))) => {
                             match frame.message_type {
                                 message_type::WELCOME => {
                                     match serde_json::from_slice::<Welcome>(&frame.payload) {
@@ -263,7 +359,12 @@ impl IpcClientAdapter {
                                 }
                             }
                         }
-                        None => return Ok(ExchangeOutcome::Disconnected),
+                        Some(Ok(None)) => return Ok(ExchangeOutcome::Disconnected), // EOF
+                        Some(Err(error)) => {
+                            tracing::warn!(%error, "IPC read failed; reconnecting");
+                            return Ok(ExchangeOutcome::Disconnected);
+                        }
+                        None => return Ok(ExchangeOutcome::Cancelled), // reader gone
                     }
                 }
                 shot = send_next => {
@@ -349,6 +450,13 @@ pub struct IpcScreenshotSink {
 #[async_trait]
 impl ScreenshotSinkPort for IpcScreenshotSink {
     async fn send(&self, seq: u32, jpeg: Vec<u8>) -> Result<(), ScreenshotSinkError> {
+        // Reject at the SOURCE, never queue an unwireable frame: the peer
+        // must reject >16 MiB frames, and resending the poisoned frame after
+        // every reconnect would loop forever. The caller (focus-watch)
+        // releases the capture quota slot on any sink error.
+        if protocol::ipc::messages::SCREENSHOT_SEQ_LEN + jpeg.len() > MAX_PAYLOAD_LEN {
+            return Err(ScreenshotSinkError::Oversize);
+        }
         self.tx.send((seq, jpeg)).await.map_err(|_| ScreenshotSinkError::Closed)
     }
 }

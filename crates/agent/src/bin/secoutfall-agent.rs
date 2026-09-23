@@ -193,6 +193,8 @@ async fn production_session_deps(
         shifter: production_shifter(),
         statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
         user_actor_nonce,
+        seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        user_actor_pid_gate: Arc::new(std::sync::atomic::AtomicU32::new(0)),
     })
 }
 
@@ -342,6 +344,8 @@ async fn simulate() -> anyhow::Result<()> {
         shifter: Arc::clone(&clock) as Arc<dyn ClockShiftPort>,
         statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
         user_actor_nonce: "demo-nonce".to_owned(),
+        seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        user_actor_pid_gate: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         bus: kernel::bus::InMemoryEventBus::new(1024),
     });
 
@@ -395,6 +399,8 @@ async fn console(args: &Args) -> anyhow::Result<()> {
                     as Arc<dyn ClockShiftPort>,
                 statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
                 user_actor_nonce: nonce.clone(),
+                seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                user_actor_pid_gate: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             },
             "fake broker (demo)".to_owned(),
         )
@@ -413,12 +419,13 @@ async fn console(args: &Args) -> anyhow::Result<()> {
     let ipc_broker = Arc::clone(&session_deps.broker);
     let ipc_clock = Arc::clone(&session_deps.clock);
     let ipc_config = Arc::clone(&session_deps.config);
+    let ipc_pid_gate = Arc::clone(&session_deps.user_actor_pid_gate);
 
     let (session, stop_tx, stop_rx) =
         agent::app::runtime::RunningSession::start(session_deps).await?;
 
     if !args.demo {
-        attach_ipc(&session, &ipc_config, ipc_broker, ipc_clock, &nonce).await;
+        attach_ipc(&session, &ipc_config, ipc_broker, ipc_clock, &nonce, ipc_pid_gate).await;
     }
 
     // Ctrl+C → ServiceStop (the same event SCM delivers).
@@ -459,12 +466,14 @@ async fn attach_etw(session: &agent::app::runtime::RunningSession) {
 /// Attach the user-actor IPC server (feature `ipc`): per-boot nonce,
 /// console-user-aware DACL, handshake-evidence wire reporting.
 #[cfg(all(windows, feature = "ipc"))]
+#[allow(clippy::too_many_arguments)] // uniform wiring shape across features
 async fn attach_ipc(
     session: &agent::app::runtime::RunningSession,
     config: &Arc<protocol::config::AgentConfig>,
     broker: Arc<dyn BrokerPort>,
     clock: Arc<dyn agent::ports::clock::SystemClockPort>,
     nonce: &str,
+    pid_gate: Arc<std::sync::atomic::AtomicU32>,
 ) {
     let sddl = agent::adapters::ipc_server::console_user_pipe_sddl().await.unwrap_or_else(|| {
         tracing::warn!("no console-session user; IPC DACL covers SYSTEM/Administrators only");
@@ -477,7 +486,8 @@ async fn attach_ipc(
         sddl,
         session.seq(),
     )
-    .with_wire_reporter(broker, clock);
+    .with_wire_reporter(broker, clock)
+    .with_expected_client_pid(pid_gate);
     let inlet = session.inlet();
     tokio::spawn(async move {
         if let Err(error) = adapter.run(inlet).await {
@@ -490,12 +500,14 @@ async fn attach_ipc(
 /// Fallback when built without the `ipc` feature.
 #[cfg(not(all(windows, feature = "ipc")))]
 #[allow(clippy::needless_pass_by_value, clippy::trivially_copy_pass_by_ref)]
+#[allow(clippy::too_many_arguments)] // signature parity with the real adapter
 async fn attach_ipc(
     _session: &agent::app::runtime::RunningSession,
     _config: &Arc<protocol::config::AgentConfig>,
     _broker: Arc<dyn BrokerPort>,
     _clock: Arc<dyn agent::ports::clock::SystemClockPort>,
     _nonce: &str,
+    _pid_gate: Arc<std::sync::atomic::AtomicU32>,
 ) {
     tracing::warn!("built without the ipc feature: user-actor transport disabled");
 }
@@ -630,9 +642,10 @@ async fn run_service_body(args: Vec<std::ffi::OsString>) -> anyhow::Result<()> {
     let ipc_broker = Arc::clone(&deps.broker);
     let ipc_clock = Arc::clone(&deps.clock);
     let ipc_config = Arc::clone(&deps.config);
+    let ipc_pid_gate = Arc::clone(&deps.user_actor_pid_gate);
 
     let (session, stop_tx, stop_rx) = agent::app::runtime::RunningSession::start(deps).await?;
-    attach_ipc(&session, &ipc_config, ipc_broker, ipc_clock, &nonce).await;
+    attach_ipc(&session, &ipc_config, ipc_broker, ipc_clock, &nonce, ipc_pid_gate).await;
 
     // SCM handler (sync thread) → runtime stop channel (async).
     let (scm_tx, scm_rx) = std::sync::mpsc::channel::<SandboxEvent>();

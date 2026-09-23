@@ -29,7 +29,13 @@ use agent::{
 use kernel::app::api_ports::EventInletPort;
 use protocol::{
     config::UserActorConfig,
-    ipc::messages::Welcome,
+    ipc::{
+        MAX_PAYLOAD_LEN,
+        messages::{
+            SCREENSHOT_SEQ_LEN,
+            Welcome,
+        },
+    },
 };
 use tokio_util::sync::CancellationToken;
 use user_actor::{
@@ -250,4 +256,23 @@ async fn wrong_nonce_is_fatal_for_the_client() {
     drop(sink);
     server.stop();
     let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+}
+
+/// An oversized screenshot is rejected at the SINK — never queued, never
+/// sent. A >16 MiB frame would be rejected by the peer, and resending the
+/// still-queued frame after every reconnect would loop forever (the
+/// historical kill-the-pipeline bug). A frame at exactly the cap (payload =
+/// seq prefix + jpeg) must still be accepted.
+#[tokio::test]
+async fn oversized_screenshot_is_rejected_at_the_sink_and_never_queued() {
+    let (sink, mut queue) = IpcClientAdapter::channel();
+
+    let oversized = vec![0_u8; MAX_PAYLOAD_LEN + 1];
+    let error = sink.send(1, oversized).await.unwrap_err();
+    assert!(matches!(error, user_actor::ports::ScreenshotSinkError::Oversize), "{error:?}");
+    assert!(queue.try_recv().is_err(), "an unwireable frame must never be queued");
+
+    let at_cap = vec![0_u8; MAX_PAYLOAD_LEN - SCREENSHOT_SEQ_LEN];
+    sink.send(2, at_cap).await.unwrap();
+    assert!(queue.try_recv().is_ok(), "a frame at the cap is wireable");
 }

@@ -135,6 +135,8 @@ async fn boot(config: &AgentConfig, shell: &Arc<FakeShellAssociation>) -> Harnes
         statistics: Arc::clone(&counters),
         bus: InMemoryEventBus::new(4096),
         user_actor_nonce: "test-nonce".to_owned(),
+        seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        user_actor_pid_gate: Arc::new(std::sync::atomic::AtomicU32::new(0)),
     });
     kernel.boot().await.unwrap();
     Harness { kernel, broker, uploader, launcher, killer, clock, stats: counters, state }

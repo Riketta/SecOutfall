@@ -145,7 +145,13 @@ impl DropsCollectorPlugin {
 
     /// The copy-and-upload job, run off the pipeline by the worker.
     async fn collect_drop(inner: &Inner, source: String) {
-        if inner.collected.fetch_add(1, Ordering::SeqCst) >= inner.deps.config.limit_per_session {
+        // Cheap gate only: the counter increments AFTER a successful copy (see
+        // below), so vanished, over-cap, failed and duplicate drops never burn
+        // a `limit_per_session` slot (legacy: malware writing+deleting `limit`
+        // temp files disabled collection for the whole session). Race-free by
+        // construction — the collection job queue is single-consumer, so jobs
+        // run one at a time and check-then-increment cannot interleave.
+        if inner.collected.load(Ordering::SeqCst) >= inner.deps.config.limit_per_session {
             tracing::warn!(
                 limit = inner.deps.config.limit_per_session,
                 %source,
@@ -178,6 +184,9 @@ impl DropsCollectorPlugin {
         let Some((copy_name, copied_bytes)) = persist_copy(inner, &source, session_id).await else {
             return;
         };
+        // Counted only now: the copy is durable on the drops volume, so the
+        // session budget is spent on real collections, not failed attempts.
+        inner.collected.fetch_add(1, Ordering::SeqCst);
         report_and_upload(inner, &source, &copy_name, copied_bytes, study_id, session_id).await;
     }
 }
@@ -203,7 +212,11 @@ async fn persist_copy(inner: &Inner, source: &str, session_id: u32) -> Option<(S
     };
 
     let hash8 = drop_copy::hash8(&digest);
-    if !inner.seen_hashes.lock().insert(hash8.clone()) {
+    // Single-consumer invariant (one collection worker): contains-then-insert
+    // here cannot race. The hash is inserted only AFTER a successful rename —
+    // a failed finalize must not burn it, or an identical later drop would be
+    // silently treated as a duplicate forever.
+    if inner.seen_hashes.lock().contains(&hash8) {
         // Same content as an already-collected drop — drop the part.
         let _ = tokio::fs::remove_file(&part_path).await;
         return None;
@@ -221,8 +234,11 @@ async fn persist_copy(inner: &Inner, source: &str, session_id: u32) -> Option<(S
     let copy_path = drops_dir.join(&copy_name);
     if let Err(error) = tokio::fs::rename(&part_path, &copy_path).await {
         tracing::error!(%error, from = %part_path.display(), "drop rename failed");
+        // Same cleanup as a failed copy: no `.part` litter, no burned hash.
+        let _ = tokio::fs::remove_file(&part_path).await;
         return None;
     }
+    inner.seen_hashes.lock().insert(hash8);
     let copied_bytes = tokio::fs::metadata(&copy_path).await.map_or(0, |meta| meta.len());
     Some((copy_name, copied_bytes))
 }

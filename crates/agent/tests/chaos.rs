@@ -171,6 +171,8 @@ async fn boot(config: &AgentConfig, broker: Arc<dyn BrokerPort>) -> Harness {
         statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
         bus: InMemoryEventBus::new(4096),
         user_actor_nonce: "chaos-nonce".to_owned(),
+        seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        user_actor_pid_gate: Arc::new(std::sync::atomic::AtomicU32::new(0)),
     });
     kernel.boot().await.unwrap();
     Harness { kernel, repo }
