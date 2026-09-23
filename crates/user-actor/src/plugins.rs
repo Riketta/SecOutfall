@@ -1,2 +1,6 @@
-//! Hexagon plugins: screenshot-on-focus, reactive activity, scripted activities
-//! (`notepad`/`calc`/`explorer`) via the `ActivityPort` contract (phases 8–9).
+//! Hexagon plugins: config application, focus watching (screenshots), and
+//! reactive input.
+
+pub mod config_apply;
+pub mod focus_watch;
+pub mod reactive;

@@ -60,6 +60,8 @@ pub struct SessionDeps {
     pub shifter: Arc<dyn ClockShiftPort>,
     /// Shared session counters.
     pub statistics: Arc<crate::plugins::statistics::SessionStatistics>,
+    /// Per-boot user-actor nonce; shared with the IPC server adapter.
+    pub user_actor_nonce: String,
 }
 
 /// A running session: the assembled kernel plus its driving handles.
@@ -67,6 +69,7 @@ pub struct RunningSession {
     kernel: Arc<AgentKernel>,
     state: SharedScopeState,
     scheduler: Arc<SchedulerAdapter>,
+    seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl RunningSession {
@@ -94,6 +97,7 @@ impl RunningSession {
             killer: Arc::clone(&deps.killer),
             shifter: Arc::clone(&deps.shifter),
             statistics: Arc::clone(&deps.statistics),
+            user_actor_nonce: deps.user_actor_nonce,
             bus,
         }));
         kernel.boot().await?;
@@ -112,7 +116,14 @@ impl RunningSession {
         });
 
         let (stop_tx, stop_rx) = mpsc::channel::<SandboxEvent>(8);
-        Ok((Self { kernel, state, scheduler }, stop_tx, stop_rx))
+        Ok((Self { kernel, state, scheduler, seq }, stop_tx, stop_rx))
+    }
+
+    /// The shared per-boot wire sequence counter (adapters that publish to
+    /// the wire outside the plugins — e.g. the IPC server — join it).
+    #[must_use]
+    pub fn seq(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.seq)
     }
 
     /// The pipeline inlet for additional driving adapters (ETW, probes...).

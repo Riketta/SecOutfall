@@ -134,6 +134,7 @@ async fn boot(config: &AgentConfig, shell: &Arc<FakeShellAssociation>) -> Harnes
         shifter: Arc::clone(&clock) as Arc<dyn agent::ports::clock::ClockShiftPort>,
         statistics: Arc::clone(&counters),
         bus: InMemoryEventBus::new(4096),
+        user_actor_nonce: "test-nonce".to_owned(),
     });
     kernel.boot().await.unwrap();
     Harness { kernel, broker, uploader, launcher, killer, clock, stats: counters, state }
@@ -359,7 +360,9 @@ async fn non_exe_target_launches_via_association_and_extends_scope() {
     harness.settle().await;
 
     let launched = harness.launcher.launched();
-    assert_eq!(launched.len(), 1, "one launch on the marker");
+    // Phase 8: the marker also triggers the user-actor supervisor, so the
+    // boot performs two launches — the target (first) and the user actor.
+    assert_eq!(launched.len(), 2, "target + user actor on the marker");
     assert_eq!(launched.first().unwrap().path, "C:\\Windows\\System32\\wscript.exe");
     assert_eq!(
         launched.first().unwrap().args,
@@ -394,10 +397,11 @@ async fn non_exe_target_launches_via_association_and_extends_scope() {
         .any(|process| process.name == "wscript.exe");
     assert!(scoped, "interpreter must be scoped via ExtendScopeExpectation");
 
-    // One launch attempt per boot: a second marker is a no-op.
+    // One launch attempt per boot: a second marker is a no-op (both the
+    // target and the user actor stay put).
     harness.feed(&[process_started(998, None, "explorer.exe")]).await;
     harness.settle().await;
-    assert_eq!(harness.launcher.launched().len(), 1, "no relaunch within one boot");
+    assert_eq!(harness.launcher.launched().len(), 2, "no relaunch within one boot");
 
     harness.shutdown().await;
 }
@@ -522,4 +526,36 @@ async fn statistics_count_pipeline_and_bus_events() {
     assert_eq!(snapshot.screenshots, 1);
     assert_eq!(snapshot.scope_entered, 1, "evil.exe joins via session-0 seed");
     assert_eq!(snapshot.ticks, 1);
+}
+
+#[tokio::test]
+async fn user_actor_supervisor_launches_with_nonce_on_marker() {
+    let mut config = base_config();
+    config.user_actor.path = "C:\\Tools\\secoutfall-user-actor.exe".to_owned();
+    let shell = Arc::new(FakeShellAssociation::new());
+    let harness = boot(&config, &shell).await;
+
+    // Marker sighting launches both the target and (new in phase 8) the user
+    // actor, the latter carrying the per-boot nonce on its command line.
+    harness.feed(&[process_started(999, None, "explorer.exe")]).await;
+    harness.settle().await;
+
+    let launches = harness.launcher.launched();
+    let ua = launches
+        .iter()
+        .find(|spec| spec.path == "C:\\Tools\\secoutfall-user-actor.exe")
+        .unwrap_or_else(|| panic!("user actor not launched; launches: {launches:?}"));
+    assert_eq!(ua.args, vec!["--nonce".to_owned(), "test-nonce".to_owned()]);
+    assert_eq!(ua.working_dir, None);
+
+    // One attempt per boot: a second marker sighting is a no-op.
+    harness.feed(&[process_started(997, None, "explorer.exe")]).await;
+    harness.settle().await;
+    assert_eq!(
+        launches.iter().filter(|spec| spec.path.contains("user-actor")).count(),
+        1,
+        "no user-actor relaunch within one boot"
+    );
+
+    harness.shutdown().await;
 }

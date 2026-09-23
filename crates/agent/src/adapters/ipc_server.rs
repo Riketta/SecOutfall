@@ -27,6 +27,7 @@ use std::{
 use kernel::app::api_ports::EventInletPort;
 use protocol::{
     config::UserActorConfig,
+    events::EventType,
     ipc::{
         FrameError,
         FrameHeader,
@@ -39,6 +40,11 @@ use protocol::{
             Welcome,
             decode_screenshot,
         },
+    },
+    nats::Payload,
+    payload::{
+        UserActorStartedData,
+        UserActorStoppedData,
     },
 };
 use tokio::{
@@ -56,6 +62,13 @@ use crate::{
         ScreenshotFrame,
     },
     domain::scope::SharedScopeState,
+    ports::{
+        broker::{
+            BrokerPort,
+            Channel,
+        },
+        clock::SystemClockPort,
+    },
 };
 
 /// Fixed IPC v1 pipe name.
@@ -88,8 +101,21 @@ pub struct IpcServerAdapter {
     user_actor_config: Arc<UserActorConfig>,
     nonce: String,
     sddl: String,
+    /// Full pipe name; the production default is [`PIPE_NAME`]. Tests override
+    /// it so parallel test binaries never compete for `first_pipe_instance`.
+    pipe_name: String,
     seq: Arc<AtomicU64>,
+    /// Optional wire reporter: publishes `user_actor.started`/`stopped` from
+    /// real handshake evidence (module version + client pid of the peer).
+    wire: Option<HelloWire>,
     cancel: CancellationToken,
+}
+
+/// Wire access for handshake evidence reports.
+#[derive(Clone)]
+struct HelloWire {
+    broker: Arc<dyn BrokerPort>,
+    clock: Arc<dyn SystemClockPort>,
 }
 
 impl IpcServerAdapter {
@@ -116,7 +142,76 @@ impl IpcServerAdapter {
         sddl: String,
         seq: Arc<AtomicU64>,
     ) -> Self {
-        Self { state, user_actor_config, nonce, sddl, seq, cancel: CancellationToken::new() }
+        Self {
+            state,
+            user_actor_config,
+            nonce,
+            sddl,
+            pipe_name: PIPE_NAME.to_owned(),
+            seq,
+            wire: None,
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    /// Override the pipe name (tests); production uses the fixed IPC v1 name.
+    #[must_use]
+    pub fn with_pipe_name(mut self, pipe_name: String) -> Self {
+        self.pipe_name = pipe_name;
+        self
+    }
+
+    /// Publish `user_actor.started`/`user_actor.stopped` wire events from
+    /// verified handshakes and disconnects.
+    #[must_use]
+    pub fn with_wire_reporter(
+        mut self,
+        broker: Arc<dyn BrokerPort>,
+        clock: Arc<dyn SystemClockPort>,
+    ) -> Self {
+        self.wire = Some(HelloWire { broker, clock });
+        self
+    }
+
+    /// Publish `user_actor.started` from a verified handshake (evidence:
+    /// module version + client pid, not a launch intention).
+    async fn publish_user_actor_started(&self, module_version: String, pid: Option<u32>) {
+        let Some(wire) = &self.wire else { return };
+        let (study_id, session_id) = {
+            let state = self.state.lock();
+            (state.study_id, state.current_session().map_or(0, |session| session.id))
+        };
+        let envelope = crate::plugins::wire::envelope_raw(
+            wire.clock.now_ms(),
+            crate::plugins::wire::next_seq(&self.seq),
+            study_id,
+            session_id,
+            EventType::UserActorStarted,
+            Payload::UserActorStarted(UserActorStartedData { module_version, pid }),
+        );
+        if let Err(error) = wire.broker.publish(Channel::Event, &envelope).await {
+            tracing::error!(%error, "user_actor.started publish failed");
+        }
+    }
+
+    /// Publish `user_actor.stopped` when an established connection ends.
+    async fn publish_user_actor_stopped(&self, reason: Option<String>) {
+        let Some(wire) = &self.wire else { return };
+        let (study_id, session_id) = {
+            let state = self.state.lock();
+            (state.study_id, state.current_session().map_or(0, |session| session.id))
+        };
+        let envelope = crate::plugins::wire::envelope_raw(
+            wire.clock.now_ms(),
+            crate::plugins::wire::next_seq(&self.seq),
+            study_id,
+            session_id,
+            EventType::UserActorStopped,
+            Payload::UserActorStopped(UserActorStoppedData { reason }),
+        );
+        if let Err(error) = wire.broker.publish(Channel::Event, &envelope).await {
+            tracing::error!(%error, "user_actor.stopped publish failed");
+        }
     }
 
     /// Stop the server (idempotent). `run` returns shortly after.
@@ -139,7 +234,7 @@ impl IpcServerAdapter {
             // them without an await in scope so the future stays Send.
             let server = {
                 let mut security = build_security_attributes(&self.sddl)?;
-                create_pipe_instance(&mut security, first_instance)?
+                create_pipe_instance(&mut security, first_instance, &self.pipe_name)?
             };
             first_instance = false;
 
@@ -173,12 +268,31 @@ struct ServerContext {
     welcome: Welcome,
 }
 
-/// Serve one connected client until EOF or protocol error.
+/// Serve one connected client until EOF or protocol error. Publishes
+/// `user_actor.started` on a verified handshake and `user_actor.stopped` when
+/// an established connection ends.
 async fn serve_client(
     mut server: NamedPipeServer,
     adapter: &IpcServerAdapter,
     cancel: &CancellationToken,
     inlet: &dyn EventInletPort<SandboxEvent>,
+) -> Result<(), IpcServerError> {
+    let mut handshaked: Option<String> = None; // module version from HELLO
+    let result = serve_client_loop(&mut server, adapter, cancel, inlet, &mut handshaked).await;
+    if handshaked.is_some() {
+        let reason = result.as_ref().err().map(ToString::to_string);
+        adapter.publish_user_actor_stopped(reason).await;
+    }
+    result
+}
+
+/// The frame loop. `handshaked` records the verified HELLO's module version.
+async fn serve_client_loop(
+    server: &mut NamedPipeServer,
+    adapter: &IpcServerAdapter,
+    cancel: &CancellationToken,
+    inlet: &dyn EventInletPort<SandboxEvent>,
+    handshaked: &mut Option<String>,
 ) -> Result<(), IpcServerError> {
     let context = ServerContext {
         nonce: adapter.nonce.clone(),
@@ -186,12 +300,12 @@ async fn serve_client(
     };
     let mut header = [0_u8; HEADER_LEN];
     loop {
-        if read_exact_or_disconnect(&mut server, &mut header, cancel).await? {
+        if read_exact_or_disconnect(server, &mut header, cancel).await? {
             return Ok(()); // clean disconnect or shutdown
         }
         let frame = FrameHeader::from_bytes(&header)?;
         let mut payload = vec![0_u8; frame.payload_len as usize];
-        if read_exact_or_disconnect(&mut server, &mut payload, cancel).await? {
+        if read_exact_or_disconnect(server, &mut payload, cancel).await? {
             return Ok(());
         }
 
@@ -202,9 +316,9 @@ async fn serve_client(
                 if hello.protocol != IPC_PROTOCOL_VERSION
                     || !constant_time_eq(hello.nonce.as_bytes(), context.nonce.as_bytes())
                 {
-                    tracing::warn!(client_pid = client_pid(&server), "HELLO rejected");
+                    tracing::warn!(client_pid = client_pid(server), "HELLO rejected");
                     send_frame(
-                        &mut server,
+                        server,
                         message_type::ERROR,
                         &serde_json::to_vec(&ErrorFrame { error: "handshake rejected".to_owned() })
                             .map_err(|error| io_plain(error.to_string()))?,
@@ -212,14 +326,24 @@ async fn serve_client(
                     .await?;
                     return Ok(()); // impostors get one strike
                 }
+                *handshaked = Some(hello.module_version.clone());
+                tracing::info!(
+                    module_version = %hello.module_version,
+                    client_pid = client_pid(server),
+                    "user actor handshake verified"
+                );
+                let pid = client_pid(server);
+                adapter
+                    .publish_user_actor_started(hello.module_version, (pid != 0).then_some(pid))
+                    .await;
                 let body = serde_json::to_vec(&context.welcome)
                     .map_err(|error| io_plain(error.to_string()))?;
-                send_frame(&mut server, message_type::WELCOME, &body).await?;
+                send_frame(server, message_type::WELCOME, &body).await?;
             }
             message_type::GET_CONFIG => {
                 let body = serde_json::to_vec(&context.welcome)
                     .map_err(|error| io_plain(error.to_string()))?;
-                send_frame(&mut server, message_type::WELCOME, &body).await?;
+                send_frame(server, message_type::WELCOME, &body).await?;
             }
             message_type::SCREENSHOT => {
                 let (seq, jpeg) = decode_screenshot(&payload)?;
@@ -360,6 +484,7 @@ fn build_security_attributes(
 fn create_pipe_instance(
     security: &mut windows::Win32::Security::SECURITY_ATTRIBUTES,
     first_instance: bool,
+    pipe_name: &str,
 ) -> Result<NamedPipeServer, IpcServerError> {
     // tokio's builder is the supported creation path: it selects the access
     // mode, OVERLAPPED flag and pipe modes that raw calls keep getting wrong
@@ -374,10 +499,102 @@ fn create_pipe_instance(
     // creation call, and the resulting server owns the configured pipe.
     let server = unsafe {
         options.create_with_security_attributes_raw(
-            PIPE_NAME,
+            pipe_name,
             std::ptr::from_mut(security).cast::<std::ffi::c_void>(),
         )
     }
     .map_err(IpcServerError::Io)?;
     Ok(server)
+}
+
+/// Build a pipe SDDL that additionally grants the interactive console
+/// session's user `GENERIC_ALL` — the user actor runs under that user's
+/// token (`CreateProcessAsUser`), so without this ACE it cannot open the
+/// pipe. Returns `None` when there is no console session or the SID cannot
+/// be resolved (dev boxes, service before logon); the default DACL applies.
+#[cfg(windows)]
+#[must_use]
+pub async fn console_user_pipe_sddl() -> Option<String> {
+    tokio::task::spawn_blocking(console_user_pipe_sddl_blocking).await.ok().flatten()
+}
+
+/// Blocking SID resolution for [`console_user_pipe_sddl`].
+fn console_user_pipe_sddl_blocking() -> Option<String> {
+    use windows::{
+        Win32::{
+            Foundation::{
+                HANDLE,
+                HLOCAL,
+                LocalFree,
+            },
+            Security::{
+                Authorization::ConvertSidToStringSidW,
+                GetTokenInformation,
+                TOKEN_USER,
+                TokenUser,
+            },
+            System::RemoteDesktop::{
+                WTSGetActiveConsoleSessionId,
+                WTSQueryUserToken,
+            },
+        },
+        core::PWSTR,
+    };
+
+    // SAFETY: no preconditions; returns the current console session id.
+    let session_id = unsafe { WTSGetActiveConsoleSessionId() };
+    let mut token = HANDLE::default();
+    // SAFETY: `token` is a valid, initialized output handle; closed on every
+    // path below.
+    let queried = unsafe { WTSQueryUserToken(session_id, std::ptr::from_mut(&mut token)) };
+    if queried.is_err() {
+        return None;
+    }
+
+    // Query the token user: first call fails with the needed size.
+    let mut needed = 0_u32;
+    // SAFETY: the sizing call expects `None` and reports the length.
+    let _ =
+        unsafe { GetTokenInformation(token, TokenUser, None, 0, std::ptr::from_mut(&mut needed)) };
+    if needed == 0 {
+        // SAFETY: owned handle, closed exactly once.
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(token) };
+        return None;
+    }
+    let mut buffer = vec![0_u8; usize::try_from(needed).ok()?];
+    // SAFETY: `buffer` is `needed` bytes long; the class writes a TOKEN_USER
+    // (with embedded SID) into it.
+    let filled = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            needed,
+            std::ptr::from_mut(&mut needed),
+        )
+    };
+    // SAFETY: owned handle, closed exactly once.
+    let _ = unsafe { windows::Win32::Foundation::CloseHandle(token) };
+    filled.ok()?;
+
+    // SAFETY: the buffer now holds a TOKEN_USER per the contract above; it
+    // is read unaligned because a `Vec<u8>` only guarantees 1-byte alignment.
+    let token_user = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<TOKEN_USER>()) };
+    let mut sid_string = PWSTR::null();
+    // SAFETY: `sid_string` is a valid out-pointer; the returned string is
+    // freed with LocalFree below.
+    unsafe { ConvertSidToStringSidW(token_user.User.Sid, std::ptr::from_mut(&mut sid_string)) }
+        .ok()?;
+    if sid_string.is_null() {
+        return None;
+    }
+    // SAFETY: `sid_string` points at a NUL-terminated wide string allocated
+    // by ConvertSidToStringSidW above.
+    let sid = unsafe { sid_string.to_string() }.ok();
+    // SAFETY: the string was allocated by ConvertSidToStringSidW and is
+    // freed exactly once.
+    unsafe { LocalFree(HLOCAL(sid_string.0.cast())) };
+    let sid = sid?;
+
+    Some(format!("{DEFAULT_PIPE_SDDL}(A;;GA;;;<{sid}>)"))
 }

@@ -27,6 +27,7 @@ bytes = "1"
 ferrisetw = "1.2"
 futures-core = "0.3"
 futures-util = "0.3"
+jpeg-encoder = "0.6"
 reqwest = { version = "0.13", default-features = false, features = [
     "multipart",
     "stream",
@@ -41,6 +42,7 @@ tokio = { version = "1.47", default-features = false, features = ["sync"] }
 tokio-util = "0.7"
 toml = "0.9"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.18", features = ["v4", "serde"] }
 windows = { version = "0.57", features = [
     "Win32_Foundation",
@@ -54,6 +56,11 @@ windows = { version = "0.57", features = [
     "Win32_Storage_FileSystem",
     "Win32_Security_Authorization",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Accessibility",
+    "Win32_UI_HiDpi",
 ] }
 windows-service = "0.7"
 

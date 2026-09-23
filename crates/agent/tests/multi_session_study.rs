@@ -140,6 +140,7 @@ async fn run_boot(
         shifter: Arc::clone(&clock) as Arc<dyn agent::ports::clock::ClockShiftPort>,
         statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
         bus: InMemoryEventBus::new(1024),
+        user_actor_nonce: "test-nonce".to_owned(),
     });
 
     kernel.boot().await.unwrap();

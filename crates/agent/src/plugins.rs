@@ -8,4 +8,5 @@ pub mod screenshot_intake;
 pub mod session_manager;
 pub mod statistics;
 pub mod target_launcher;
+pub mod user_actor_supervisor;
 pub mod wire;

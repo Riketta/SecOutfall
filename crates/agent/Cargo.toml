@@ -54,6 +54,7 @@ tokio = { workspace = true, features = [
     "fs",
     "signal",
     "io-util",
+    "net",
 ] }
 tokio-util.workspace = true
 tracing.workspace = true

@@ -51,6 +51,10 @@ use crate::{
             TargetLauncherDeps,
             TargetLauncherPlugin,
         },
+        user_actor_supervisor::{
+            UserActorSupervisorDeps,
+            UserActorSupervisorPlugin,
+        },
     },
     ports::{
         broker::BrokerPort,
@@ -108,6 +112,8 @@ pub struct AgentDeps {
     pub shifter: Arc<dyn ClockShiftPort>,
     /// Shared session counters (ops/tests read them).
     pub statistics: Arc<SessionStatistics>,
+    /// Per-boot user-actor nonce; shared with the IPC server adapter.
+    pub user_actor_nonce: String,
     /// Derived-event bus (also handed to tests/simulator for extra assertions).
     pub bus: InMemoryEventBus<AgentBusEvent>,
 }
@@ -138,6 +144,7 @@ pub fn target_image_name(config: &AgentConfig) -> String {
 
 /// Assemble the kernel. Registration order matters: the session manager opens
 /// the session in `init` before the tracker seeds it in `start`.
+#[allow(clippy::too_many_lines)] // linear wiring, kept on purpose
 #[must_use]
 pub fn assemble(deps: AgentDeps) -> AgentKernel {
     let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -223,6 +230,12 @@ pub fn assemble(deps: AgentDeps) -> AgentKernel {
         Arc::clone(&deps.statistics),
     ));
 
+    let supervisor = Arc::new(UserActorSupervisorPlugin::new(UserActorSupervisorDeps {
+        config: Arc::clone(&deps.config),
+        launcher: Arc::clone(&deps.launcher),
+        nonce: deps.user_actor_nonce,
+    }));
+
     let plugins: Vec<Arc<dyn PluginPort>> = vec![
         session_manager.clone(),
         tracker.clone(),
@@ -230,11 +243,19 @@ pub fn assemble(deps: AgentDeps) -> AgentKernel {
         drops_collector.clone(),
         screenshot_intake.clone(),
         target_launcher.clone(),
+        supervisor.clone(),
         scoring.clone(),
         statistics.clone(),
     ];
-    let middleware: Vec<Arc<dyn MiddlewarePluginPort<SandboxEvent, AgentServices>>> =
-        vec![session_manager, tracker, reporter, screenshot_intake, target_launcher, statistics];
+    let middleware: Vec<Arc<dyn MiddlewarePluginPort<SandboxEvent, AgentServices>>> = vec![
+        session_manager,
+        tracker,
+        reporter,
+        screenshot_intake,
+        target_launcher,
+        supervisor,
+        statistics,
+    ];
 
     KernelService::new(plugins, middleware, deps.bus, services)
 }

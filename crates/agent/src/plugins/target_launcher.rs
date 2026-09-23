@@ -58,6 +58,7 @@ use crate::{
     },
     domain::{
         command_line::split_command_line,
+        marker::is_marker_process,
         scope::SharedScopeState,
     },
     ports::{
@@ -73,11 +74,6 @@ use crate::{
         shell_association::ShellAssociationPort,
     },
 };
-
-/// Strip a trailing `.exe` (case-sensitive; callers compare case-insensitively).
-fn strip_exe(value: &str) -> &str {
-    value.strip_suffix(".exe").unwrap_or(value)
-}
 
 /// Constructor dependencies.
 pub struct TargetLauncherDeps {
@@ -111,12 +107,6 @@ impl TargetLauncherPlugin {
     #[must_use]
     pub fn new(deps: TargetLauncherDeps) -> Self {
         Self { deps, attempted: AtomicBool::new(false) }
-    }
-
-    /// Marker-process check, tolerant of configured names with or without
-    /// `.exe` (legacy stored `explorer`, images report `explorer.exe`).
-    fn is_marker_process(&self, name: &str) -> bool {
-        strip_exe(name).eq_ignore_ascii_case(strip_exe(&self.deps.config.platform.non_s0_process))
     }
 
     /// Should this boot detonate the sample?
@@ -227,7 +217,7 @@ impl PluginPort for TargetLauncherPlugin {
 impl MiddlewarePluginPort<SandboxEvent, AgentServices> for TargetLauncherPlugin {
     async fn pre(&self, event: &mut SandboxEvent, _services: &AgentServices) -> Next {
         if let SandboxEvent::Source(crate::app::event::SourceEvent::ProcessStarted(data)) = event {
-            if self.is_marker_process(&data.name)
+            if is_marker_process(&self.deps.config.platform.non_s0_process, &data.name)
                 && !self.attempted.swap(true, Ordering::SeqCst)
                 && self.should_launch()
             {

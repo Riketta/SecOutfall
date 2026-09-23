@@ -104,9 +104,17 @@ fn demo_config() -> anyhow::Result<protocol::config::AgentConfig> {
     Ok(config)
 }
 
+/// Per-boot nonce for the user-actor IPC handshake (uuid-shaped, 32 hex).
+fn generate_nonce() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
 /// Production wiring: strict TOML config, real NATS broker (legacy retry
 /// budget), HTTP uploader, config-driven scope DB location.
-async fn production_session_deps(config_path: &std::path::Path) -> anyhow::Result<SessionDeps> {
+async fn production_session_deps(
+    config_path: &std::path::Path,
+    user_actor_nonce: String,
+) -> anyhow::Result<SessionDeps> {
     let config = Arc::new(agent::adapters::config_toml::load(config_path)?);
     let broker = agent::adapters::broker_nats::NatsBrokerAdapter::connect(&config.broker).await?;
     tracing::info!(uri = %config.broker.uri, "NATS broker connected");
@@ -126,6 +134,7 @@ async fn production_session_deps(config_path: &std::path::Path) -> anyhow::Resul
         killer: production_killer(),
         shifter: production_shifter(),
         statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
+        user_actor_nonce,
     })
 }
 
@@ -264,6 +273,7 @@ async fn simulate() -> anyhow::Result<()> {
         killer: Arc::new(agent::adapters::process_killer_fake::FakeProcessKiller::default()),
         shifter: Arc::clone(&clock) as Arc<dyn ClockShiftPort>,
         statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
+        user_actor_nonce: "demo-nonce".to_owned(),
         bus: kernel::bus::InMemoryEventBus::new(1024),
     });
 
@@ -291,6 +301,9 @@ async fn simulate() -> anyhow::Result<()> {
 /// Full runtime on this host: real config + broker, real clock, Ctrl+C to
 /// stop. `--demo` swaps every adapter for a fake (dev boxes without NATS).
 async fn console(args: &Args) -> anyhow::Result<()> {
+    // One per-boot nonce shared by the supervisor (launch args) and the IPC
+    // server (HELLO verification).
+    let nonce = generate_nonce();
     let (session_deps, broker_kind) = if args.demo {
         println!("{} v{} (console, demo)", agent::NAME, env!("CARGO_PKG_VERSION"));
         (
@@ -313,17 +326,30 @@ async fn console(args: &Args) -> anyhow::Result<()> {
                 shifter: Arc::new(agent::adapters::clock_fake::FakeClock::new(0))
                     as Arc<dyn ClockShiftPort>,
                 statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
+                user_actor_nonce: nonce.clone(),
             },
             "fake broker (demo)".to_owned(),
         )
     } else {
         println!("{} v{} (console)", agent::NAME, env!("CARGO_PKG_VERSION"));
-        (production_session_deps(&args.config_path).await?, args.config_path.display().to_string())
+        (
+            production_session_deps(&args.config_path, nonce.clone()).await?,
+            args.config_path.display().to_string(),
+        )
     };
     println!("config: {broker_kind}");
 
+    // The IPC server wants the transport pieces; clone before the deps move.
+    let ipc_broker = Arc::clone(&session_deps.broker);
+    let ipc_clock = Arc::clone(&session_deps.clock);
+    let ipc_config = Arc::clone(&session_deps.config);
+
     let (session, stop_tx, stop_rx) =
         agent::app::runtime::RunningSession::start(session_deps).await?;
+
+    if !args.demo {
+        attach_ipc(&session, &ipc_config, ipc_broker, ipc_clock, &nonce).await;
+    }
 
     // Ctrl+C → ServiceStop (the same event SCM delivers).
     let ctrl_c_tx = stop_tx.clone();
@@ -358,6 +384,50 @@ async fn attach_etw(session: &agent::app::runtime::RunningSession) {
         }
     });
     println!("ETW kernel trace attached");
+}
+
+/// Attach the user-actor IPC server (feature `ipc`): per-boot nonce,
+/// console-user-aware DACL, handshake-evidence wire reporting.
+#[cfg(all(windows, feature = "ipc"))]
+async fn attach_ipc(
+    session: &agent::app::runtime::RunningSession,
+    config: &Arc<protocol::config::AgentConfig>,
+    broker: Arc<dyn BrokerPort>,
+    clock: Arc<dyn agent::ports::clock::SystemClockPort>,
+    nonce: &str,
+) {
+    let sddl = agent::adapters::ipc_server::console_user_pipe_sddl().await.unwrap_or_else(|| {
+        tracing::warn!("no console-session user; IPC DACL covers SYSTEM/Administrators only");
+        agent::adapters::ipc_server::DEFAULT_PIPE_SDDL.to_owned()
+    });
+    let adapter = agent::adapters::ipc_server::IpcServerAdapter::with_sddl(
+        session.scope_state().clone(),
+        Arc::new(config.user_actor_config()),
+        nonce.to_owned(),
+        sddl,
+        session.seq(),
+    )
+    .with_wire_reporter(broker, clock);
+    let inlet = session.inlet();
+    tokio::spawn(async move {
+        if let Err(error) = adapter.run(inlet).await {
+            tracing::error!(%error, "user-actor IPC server failed");
+        }
+    });
+    tracing::info!("user-actor IPC server attached");
+}
+
+/// Fallback when built without the `ipc` feature.
+#[cfg(not(all(windows, feature = "ipc")))]
+#[allow(clippy::needless_pass_by_value, clippy::trivially_copy_pass_by_ref)]
+async fn attach_ipc(
+    _session: &agent::app::runtime::RunningSession,
+    _config: &Arc<protocol::config::AgentConfig>,
+    _broker: Arc<dyn BrokerPort>,
+    _clock: Arc<dyn agent::ports::clock::SystemClockPort>,
+    _nonce: &str,
+) {
+    tracing::warn!("built without the ipc feature: user-actor transport disabled");
 }
 
 /// SCM service mode (feature `service`).
@@ -442,9 +512,16 @@ async fn run_service_body(args: Vec<std::ffi::OsString>) -> anyhow::Result<()> {
     // SCM passes the service command line (ImagePath arguments included), so
     // `--config <path>` set at install time lands here.
     let args = Args::parse_from(args);
-    let deps = production_session_deps(&args.config_path).await?;
+    let nonce = generate_nonce();
+    let deps = production_session_deps(&args.config_path, nonce.clone()).await?;
+
+    // The IPC server wants the transport pieces; clone before the deps move.
+    let ipc_broker = Arc::clone(&deps.broker);
+    let ipc_clock = Arc::clone(&deps.clock);
+    let ipc_config = Arc::clone(&deps.config);
 
     let (session, stop_tx, stop_rx) = agent::app::runtime::RunningSession::start(deps).await?;
+    attach_ipc(&session, &ipc_config, ipc_broker, ipc_clock, &nonce).await;
 
     // SCM handler (sync thread) → runtime stop channel (async).
     let (scm_tx, scm_rx) = std::sync::mpsc::channel::<SandboxEvent>();

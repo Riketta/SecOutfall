@@ -13,8 +13,42 @@ path = "src/bin/secoutfall-user-actor.rs"
 [lints]
 workspace = true
 
+[features]
+default = []
+# Named-pipe IPC client (the only production transport to the agent).
+ipc = []
+# 50 ms `GetForegroundWindow` polling focus source.
+focus-poll = ["dep:windows"]
+# `SetWinEventHook` focus source with a dedicated message-pump thread.
+focus-winevents = ["dep:windows"]
+# GDI screen capture to JPEG.
+capture = ["dep:windows", "dep:jpeg-encoder"]
+# `SendInput`-based reactive input synthesis.
+input = ["dep:windows"]
+
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
+jpeg-encoder = { workspace = true, optional = true }
 kernel.workspace = true
+parking_lot.workspace = true
 protocol.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "io-util",
+    "net",
+    "signal",
+] }
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+windows = { workspace = true, optional = true }
+
+[dev-dependencies]
+agent = { workspace = true, features = ["ipc"] }
+serde.workspace = true
