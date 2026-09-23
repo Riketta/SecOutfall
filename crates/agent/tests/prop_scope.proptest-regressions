@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc fe4692b4d94287f538b5cffbdbc38d19eec3e7af531599820ff5afdc70040855 # shrinks to scoped = true, paths = ["a\\.txt"]
+cc 882a953c5fe3995f2d4f0cb0029fff0d8302f98eda3ee20162b890a655818e40 # shrinks to scoped = true, paths = ["A:.txt"]
+cc 51c05129fe4ec9584abb505f7f9d99e63919fb7b69cdb683697e60e49b71cfac # shrinks to scoped = true, paths = ["_.txt", "_.txt"]

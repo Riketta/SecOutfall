@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["fuzz"]
 members = [
     "crates/kernel",
     "crates/protocol",
@@ -35,6 +36,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 sha2 = "0.10"
 parking_lot = "0.12"
+proptest = "1.6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

@@ -420,3 +420,96 @@ async fn uptimes_overrun_is_dynamic_not_a_panic() {
         EventType::StudyShutdownRequested
     );
 }
+
+/// The full-study regression (the legacy config's 24 × 6000 s uptimes): 24
+/// boots, reboot between each, shutdown after the last. Milliseconds on the
+/// deterministic clock; asserts study-wide invariants, not per-event orders.
+#[tokio::test]
+async fn twenty_four_session_full_study_simulation() {
+    let total_sessions = 24_u32;
+    let config = base_config(vec![6000; total_sessions as usize], false);
+    let repo = Arc::new(InMemoryScopeRepository::default());
+    let mut study_id = None;
+
+    for session in 0..total_sessions {
+        // Every third session detonates and drops; the others are quiet
+        // (the target still relaunches — `every_session`).
+        let target_pid = 5000 + session;
+        let mut script = vec![
+            process_started(4000 + session, None, "explorer.exe"),
+            process_started(target_pid, None, "evil.exe"),
+        ];
+        if session % 3 == 0 {
+            let path = format!("C:\\Users\\victim\\report-{session}.txt");
+            script.push(file_written(target_pid, &path));
+            script.push(file_closed(target_pid, &path));
+        }
+        let boot = run_boot(&config, &repo, &script, true).await;
+
+        // Bookkeeping every boot: open + finalize reports, session id and
+        // study id stamped on every envelope, gap-free sequences.
+        let sequence = boot.broker.event_sequence();
+        assert_eq!(sequence.first(), Some(&EventType::AgentState), "session {session}");
+        assert_eq!(sequence.get(1), Some(&EventType::SessionStarted));
+        for expected in [
+            EventType::SessionFinalizing,
+            EventType::StudyScore,
+            EventType::StudyDropsSummary,
+            EventType::SessionEnded,
+        ] {
+            assert!(sequence.contains(&expected), "session {session}: {expected} missing");
+        }
+
+        let events = boot.broker.of_channel(Channel::Event);
+        assert!(
+            events.iter().all(|envelope| envelope.session == session),
+            "session id {session} stamped on every envelope"
+        );
+        let current_study = events.first().unwrap().study;
+        match study_id {
+            Some(id) => assert_eq!(current_study, id, "study id stable at session {session}"),
+            None => study_id = Some(current_study),
+        }
+        let mut seqs: Vec<u64> = events.iter().map(|envelope| envelope.seq).collect();
+        seqs.sort_unstable();
+        assert_eq!(
+            seqs,
+            (0..seqs.len() as u64).collect::<Vec<u64>>(),
+            "session {session} sequence gap-free"
+        );
+
+        // Control: reboots between sessions, shutdown only after the last.
+        let control = boot.broker.of_channel(Channel::Control);
+        assert_eq!(control.len(), 1, "session {session} control messages");
+        let expected_control = if session + 1 == total_sessions {
+            EventType::StudyShutdownRequested
+        } else {
+            EventType::StudyRebootRequested
+        };
+        assert_eq!(control.first().unwrap().event_type, expected_control);
+    }
+
+    // The persisted study record: 24 ended sessions under one study id.
+    let final_state = repo.load().await.unwrap();
+    assert_eq!(final_state.sessions.len(), total_sessions as usize);
+    assert!(
+        final_state
+            .sessions
+            .iter()
+            .enumerate()
+            .all(|(index, session)| session.id as usize == index && session.ended_at_ms.is_some()),
+        "every session finalized exactly once"
+    );
+    assert_eq!(study_id, Some(final_state.study_id));
+
+    // Drop observation: every third session saw its report; quiet ones none.
+    for (index, session) in final_state.sessions.iter().enumerate() {
+        let expected = usize::from(index % 3 == 0);
+        assert_eq!(
+            session.observed_drops.len(),
+            expected,
+            "session {index} drops: {:?}",
+            session.observed_drops
+        );
+    }
+}

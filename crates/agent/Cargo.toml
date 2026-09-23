@@ -66,4 +66,5 @@ windows-service = { workspace = true, optional = true }
 # In-process HTTP server backing the multipart-uploader integration tests.
 axum = { version = "0.8", features = ["multipart"] }
 futures-util.workspace = true
+proptest.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

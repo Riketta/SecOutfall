@@ -53,4 +53,5 @@ windows = { workspace = true, optional = true }
 
 [dev-dependencies]
 agent = { workspace = true, features = ["ipc"] }
+proptest.workspace = true
 serde.workspace = true

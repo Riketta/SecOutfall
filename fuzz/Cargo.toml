@@ -1,0 +1,35 @@
+[package]
+name = "secoutfall-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+protocol = { path = "../crates/protocol" }
+
+[[bin]]
+name = "parse_frame"
+path = "fuzz_targets/parse_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_config"
+path = "fuzz_targets/parse_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_screenshot_payload"
+path = "fuzz_targets/decode_screenshot_payload.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

@@ -86,27 +86,37 @@ impl FocusWatchPlugin {
             return;
         }
         let quota = config.max_screenshots_per_session;
+        // Reserve the sequence slot atomically: the inlet accepts from several
+        // adapters concurrently, so check-then-act could over-run the quota.
         let seq = self.captured.load(Ordering::SeqCst);
-        if u64::from(seq) >= u64::from(quota) {
+        if seq >= quota {
             if !self.quota_exhausted.swap(true, Ordering::SeqCst) {
                 tracing::info!(quota, "screenshot quota exhausted for this session");
                 self.bus.publish(ActorBusEvent::CaptureQuotaExhausted);
             }
             return;
         }
+        let reserved =
+            self.captured.compare_exchange(seq, seq + 1, Ordering::SeqCst, Ordering::SeqCst);
+        let Ok(seq) = reserved else {
+            // Another inlet took the slot; the next focus change re-checks.
+            return;
+        };
 
         match self.capture.capture().await {
             Ok(jpeg) => match self.sink.send(seq, jpeg).await {
                 Ok(()) => {
-                    self.captured.store(seq + 1, Ordering::SeqCst);
                     tracing::debug!(seq, "screenshot captured and queued");
                     self.bus.publish(ActorBusEvent::ScreenshotTaken { seq });
                 }
                 Err(error) => {
+                    // Release the slot: the transport may heal and reuse it.
+                    self.captured.fetch_sub(1, Ordering::SeqCst);
                     tracing::warn!(seq, %error, "screenshot sink rejected the frame");
                 }
             },
             Err(error) => {
+                self.captured.fetch_sub(1, Ordering::SeqCst);
                 tracing::warn!(%error, "screen capture failed");
             }
         }
