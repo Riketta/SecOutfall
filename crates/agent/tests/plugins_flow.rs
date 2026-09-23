@@ -61,7 +61,10 @@ use kernel::{
     bus::InMemoryEventBus,
 };
 use protocol::{
-    config::AgentConfig,
+    config::{
+        AgentConfig,
+        EventVerbosity,
+    },
     events::EventType,
     payload::{
         FileReleasedData,
@@ -753,4 +756,50 @@ async fn user_actor_supervisor_launches_with_nonce_on_marker() {
     );
 
     harness.shutdown().await;
+}
+
+/// Verbosity gating (legacy `elog_verbosity`): `None` silences SOURCE
+/// telemetry entirely, while derived lifecycle/drop events still flow —
+/// they ARE the product. (`Full` forwarding is pinned by every other test
+/// here that asserts source events on the wire.)
+#[tokio::test]
+async fn verbosity_none_silences_source_events_but_derived_events_flow() {
+    let drops_dir = temp_dir("verbosity-drops");
+    let source_dir = temp_dir("verbosity-src");
+
+    let mut config = base_config();
+    config.broker.verbosity = EventVerbosity::None;
+    config.drops.path = drops_dir.display().to_string();
+    config.drops.extensions = vec![".txt".to_owned()];
+
+    let drop_src = source_dir.join("artifact.txt");
+    std::fs::write(&drop_src, b"payload").unwrap();
+    let drop_path = drop_src.display().to_string();
+
+    let shell = Arc::new(FakeShellAssociation::new());
+    let harness = boot(&config, &shell).await;
+    harness
+        .feed(&[
+            process_started(999, None, "explorer.exe"),
+            process_started(1000, None, "evil.exe"),
+            file_written(1000, &drop_path, 7),
+            file_closed(1000, &drop_path),
+        ])
+        .await;
+    harness.settle().await;
+    harness.shutdown().await;
+
+    let types: Vec<EventType> = harness
+        .broker
+        .of_channel(agent::ports::broker::Channel::Event)
+        .into_iter()
+        .map(|envelope| envelope.event_type)
+        .collect();
+    assert!(
+        !types.contains(&EventType::ProcessStarted),
+        "verbosity None must drop source events: {types:?}"
+    );
+    assert!(types.contains(&EventType::SessionStarted), "{types:?}");
+    assert!(types.contains(&EventType::DropObserved), "{types:?}");
+    assert!(types.contains(&EventType::DropClosed), "{types:?}");
 }

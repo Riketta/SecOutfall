@@ -263,3 +263,65 @@ async fn publish_without_subscribers_reports_zero() {
 
     assert_eq!(bus.publish(TestEvent(1)), 0);
 }
+
+#[tokio::test]
+async fn slow_subscriber_sees_lagged_not_a_panic() {
+    // Capacity 1: two publishes without a recv lag the subscriber by one.
+    // The overflow policy is explicit: the subscriber observes
+    // `RecvError::Lagged` (counted loss), the publisher never blocks.
+    let bus = InMemoryEventBus::<TestEvent>::new(1);
+    let mut rx = bus.subscribe();
+
+    bus.publish(TestEvent(1));
+    bus.publish(TestEvent(2));
+
+    let verdict = rx.recv().await;
+    assert!(
+        matches!(&verdict, Err(tokio::sync::broadcast::error::RecvError::Lagged(1))),
+        "expected Lagged(1), got {verdict:?}"
+    );
+    // After the lag report the stream resumes with the newest event.
+    assert_eq!(rx.recv().await.unwrap(), TestEvent(2));
+}
+
+#[tokio::test]
+async fn zero_capacity_bus_clamps_to_one_instead_of_panicking() {
+    let bus = InMemoryEventBus::<TestEvent>::new(0);
+    let mut rx = bus.subscribe();
+
+    assert_eq!(bus.publish(TestEvent(1)), 1);
+    assert_eq!(rx.recv().await.unwrap(), TestEvent(1));
+}
+
+#[tokio::test]
+async fn double_shutdown_stops_every_plugin_twice_idempotently() {
+    // `stop` is contractually idempotent; the kernel passes every shutdown
+    // through so plugins can rely on their own guards.
+    let log: Log = Arc::default();
+    let kernel = KernelService::<TestEvent, (), InMemoryEventBus<TestEvent>, TestEvent>::new(
+        vec![Arc::new(LifecyclePlugin::new("a", &log))],
+        Vec::new(),
+        InMemoryEventBus::<TestEvent>::new(8),
+        (),
+    );
+    kernel.boot().await.unwrap();
+
+    kernel.shutdown().await;
+    kernel.shutdown().await;
+
+    assert_eq!(logged(&log), vec!["a:init", "a:start", "a:stop", "a:stop"]);
+}
+
+#[tokio::test]
+async fn pipeline_without_middleware_is_a_no_op() {
+    let kernel = KernelService::<TestEvent, (), InMemoryEventBus<TestEvent>, TestEvent>::new(
+        Vec::new(),
+        Vec::new(),
+        InMemoryEventBus::<TestEvent>::new(8),
+        (),
+    );
+    kernel.boot().await.unwrap();
+
+    kernel.accept(TestEvent(1)).await; // must not panic
+    kernel.shutdown().await;
+}

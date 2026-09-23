@@ -14,6 +14,11 @@ use protocol::{
         HEADER_LEN,
         MAX_PAYLOAD_LEN,
         message_type,
+        messages::{
+            SCREENSHOT_SEQ_LEN,
+            decode_screenshot,
+            encode_screenshot,
+        },
     },
 };
 
@@ -94,6 +99,37 @@ proptest! {
     ) {
         let source = String::from_utf8_lossy(&bytes);
         let _ = AgentConfig::from_toml_str(&source);
+    }
+
+    /// Hostile screenshot payloads: arbitrary bytes decode to `Ok` or `Err`,
+    /// never panic; a payload that decodes always yields exactly the encoded
+    /// seq and jpeg; payloads shorter than the seq prefix are always
+    /// rejected. Same call site as the `decode_screenshot_payload` fuzz
+    /// target, exercised on every host.
+    #[test]
+    fn screenshot_decode_never_panics_and_roundtrips(
+        seq in any::<u32>(),
+        jpeg in proptest::collection::vec(any::<u8>(), 0..=300),
+    ) {
+        let payload = encode_screenshot(seq, &jpeg);
+        let decoded = decode_screenshot(&payload);
+        prop_assert!(decoded.is_ok(), "own encoding must decode: {:?}", decoded.err());
+        let (decoded_seq, decoded_jpeg) = decoded.unwrap();
+        prop_assert_eq!(decoded_seq, seq);
+        prop_assert_eq!(decoded_jpeg, jpeg.as_slice());
+    }
+
+    #[test]
+    fn truncated_screenshot_payloads_are_rejected(
+        seq in any::<u32>(),
+        cut in 0_usize..SCREENSHOT_SEQ_LEN,
+    ) {
+        let payload = encode_screenshot(seq, &[0_u8; 8]);
+        let truncated = payload.get(..cut).unwrap_or(&payload);
+        prop_assert!(matches!(
+            decode_screenshot(truncated),
+            Err(FrameError::MalformedScreenshot(4, _))
+        ));
     }
 
     /// An unknown key under any known section is always rejected (the

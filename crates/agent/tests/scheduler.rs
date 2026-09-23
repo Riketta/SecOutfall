@@ -157,3 +157,29 @@ async fn dynamic_session_never_fires_a_deadline() {
     sched.stop();
     let _ = tokio::time::timeout(Duration::from_millis(1), handle).await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn zero_scheduled_duration_deadlines_immediately_once() {
+    // A malformed/hostile `uptimes = [0]` entry degrades to "deadline on the
+    // first tick" — never a panic, never a busy loop of deadlines.
+    let state = open_session_state(Some(0));
+    let clock = Arc::new(FakeClock::new(0));
+    let broker = Arc::new(FakeBroker::default());
+    let seq = Arc::new(AtomicU64::new(0));
+    let inlet = Arc::new(RecordingInlet::default());
+    let sched = Arc::new(adapter(state, &seq, &broker, &clock));
+    let run_inlet: Arc<dyn EventInletPort<SandboxEvent>> = inlet.clone();
+    let task_sched = Arc::clone(&sched);
+    let handle = tokio::spawn(async move { task_sched.run(run_inlet).await });
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let deadlines = inlet
+        .snapshot()
+        .into_iter()
+        .filter(|event| matches!(event, SandboxEvent::SessionDeadline))
+        .count();
+    assert_eq!(deadlines, 1, "zero duration fires once, not in a loop");
+    sched.stop();
+    let _ = tokio::time::timeout(Duration::from_millis(1), handle).await;
+}

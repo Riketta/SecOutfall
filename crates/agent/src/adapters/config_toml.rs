@@ -83,4 +83,23 @@ mod tests {
             other @ ConfigLoadError::Schema(_) => panic!("expected Read error, got {other}"),
         }
     }
+
+    #[test]
+    fn non_utf8_config_bytes_are_a_read_error_not_a_panic() {
+        // A hostile/corrupted config is binary garbage — `read_to_string`
+        // must surface a typed error, never mojibake or a panic.
+        let path =
+            std::env::temp_dir().join(format!("secoutfall-cfg-{}-binary.toml", std::process::id()));
+        std::fs::write(&path, [0xFF, 0xFE, 0x00, 0xC3, 0x28, 0xFF]).expect("write binary junk");
+        let error = load(&path).expect_err("non-UTF-8 config must fail");
+        assert!(matches!(error, ConfigLoadError::Read { .. }));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn directory_as_config_path_is_a_read_error() {
+        let dir = std::env::temp_dir();
+        let error = load(&dir).expect_err("a directory cannot be a config");
+        assert!(matches!(error, ConfigLoadError::Read { .. }));
+    }
 }

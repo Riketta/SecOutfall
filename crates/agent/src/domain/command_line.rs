@@ -52,8 +52,9 @@ pub fn split_command_line(line: &str) -> Vec<String> {
                 for _ in 0..backslashes {
                     current.push('\\');
                 }
-                backslashes = 0;
-                if has_token {
+                // A run of backslashes alone still forms a token (`a b \\\\`
+                // must yield `a`, `b`, `\\\\` — CommandLineToArgvW parity).
+                if has_token || !current.is_empty() {
                     argv.push(std::mem::take(&mut current));
                     has_token = false;
                 }
@@ -71,7 +72,7 @@ pub fn split_command_line(line: &str) -> Vec<String> {
     for _ in 0..backslashes {
         current.push('\\');
     }
-    if has_token {
+    if has_token || !current.is_empty() {
         argv.push(current);
     }
     argv
@@ -114,5 +115,15 @@ mod tests {
         assert_eq!(split_command_line("a\\\\\\\"b"), ["a\\\"b"]);
         // Trailing backslashes are literal.
         assert_eq!(split_command_line("C:\\dir\\"), ["C:\\dir\\"]);
+    }
+
+    #[test]
+    fn lone_backslash_token_is_not_dropped() {
+        // A trailing backslash-only argument must survive the split
+        // (CommandLineToArgvW parity): input `a b \\` splits to a, b, `\\`.
+        assert_eq!(split_command_line("a b \\\\"), ["a", "b", "\\\\"]);
+        // Quoted-space then a backslash-only tail: input `x " " \\\\`
+        // splits to x, (space), `\\`.
+        assert_eq!(split_command_line(concat!("x \" \" ", "\\\\")), ["x", " ", "\\\\"]);
     }
 }

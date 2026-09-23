@@ -640,4 +640,39 @@ mod tests {
         assert_eq!(config.scoring.cli_started, 10);
         assert_eq!(config.scoring.drop_observed, 20);
     }
+
+    #[test]
+    fn duplicate_keys_and_sections_are_rejected() {
+        // A duplicated key inside one table is a TOML syntax error — the
+        // hostile-config rule: reject, never last-one-wins.
+        let source = "[broker]\nuri = 'nats://a'\nuri = 'nats://b'\n";
+        assert!(AgentConfig::from_toml_str(source).is_err());
+        // A duplicated section header likewise.
+        let source = "[broker]\nuri = 'nats://a'\n\n[broker]\nuri = 'nats://b'\n";
+        assert!(AgentConfig::from_toml_str(source).is_err());
+    }
+
+    #[test]
+    fn negative_values_are_rejected_where_unsigned() {
+        // u64/u32 fields must not silently wrap a negative TOML integer.
+        let source = "[drops]\nmax_size = -1\n";
+        assert!(AgentConfig::from_toml_str(source).is_err());
+        let source = "[screenshots]\nmax_per_session = -5\n";
+        assert!(AgentConfig::from_toml_str(source).is_err());
+    }
+
+    #[test]
+    fn signed_and_none_verbosity_variants_parse() {
+        // `none` verbosity is a legitimate (and distinct from `partial`)
+        // selection; negative clock offsets are legal (time may run backwards).
+        let source = "[broker]\nverbosity = 'none'\n\n[time]\noffset_secs = -3600\n";
+        let config = AgentConfig::from_toml_str(source).unwrap();
+        assert_eq!(config.broker.verbosity, EventVerbosity::None);
+        assert_eq!(config.time.offset_secs, -3600);
+        // ...and `none` passes validation (only the unimplemented `partial`
+        // is rejected there).
+        let mut config = AgentConfig::from_toml_str("[target]\npath = 'x'\n").unwrap();
+        config.broker.verbosity = EventVerbosity::None;
+        config.validate().unwrap();
+    }
 }

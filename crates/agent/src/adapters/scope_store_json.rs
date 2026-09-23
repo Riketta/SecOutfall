@@ -127,4 +127,33 @@ mod tests {
         let repo = JsonScopeRepository::new(&path);
         assert!(matches!(repo.load().await, Err(ScopeRepositoryError::Corrupt(_))));
     }
+
+    #[tokio::test]
+    async fn pre_abandoned_schema_still_loads_with_defaulted_field() {
+        // Backward compatibility: a scope DB written before `abandoned` existed
+        // (upgraded agent on an in-progress study) must parse — the field
+        // defaults to false, because a persisted open session from THAT boot
+        // means "running normally then", not "hard-reset leftover".
+        let path = temp_path("legacy-schema");
+        fs::write(
+            &path,
+            format!(
+                "{{\"study_id\":\"{}\",\"sessions\":[{{\"id\":0,\
+                 \"scheduled_duration_secs\":6000,\"started_at_ms\":1000,\
+                 \"ended_at_ms\":null,\"scoped_processes\":[],\
+                 \"observed_drops\":[]}}]}}",
+                Uuid::from_u128(9)
+            )
+            .bytes()
+            .collect::<Vec<u8>>(),
+        )
+        .await
+        .unwrap();
+        let repo = JsonScopeRepository::new(&path);
+        let state = repo.load().await.unwrap();
+        assert_eq!(state.study_id, Uuid::from_u128(9));
+        let session = state.sessions.first().unwrap();
+        assert!(!session.abandoned);
+        assert!(session.ended_at_ms.is_none());
+    }
 }

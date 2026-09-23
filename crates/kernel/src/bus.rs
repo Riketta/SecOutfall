@@ -25,7 +25,6 @@ where
     /// never panic the kernel).
     #[must_use]
     pub fn new(capacity: usize) -> Self {
-        debug_assert!(capacity > 0, "bus capacity 0 is a composition-root bug; clamped to 1");
         let (sender, _) = broadcast::channel(capacity.max(1));
         Self { sender }
     }
