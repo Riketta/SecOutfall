@@ -47,6 +47,10 @@ use crate::{
 
 /// Heartbeat period (legacy parity: 15 s).
 pub const KEEPALIVE_PERIOD_SECS: u64 = 15;
+/// Periodic scope persistence (legacy parity: 15 s scope save).
+pub const PERSIST_PERIOD_SECS: u64 = 15;
+/// Periodic statistics summary.
+pub const STATS_PERIOD_SECS: u64 = 60;
 
 /// Time-driven event source: deadline (once) + keepalive (periodic).
 pub struct SchedulerAdapter {
@@ -113,6 +117,34 @@ impl SchedulerAdapter {
         }
     }
 
+    async fn persist_loop(&self, inlet: &Arc<dyn EventInletPort<SandboxEvent>>) {
+        let mut interval = tokio::time::interval(Duration::from_secs(PERSIST_PERIOD_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                () = self.cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    inlet.accept(SandboxEvent::PersistTick).await;
+                }
+            }
+        }
+    }
+
+    async fn stats_loop(&self, inlet: &Arc<dyn EventInletPort<SandboxEvent>>) {
+        let mut interval = tokio::time::interval(Duration::from_secs(STATS_PERIOD_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                () = self.cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    inlet.accept(SandboxEvent::StatsTick).await;
+                }
+            }
+        }
+    }
+
     async fn deadline_task(&self, inlet: &Arc<dyn EventInletPort<SandboxEvent>>) {
         let Some(delay_secs) = self.deadline_delay_secs() else {
             // Dynamic session: no scheduled deadline; the scope-die path or an
@@ -143,6 +175,8 @@ impl EventSourcePort for SchedulerAdapter {
             biased;
             () = self.cancel.cancelled() => {}
             () = self.keepalive_loop() => {}
+            () = self.persist_loop(&inlet) => {}
+            () = self.stats_loop(&inlet) => {}
             () = self.deadline_task(&inlet) => {}
         }
         Ok(())

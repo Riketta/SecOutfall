@@ -18,6 +18,13 @@ etw = ["dep:ferrisetw"]
 launcher = ["dep:windows"]
 # Registry-backed shell-association lookup for non-exe targets (Windows-only).
 associations = ["dep:windows"]
+# Terminate configured processes at finalize (Toolhelp snapshot, Windows-only).
+killer = ["dep:windows"]
+# SetSystemTime-based fake clock manipulation (Windows-only; the analysis VM
+# clock is deliberately fake).
+time_shift = ["dep:windows"]
+# Named-pipe IPC server for the user-actor (Windows-only transport).
+ipc = ["dep:windows"]
 # SCM service mode (windows-service).
 service = ["dep:windows-service"]
 

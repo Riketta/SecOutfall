@@ -25,8 +25,12 @@ use crate::{
     domain::scope::SharedScopeState,
     ports::{
         broker::BrokerPort,
-        clock::SystemClockPort,
+        clock::{
+            ClockShiftPort,
+            SystemClockPort,
+        },
         event_source::EventSourcePort,
+        process_killer::ProcessKillerPort,
         process_launcher::ProcessLauncherPort,
         scope_repository::ScopeRepository,
         shell_association::ShellAssociationPort,
@@ -50,6 +54,12 @@ pub struct SessionDeps {
     pub launcher: Arc<dyn ProcessLauncherPort>,
     /// Shell-association resolver for non-exe targets.
     pub shell: Arc<dyn ShellAssociationPort>,
+    /// Finalize-time process cleanup.
+    pub killer: Arc<dyn ProcessKillerPort>,
+    /// Clock manipulation (fake timestamps, finalize offsets).
+    pub shifter: Arc<dyn ClockShiftPort>,
+    /// Shared session counters.
+    pub statistics: Arc<crate::plugins::statistics::SessionStatistics>,
 }
 
 /// A running session: the assembled kernel plus its driving handles.
@@ -81,6 +91,9 @@ impl RunningSession {
             uploader: Arc::clone(&deps.uploader),
             launcher: Arc::clone(&deps.launcher),
             shell: Arc::clone(&deps.shell),
+            killer: Arc::clone(&deps.killer),
+            shifter: Arc::clone(&deps.shifter),
+            statistics: Arc::clone(&deps.statistics),
             bus,
         }));
         kernel.boot().await?;

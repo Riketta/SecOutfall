@@ -276,6 +276,26 @@ pub struct TelemetryConfig {
     pub user_actor_dsn: String,
 }
 
+/// Scoring weights (`[scoring]` section).
+///
+/// Legacy scored process starts with hardcoded values and ignored its own
+/// parameters entirely (bug #12); here the weights are real configuration. The
+/// session score is the **maximum** over observed signals (legacy parity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScoringConfig {
+    /// Score for a CLI/interpreter process entering the scope.
+    pub cli_started: u32,
+    /// Score for an observed drop.
+    pub drop_observed: u32,
+}
+
+impl Default for ScoringConfig {
+    fn default() -> Self {
+        Self { cli_started: 4, drop_observed: 5 }
+    }
+}
+
 /// Debug switches (`[debug]` section) — for development on non-VM hosts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -308,6 +328,8 @@ pub struct AgentConfig {
     pub platform: PlatformConfig,
     /// User-actor section.
     pub user_actor: UserActorSection,
+    /// Session scoring weights.
+    pub scoring: ScoringConfig,
     /// Telemetry egress.
     pub telemetry: TelemetryConfig,
     /// Debug switches.
@@ -592,5 +614,20 @@ mod tests {
         let mut config = AgentConfig::default();
         config.telemetry.sentry_enabled = true;
         assert_eq!(config.user_actor_config().telemetry_dsn, None);
+    }
+
+    #[test]
+    fn scoring_section_has_legacy_parity_defaults_and_parses() {
+        // Missing section → legacy-parity defaults.
+        let config = AgentConfig::from_toml_str("[target]\npath = 'x'\n").unwrap();
+        assert_eq!(config.scoring.cli_started, 4);
+        assert_eq!(config.scoring.drop_observed, 5);
+
+        let config = AgentConfig::from_toml_str(
+            "[target]\npath = 'x'\n\n[scoring]\ncli_started = 10\ndrop_observed = 20\n",
+        )
+        .unwrap();
+        assert_eq!(config.scoring.cli_started, 10);
+        assert_eq!(config.scoring.drop_observed, 20);
     }
 }

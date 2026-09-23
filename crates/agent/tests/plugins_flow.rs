@@ -34,6 +34,7 @@ use agent::{
         },
     },
     domain::scope::SharedScopeState,
+    plugins::statistics::SessionStatistics,
     ports::scope_repository::ScopeRepository,
 };
 use kernel::{
@@ -102,6 +103,9 @@ struct Harness {
     broker: Arc<FakeBroker>,
     uploader: Arc<FakeUploader>,
     launcher: Arc<FakeLauncher>,
+    killer: Arc<agent::adapters::process_killer_fake::FakeProcessKiller>,
+    clock: Arc<FakeClock>,
+    stats: Arc<SessionStatistics>,
     state: SharedScopeState,
 }
 
@@ -111,6 +115,9 @@ async fn boot(config: &AgentConfig, shell: &Arc<FakeShellAssociation>) -> Harnes
     let broker = Arc::new(FakeBroker::default());
     let uploader = Arc::new(FakeUploader::default());
     let launcher = Arc::new(FakeLauncher::default());
+    let killer =
+        Arc::new(agent::adapters::process_killer_fake::FakeProcessKiller::with_killed_per_name(1));
+    let counters = Arc::new(SessionStatistics::default());
     let repo = Arc::new(InMemoryScopeRepository::default());
     let state = load_scope_state(repo.as_ref()).await.unwrap();
     let kernel = assemble(AgentDeps {
@@ -123,13 +130,21 @@ async fn boot(config: &AgentConfig, shell: &Arc<FakeShellAssociation>) -> Harnes
         launcher: Arc::clone(&launcher)
             as Arc<dyn agent::ports::process_launcher::ProcessLauncherPort>,
         shell: Arc::clone(shell) as Arc<dyn agent::ports::shell_association::ShellAssociationPort>,
+        killer: Arc::clone(&killer) as Arc<dyn agent::ports::process_killer::ProcessKillerPort>,
+        shifter: Arc::clone(&clock) as Arc<dyn agent::ports::clock::ClockShiftPort>,
+        statistics: Arc::clone(&counters),
         bus: InMemoryEventBus::new(4096),
     });
     kernel.boot().await.unwrap();
-    Harness { kernel, broker, uploader, launcher, state }
+    Harness { kernel, broker, uploader, launcher, killer, clock, stats: counters, state }
 }
 
 impl Harness {
+    /// Wire event types, in order.
+    fn sequence(&self) -> Vec<protocol::events::EventType> {
+        self.broker.event_sequence()
+    }
+
     async fn feed(&self, events: &[SandboxEvent]) {
         for event in events {
             self.kernel.accept(event.clone()).await;
@@ -144,7 +159,7 @@ impl Harness {
         }
     }
 
-    async fn shutdown(self) {
+    async fn shutdown(&self) {
         self.kernel.shutdown().await;
     }
 }
@@ -385,4 +400,126 @@ async fn non_exe_target_launches_via_association_and_extends_scope() {
     assert_eq!(harness.launcher.launched().len(), 1, "no relaunch within one boot");
 
     harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn finalize_reports_score_summary_shifts_clock_and_kills() {
+    let mut config = base_config();
+    config.study.uptimes = vec![6000];
+    config.time.offset_secs = 90;
+    config.study.processes_to_terminate = vec!["notepad.EXE".to_owned()];
+    config.debug.skip_time_manipulation = false;
+    config.user_actor.screencapture = true;
+
+    let shell = Arc::new(FakeShellAssociation::new());
+    let harness = boot(&config, &shell).await;
+
+    // Marker + target + a scoped child that drops one .txt file.
+    let source =
+        std::env::temp_dir().join(format!("secoutfall-fin-{}-drop.txt", std::process::id()));
+    std::fs::write(&source, b"score me").unwrap();
+    let source_path = source.display().to_string();
+
+    harness
+        .feed(&[
+            process_started(999, None, "explorer.exe"),
+            process_started(1000, None, "evil.exe"),
+            process_started(1001, Some(1000), "cmd.exe"),
+            file_written(1001, &source_path, 8),
+            file_closed(1001, &source_path),
+        ])
+        .await;
+    harness.settle().await;
+
+    let before_finalize = agent::ports::clock::SystemClockPort::now_ms(harness.clock.as_ref());
+    harness.kernel.accept(SandboxEvent::SessionDeadline).await;
+    harness.settle().await;
+    harness.shutdown().await;
+
+    let sequence = harness.sequence();
+    // Scoring: cmd.exe entering the scope scores 4, the drop scores 5 —
+    // the reported score is the session maximum.
+    let score_event = harness
+        .broker
+        .of_channel(agent::ports::broker::Channel::Event)
+        .into_iter()
+        .find(|envelope| envelope.event_type == protocol::events::EventType::StudyScore)
+        .expect("study.score at finalize");
+    match score_event.data {
+        protocol::payload::Payload::StudyScore(data) => {
+            assert_eq!(data.score, 5, "max(drop=5, cli=4)");
+            assert_eq!(data.reason.as_deref(), Some("Total"));
+        }
+        other => panic!("unexpected payload: {other:?}"),
+    }
+
+    // Drops summary: the structured histogram replaces the legacy string.
+    let summary_event = harness
+        .broker
+        .of_channel(agent::ports::broker::Channel::Event)
+        .into_iter()
+        .find(|envelope| envelope.event_type == protocol::events::EventType::StudyDropsSummary)
+        .expect("study.drops_summary at finalize");
+    match summary_event.data {
+        protocol::payload::Payload::StudyDropsSummary(data) => {
+            assert_eq!(data.extensions.get("txt"), Some(&1));
+        }
+        other => panic!("unexpected payload: {other:?}"),
+    }
+
+    // Clock offset applied through the shifter (FakeClock = clock + shifter).
+    assert_eq!(
+        agent::ports::clock::SystemClockPort::now_ms(harness.clock.as_ref()),
+        before_finalize + 90 * 1000,
+        "finalize must shift the fake clock by offset_secs"
+    );
+    let adjusted_event = harness
+        .broker
+        .of_channel(agent::ports::broker::Channel::Event)
+        .into_iter()
+        .find(|envelope| envelope.event_type == protocol::events::EventType::ClockAdjusted)
+        .expect("clock.adjusted at finalize");
+    match adjusted_event.data {
+        protocol::payload::Payload::ClockAdjusted(data) => {
+            assert_eq!(data.offset_secs, 90);
+            assert!(matches!(data.cause, protocol::payload::ClockCause::SessionOffset));
+        }
+        other => panic!("unexpected payload: {other:?}"),
+    }
+
+    // Process cleanup swept the configured list.
+    let sweeps = harness.killer.sweeps();
+    assert_eq!(sweeps, vec![vec!["notepad.EXE".to_owned()]]);
+
+    // Sequence ordering (membership, not fragile positions): finalize reports
+    // all present after the deadline.
+    assert!(sequence.contains(&protocol::events::EventType::StudyScore));
+    assert!(sequence.contains(&protocol::events::EventType::StudyDropsSummary));
+    assert!(sequence.contains(&protocol::events::EventType::ClockAdjusted));
+}
+
+#[tokio::test]
+async fn statistics_count_pipeline_and_bus_events() {
+    let mut config = base_config();
+    config.user_actor.screencapture = true;
+    config.target.every_session = true;
+
+    let shell = Arc::new(FakeShellAssociation::new());
+    let harness = boot(&config, &shell).await;
+
+    harness
+        .feed(&[
+            process_started(999, None, "explorer.exe"),
+            process_started(1000, None, "evil.exe"),
+            SandboxEvent::ScreenshotReceived(ScreenshotFrame { seq: 1, jpeg: vec![1; 4] }),
+            SandboxEvent::StatsTick,
+        ])
+        .await;
+    harness.shutdown().await;
+
+    let snapshot = harness.stats.snapshot();
+    assert_eq!(snapshot.source_events, 2, "explorer + evil are source events");
+    assert_eq!(snapshot.screenshots, 1);
+    assert_eq!(snapshot.scope_entered, 1, "evil.exe joins via session-0 seed");
+    assert_eq!(snapshot.ticks, 1);
 }

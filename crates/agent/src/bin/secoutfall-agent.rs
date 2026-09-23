@@ -26,6 +26,8 @@ use agent::{
     },
     ports::{
         broker::BrokerPort,
+        clock::ClockShiftPort,
+        process_killer::ProcessKillerPort,
         process_launcher::ProcessLauncherPort,
         shell_association::ShellAssociationPort,
         uploader::FileUploadPort,
@@ -121,6 +123,9 @@ async fn production_session_deps(config_path: &std::path::Path) -> anyhow::Resul
         ),
         launcher: production_launcher(&config),
         shell: production_shell(),
+        killer: production_killer(),
+        shifter: production_shifter(),
+        statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
     })
 }
 
@@ -159,6 +164,28 @@ fn production_shell() -> Arc<dyn ShellAssociationPort> {
 #[cfg(not(all(windows, feature = "associations")))]
 fn production_shell() -> Arc<dyn ShellAssociationPort> {
     Arc::new(agent::adapters::shell_association_fake::UnavailableShellAssociation)
+}
+
+/// Finalize process cleanup (Toolhelp adapter is feature-gated).
+#[cfg(all(windows, feature = "killer"))]
+fn production_killer() -> Arc<dyn ProcessKillerPort> {
+    Arc::new(agent::adapters::process_killer_windows::WindowsProcessKiller::new())
+}
+
+#[cfg(not(all(windows, feature = "killer")))]
+fn production_killer() -> Arc<dyn ProcessKillerPort> {
+    Arc::new(agent::adapters::process_killer_fake::UnavailableProcessKiller)
+}
+
+/// Clock manipulation (`SetSystemTime` adapter is feature-gated).
+#[cfg(all(windows, feature = "time_shift"))]
+fn production_shifter() -> Arc<dyn ClockShiftPort> {
+    Arc::new(agent::adapters::clock_shift::windows_shifter::WindowsClockShifter::new())
+}
+
+#[cfg(not(all(windows, feature = "time_shift")))]
+fn production_shifter() -> Arc<dyn ClockShiftPort> {
+    Arc::new(agent::adapters::clock_shift::UnavailableClockShifter)
 }
 
 fn demo_script() -> Vec<SandboxEvent> {
@@ -234,6 +261,9 @@ async fn simulate() -> anyhow::Result<()> {
         uploader: Arc::clone(&uploader) as Arc<dyn FileUploadPort>,
         launcher: Arc::new(agent::adapters::launcher_fake::FakeLauncher::default()),
         shell: Arc::new(agent::adapters::shell_association_fake::FakeShellAssociation::new()),
+        killer: Arc::new(agent::adapters::process_killer_fake::FakeProcessKiller::default()),
+        shifter: Arc::clone(&clock) as Arc<dyn ClockShiftPort>,
+        statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
         bus: kernel::bus::InMemoryEventBus::new(1024),
     });
 
@@ -278,6 +308,11 @@ async fn console(args: &Args) -> anyhow::Result<()> {
                     as Arc<dyn ProcessLauncherPort>,
                 shell: Arc::new(agent::adapters::shell_association_fake::FakeShellAssociation::new())
                     as Arc<dyn ShellAssociationPort>,
+                killer: Arc::new(agent::adapters::process_killer_fake::FakeProcessKiller::default())
+                    as Arc<dyn ProcessKillerPort>,
+                shifter: Arc::new(agent::adapters::clock_fake::FakeClock::new(0))
+                    as Arc<dyn ClockShiftPort>,
+                statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
             },
             "fake broker (demo)".to_owned(),
         )

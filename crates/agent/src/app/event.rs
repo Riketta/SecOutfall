@@ -42,6 +42,10 @@ pub enum SandboxEvent {
     ServiceStop,
     /// A decoded screenshot frame arrived from the user-actor (IPC v1).
     ScreenshotReceived(ScreenshotFrame),
+    /// Periodic persistence tick (legacy scope-save cadence).
+    PersistTick,
+    /// Periodic statistics tick.
+    StatsTick,
 }
 
 /// One screenshot frame handed over by the user-actor.
@@ -201,5 +205,10 @@ pub enum AgentBusEvent {
     ExtendScopeExpectation {
         /// Image name (with extension) to expect in the scope.
         name: String,
+    },
+    /// The scoring plugin raised the session maximum score.
+    SessionScoreRaised {
+        /// New session maximum.
+        score: u32,
     },
 }

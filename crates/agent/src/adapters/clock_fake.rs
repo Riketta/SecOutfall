@@ -5,7 +5,11 @@ use std::sync::atomic::{
     Ordering,
 };
 
-use crate::ports::clock::SystemClockPort;
+use crate::ports::clock::{
+    ClockShiftError,
+    ClockShiftPort,
+    SystemClockPort,
+};
 
 /// Injectable clock. Advance it manually — a 24-session study simulates in
 /// milliseconds.
@@ -35,5 +39,13 @@ impl FakeClock {
 impl SystemClockPort for FakeClock {
     fn now_ms(&self) -> i64 {
         self.now_ms.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl ClockShiftPort for FakeClock {
+    async fn set_unix_ms(&self, unix_ms: i64) -> Result<(), ClockShiftError> {
+        self.set_ms(unix_ms);
+        Ok(())
     }
 }

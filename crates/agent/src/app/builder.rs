@@ -34,6 +34,7 @@ use crate::{
         },
         event_reporter::EventReporterPlugin,
         scope_tracker::ScopeTrackerPlugin,
+        scoring::ScoringPlugin,
         screenshot_intake::{
             ScreenshotIntakeDeps,
             ScreenshotIntakePlugin,
@@ -42,6 +43,10 @@ use crate::{
             SessionManagerDeps,
             SessionManagerPlugin,
         },
+        statistics::{
+            SessionStatistics,
+            StatisticsPlugin,
+        },
         target_launcher::{
             TargetLauncherDeps,
             TargetLauncherPlugin,
@@ -49,7 +54,11 @@ use crate::{
     },
     ports::{
         broker::BrokerPort,
-        clock::SystemClockPort,
+        clock::{
+            ClockShiftPort,
+            SystemClockPort,
+        },
+        process_killer::ProcessKillerPort,
         process_launcher::ProcessLauncherPort,
         scope_repository::ScopeRepository,
         shell_association::ShellAssociationPort,
@@ -93,6 +102,12 @@ pub struct AgentDeps {
     pub launcher: Arc<dyn ProcessLauncherPort>,
     /// Shell-association resolver for non-exe targets.
     pub shell: Arc<dyn ShellAssociationPort>,
+    /// Finalize-time process cleanup.
+    pub killer: Arc<dyn ProcessKillerPort>,
+    /// Clock manipulation (fake timestamps, finalize offsets).
+    pub shifter: Arc<dyn ClockShiftPort>,
+    /// Shared session counters (ops/tests read them).
+    pub statistics: Arc<SessionStatistics>,
     /// Derived-event bus (also handed to tests/simulator for extra assertions).
     pub bus: InMemoryEventBus<AgentBusEvent>,
 }
@@ -139,8 +154,13 @@ pub fn assemble(deps: AgentDeps) -> AgentKernel {
         repo: Arc::clone(&deps.scope_repo),
         broker: Arc::clone(&deps.broker),
         clock: Arc::clone(&deps.clock),
+        shifter: Arc::clone(&deps.shifter),
+        killer: Arc::clone(&deps.killer),
+        processes_to_terminate: Arc::new(deps.config.study.processes_to_terminate.clone()),
         uptimes: Arc::new(deps.config.study.uptimes.clone()),
         autoshutdown: deps.config.study.autoshutdown,
+        time: deps.config.time,
+        skip_time_manipulation: deps.config.debug.skip_time_manipulation,
         agent_version: env!("CARGO_PKG_VERSION").to_owned(),
         bus: deps.bus.clone(),
         seq: Arc::clone(&seq),
@@ -196,6 +216,13 @@ pub fn assemble(deps: AgentDeps) -> AgentKernel {
         bus: deps.bus.clone(),
     }));
 
+    let scoring = Arc::new(ScoringPlugin::new(&deps.config.scoring, deps.bus.clone()));
+    let statistics = Arc::new(StatisticsPlugin::new(
+        Arc::clone(&deps.scope_state),
+        deps.bus.clone(),
+        Arc::clone(&deps.statistics),
+    ));
+
     let plugins: Vec<Arc<dyn PluginPort>> = vec![
         session_manager.clone(),
         tracker.clone(),
@@ -203,9 +230,11 @@ pub fn assemble(deps: AgentDeps) -> AgentKernel {
         drops_collector.clone(),
         screenshot_intake.clone(),
         target_launcher.clone(),
+        scoring.clone(),
+        statistics.clone(),
     ];
     let middleware: Vec<Arc<dyn MiddlewarePluginPort<SandboxEvent, AgentServices>>> =
-        vec![session_manager, tracker, reporter, screenshot_intake, target_launcher];
+        vec![session_manager, tracker, reporter, screenshot_intake, target_launcher, statistics];
 
     KernelService::new(plugins, middleware, deps.bus, services)
 }

@@ -125,7 +125,7 @@ async fn run_boot(
     let kernel = assemble(AgentDeps {
         config: Arc::new(config.clone()),
         scope_state: state,
-        scope_repo: Arc::clone(repo) as Arc<dyn agent::ports::scope_repository::ScopeRepository>,
+        scope_repo: Arc::clone(repo) as Arc<dyn ScopeRepository>,
         broker: Arc::clone(&broker) as Arc<dyn agent::ports::broker::BrokerPort>,
         clock: Arc::clone(&clock) as Arc<dyn agent::ports::clock::SystemClockPort>,
         uploader: Arc::new(FakeUploader::default())
@@ -134,6 +134,11 @@ async fn run_boot(
             as Arc<dyn agent::ports::process_launcher::ProcessLauncherPort>,
         shell: Arc::new(FakeShellAssociation::new())
             as Arc<dyn agent::ports::shell_association::ShellAssociationPort>,
+        killer: Arc::new(
+            agent::adapters::process_killer_fake::FakeProcessKiller::with_killed_per_name(1),
+        ) as Arc<dyn agent::ports::process_killer::ProcessKillerPort>,
+        shifter: Arc::clone(&clock) as Arc<dyn agent::ports::clock::ClockShiftPort>,
+        statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
         bus: InMemoryEventBus::new(1024),
     });
 
@@ -165,8 +170,27 @@ fn boot0_sequence() -> Vec<EventType> {
         EventType::DropClosed,
         EventType::ProcessStopped, // cmd.exe (no scope.died: evil alive)
         EventType::SessionFinalizing,
+        EventType::StudyScore,
+        EventType::StudyDropsSummary,
         EventType::SessionEnded,
     ]
+}
+
+/// Find the `target.launched` envelope and assert its launcher-reported facts.
+fn assert_fake_launch(broker: &FakeBroker, expected_path: &str) {
+    let launched = broker
+        .of_channel(Channel::Event)
+        .into_iter()
+        .find(|envelope| envelope.event_type == EventType::TargetLaunched)
+        .unwrap();
+    match launched.data {
+        protocol::payload::Payload::TargetLaunched(data) => {
+            assert_eq!(data.path, expected_path);
+            assert_eq!(data.pid, Some(0), "FakeLauncher assigns sequential pids");
+            assert!(matches!(data.launcher, protocol::payload::Launcher::Token));
+        }
+        other => panic!("unexpected payload: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -195,20 +219,7 @@ async fn three_session_study_reboots_then_shuts_down() {
 
     assert_eq!(boot0.broker.event_sequence(), boot0_sequence(), "session 0 wire sequence");
     // The launcher owns target.launched and reports real facts.
-    let launched = boot0
-        .broker
-        .of_channel(Channel::Event)
-        .into_iter()
-        .find(|envelope| envelope.event_type == EventType::TargetLaunched)
-        .unwrap();
-    match launched.data {
-        protocol::payload::Payload::TargetLaunched(data) => {
-            assert_eq!(data.path, "C:\\Targets\\evil.exe");
-            assert_eq!(data.pid, Some(0), "FakeLauncher assigns sequential pids");
-            assert!(matches!(data.launcher, protocol::payload::Launcher::Token));
-        }
-        other => panic!("unexpected payload: {other:?}"),
-    }
+    assert_fake_launch(&boot0.broker, "C:\\Targets\\evil.exe");
     assert_eq!(
         boot0.broker.of_channel(Channel::Control).len(),
         1,
@@ -241,7 +252,7 @@ async fn three_session_study_reboots_then_shuts_down() {
     .await;
     assert_eq!(
         boot1.broker.event_sequence(),
-        vec![
+        [
             EventType::AgentState,
             EventType::SessionStarted,
             EventType::ProcessStarted, // explorer.exe (marker)
@@ -250,6 +261,8 @@ async fn three_session_study_reboots_then_shuts_down() {
             EventType::FileWritten,
             EventType::DropObserved,
             EventType::SessionFinalizing,
+            EventType::StudyScore,
+            EventType::StudyDropsSummary,
             EventType::SessionEnded,
         ],
         "session 1 wire sequence"
@@ -260,10 +273,12 @@ async fn three_session_study_reboots_then_shuts_down() {
     let boot2 = run_boot(&config, &repo, &[], true).await;
     assert_eq!(
         boot2.broker.event_sequence(),
-        vec![
+        [
             EventType::AgentState,
             EventType::SessionStarted,
             EventType::SessionFinalizing,
+            EventType::StudyScore,
+            EventType::StudyDropsSummary,
             EventType::SessionEnded,
         ],
         "session 2 wire sequence"
@@ -316,9 +331,13 @@ async fn autoshutdown_finalizes_on_real_scope_death_only_once() {
     // order is not deterministic; membership and post-stop placement are.
     let last_stop = sequence.iter().rposition(|event| *event == EventType::ProcessStopped).unwrap();
     let tail = sequence.get(last_stop + 1..).unwrap();
-    assert_eq!(tail.len(), 3, "three derived events after the last stop: {tail:?}");
+    // ScopeDied (event-reporter) races the finalize reports (session-manager):
+    // relative order is nondeterministic, membership and count are not.
+    assert_eq!(tail.len(), 5, "five derived events after the last stop: {tail:?}");
     assert!(tail.contains(&EventType::ScopeDied));
     assert!(tail.contains(&EventType::SessionFinalizing));
+    assert!(tail.contains(&EventType::StudyScore));
+    assert!(tail.contains(&EventType::StudyDropsSummary));
     assert!(tail.contains(&EventType::SessionEnded));
     assert_eq!(
         sequence.get(..=last_stop).unwrap(),
@@ -376,6 +395,8 @@ async fn uptimes_overrun_is_dynamic_not_a_panic() {
             EventType::TargetLaunched,
             EventType::ProcessStarted,
             EventType::SessionFinalizing,
+            EventType::StudyScore,
+            EventType::StudyDropsSummary,
             EventType::SessionEnded,
         ]
     );

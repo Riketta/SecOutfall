@@ -63,6 +63,10 @@ async fn main() -> anyhow::Result<()> {
                 as Arc<dyn agent::ports::process_launcher::ProcessLauncherPort>,
             shell: Arc::new(agent::adapters::shell_association_fake::FakeShellAssociation::new())
                 as Arc<dyn agent::ports::shell_association::ShellAssociationPort>,
+            killer: Arc::new(agent::adapters::process_killer_fake::FakeProcessKiller::default())
+                as Arc<dyn agent::ports::process_killer::ProcessKillerPort>,
+            shifter: Arc::clone(&clock) as Arc<dyn agent::ports::clock::ClockShiftPort>,
+            statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
             bus: kernel::bus::InMemoryEventBus::new(1024),
         });
 
