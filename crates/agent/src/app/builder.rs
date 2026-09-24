@@ -146,13 +146,11 @@ pub async fn load_scope_state(
     Ok(Arc::new(parking_lot::Mutex::new(state)))
 }
 
-/// Target image name derived from the configured path (last path component).
+/// Target image name derived from the configured path (last path component,
+/// textual — see `domain::image_name` for why this is not `Path::file_name`).
 #[must_use]
 pub fn target_image_name(config: &AgentConfig) -> String {
-    std::path::Path::new(&config.target.path).file_name().map_or_else(
-        || config.target.path.to_lowercase(),
-        |name| name.to_string_lossy().to_lowercase(),
-    )
+    crate::domain::image_name::image_name(&config.target.path).to_lowercase()
 }
 
 /// Assemble the kernel. Registration order matters: the session manager opens
@@ -274,4 +272,24 @@ pub fn assemble(deps: AgentDeps) -> AgentKernel {
     ];
 
     KernelService::new(plugins, middleware, deps.bus, services)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::target_image_name;
+
+    #[test]
+    fn windows_style_config_paths_yield_the_bare_image_name_on_any_host() {
+        // Regression: `Path::file_name` is host-separator-dependent; on Unix
+        // it returned the whole `C:\...` string and the target never matched
+        // an ETW process name (Linux CI, chaos suite). The derivation is
+        // textual now — same answer everywhere.
+        let mut config = protocol::config::AgentConfig::default();
+        config.target.path = "C:\\Targets\\Evil.exe".to_owned();
+        assert_eq!(target_image_name(&config), "evil.exe");
+        config.target.path = "evil.exe".to_owned();
+        assert_eq!(target_image_name(&config), "evil.exe");
+        config.target.path = "C:/Targets/evil.exe".to_owned();
+        assert_eq!(target_image_name(&config), "evil.exe");
+    }
 }

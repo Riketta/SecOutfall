@@ -24,15 +24,12 @@
 //! (crashing on single-token commands — bug #7); launch failures now log a
 //! typed error instead of crashing.
 
-use std::{
-    ffi::OsStr,
-    sync::{
-        Arc,
-        atomic::{
-            AtomicBool,
-            AtomicU64,
-            Ordering,
-        },
+use std::sync::{
+    Arc,
+    atomic::{
+        AtomicBool,
+        AtomicU64,
+        Ordering,
     },
 };
 
@@ -181,11 +178,9 @@ impl TargetLauncherPlugin {
         // The interpreter/executable image joins the scope expectation
         // (bus-only plugin communication — never a direct call). Published
         // before CreateProcess; published even if the launch then fails, an
-        // expectation for a name that never appears is inert.
-        let image = std::path::Path::new(&spec.path)
-            .file_name()
-            .and_then(OsStr::to_str)
-            .map_or_else(|| spec.path.clone(), ToString::to_string);
+        // expectation for a name that never appears is inert. Textual split:
+        // see `domain::image_name` — must not depend on the host OS.
+        let image = crate::domain::image_name::image_name(&spec.path).to_owned();
         deps.bus.publish(AgentBusEvent::ExtendScopeExpectation { name: image });
 
         match deps.launcher.launch(&spec).await {
