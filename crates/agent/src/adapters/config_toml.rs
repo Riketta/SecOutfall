@@ -74,8 +74,12 @@ mod tests {
 
     #[test]
     fn missing_file_reports_the_path() {
-        let error =
-            load(Path::new("Z:\\no\\such\\Agent.toml")).expect_err("missing file must fail");
+        // Built portably: `Path::ends_with` compares components, and a
+        // hand-written Windows path is a single component on Unix.
+        let missing = std::env::temp_dir()
+            .join(format!("secoutfall-no-such-{}", std::process::id()))
+            .join("Agent.toml");
+        let error = load(&missing).expect_err("missing file must fail");
         match error {
             ConfigLoadError::Read { path, .. } => {
                 assert!(path.ends_with("Agent.toml"));
