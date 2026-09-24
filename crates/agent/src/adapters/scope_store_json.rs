@@ -66,10 +66,10 @@ impl ScopeRepository for JsonScopeRepository {
         // Best-effort directory fsync so the rename itself survives a power
         // loss. Not done on Windows: `File::open` on a directory fails there.
         #[cfg(unix)]
-        if let Some(parent) = self.path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
+        if let Some(parent) = self.path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
         }
         Ok(())
     }
