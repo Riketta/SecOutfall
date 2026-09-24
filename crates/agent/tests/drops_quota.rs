@@ -143,6 +143,7 @@ async fn boot(config: &AgentConfig) -> Harness {
         user_actor_nonce: "drops-quota-nonce".to_owned(),
         seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         user_actor_pid_gate: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        finalize_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     kernel.boot().await.unwrap();
     Harness { kernel }

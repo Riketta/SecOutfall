@@ -115,6 +115,12 @@ pub struct SessionManagerDeps {
     pub time: TimeConfig,
     /// Debug gate for all clock manipulation.
     pub skip_time_manipulation: bool,
+    /// Debug gate for the finalize reboot/shutdown REQUEST (the agent only
+    /// ever publishes the request; the Controller/VM acts on it).
+    pub skip_reboot_and_shutdown: bool,
+    /// Finalize-completion flag, set when a finalize FULLY completed (the
+    /// host's `is_finalized` poll waits on this, not on `ended_at_ms`).
+    pub finalize_done: Arc<std::sync::atomic::AtomicBool>,
     /// Agent version for `agent.state`.
     pub agent_version: String,
     /// Bus handle: score raises in, dead-scope + score subscriptions out.
@@ -157,6 +163,8 @@ impl SessionManagerPlugin {
             killer: &self.deps.killer,
             time: &self.deps.time,
             skip_time_manipulation: self.deps.skip_time_manipulation,
+            skip_reboot_and_shutdown: self.deps.skip_reboot_and_shutdown,
+            finalize_done: &self.deps.finalize_done,
             processes_to_terminate: &self.deps.processes_to_terminate,
             uptimes: &self.deps.uptimes,
             seq: &self.deps.seq,
@@ -219,6 +227,8 @@ struct FinalizeCtx<'a> {
     killer: &'a Arc<dyn ProcessKillerPort>,
     time: &'a TimeConfig,
     skip_time_manipulation: bool,
+    skip_reboot_and_shutdown: bool,
+    finalize_done: &'a AtomicBool,
     processes_to_terminate: &'a [String],
     uptimes: &'a [u64],
     seq: &'a AtomicU64,
@@ -236,6 +246,8 @@ async fn finalize_session(ctx: &FinalizeCtx<'_>, reason: FinalizeReason) {
         killer,
         time,
         skip_time_manipulation,
+        skip_reboot_and_shutdown,
+        finalize_done,
         processes_to_terminate,
         uptimes,
         seq,
@@ -323,6 +335,38 @@ async fn finalize_session(ctx: &FinalizeCtx<'_>, reason: FinalizeReason) {
 
     // FIXED decision logic: an empty/dynamic table never overruns; the study
     // shuts down exactly when the planned session count is exhausted.
+    request_reboot_or_shutdown(
+        broker,
+        &emit,
+        uptimes,
+        session_count,
+        *skip_reboot_and_shutdown,
+        reason,
+    )
+    .await;
+    // LAST: the completion flag the host polls. Flipping it early would let
+    // `run_until_stop` drop this very future mid-persist (the scope write
+    // would die with it).
+    finalize_done.store(true, Ordering::SeqCst);
+}
+
+/// The finalize tail: reboot/shutdown REQUEST on the control channel — the
+/// agent only ever publishes it; the Controller/VM acts on it. An
+/// empty/dynamic table never overruns; the study shuts down exactly when the
+/// planned session count is exhausted. The dev-host gate suppresses the
+/// request entirely.
+async fn request_reboot_or_shutdown(
+    broker: &Arc<dyn BrokerPort>,
+    emit: &impl Fn(EventType, Payload) -> Envelope<Payload>,
+    uptimes: &[u64],
+    session_count: usize,
+    skip_reboot_and_shutdown: bool,
+    reason: FinalizeReason,
+) {
+    if skip_reboot_and_shutdown {
+        tracing::info!("reboot/shutdown request suppressed (debug gate)");
+        return;
+    }
     let shutdown = !uptimes.is_empty() && session_count >= uptimes.len();
     let reason_text = format!("{reason:?}").to_lowercase();
     let request = if shutdown {
@@ -514,6 +558,8 @@ impl PluginPort for SessionManagerPlugin {
         let processes_to_terminate = Arc::clone(&self.deps.processes_to_terminate);
         let time = self.deps.time;
         let skip_time_manipulation = self.deps.skip_time_manipulation;
+        let skip_reboot_and_shutdown = self.deps.skip_reboot_and_shutdown;
+        let finalize_done = Arc::clone(&self.deps.finalize_done);
         let uptimes = Arc::clone(&self.deps.uptimes);
         let autoshutdown = self.deps.autoshutdown;
         let finalized = Arc::clone(&self.finalized);
@@ -537,6 +583,8 @@ impl PluginPort for SessionManagerPlugin {
                                     killer: &killer,
                                     time: &time,
                                     skip_time_manipulation,
+                                    skip_reboot_and_shutdown,
+                                    finalize_done: &finalize_done,
                                     processes_to_terminate: &processes_to_terminate,
                                     uptimes: &uptimes,
                                     seq: &seq,

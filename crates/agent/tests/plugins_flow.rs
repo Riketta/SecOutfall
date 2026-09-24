@@ -173,6 +173,7 @@ async fn boot_with_launcher(
         user_actor_nonce: "test-nonce".to_owned(),
         seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         user_actor_pid_gate: Arc::clone(&pid_gate),
+        finalize_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     kernel.boot().await.unwrap();
     Harness {

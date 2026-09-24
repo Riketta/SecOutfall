@@ -21,6 +21,10 @@ pub enum BrokerError {
     /// Connection to the broker is down (message NOT delivered).
     #[error("broker connection is down")]
     ConnectionLost,
+    /// A local persistence sink (e.g. the JSONL event log) failed to store
+    /// the envelope.
+    #[error("event persistence failed: {0}")]
+    Persistence(String),
 }
 
 /// Driven port: publishes typed v3 envelopes. Implementations must serialize

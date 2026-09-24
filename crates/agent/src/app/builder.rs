@@ -119,10 +119,14 @@ pub struct AgentDeps {
     /// lost messages; duplicates mean publisher restarts. Never create a
     /// second counter for the same boot.
     pub seq: Arc<std::sync::atomic::AtomicU64>,
-    /// Expected user-actor client pid (0 = unknown/ungated). The supervisor
+    /// Expected user-actor client pid gate (0 = unknown/ungated). The supervisor
     /// stores the pid it launched; the IPC server compares it against
     /// `GetNamedPipeClientProcessId` at `HELLO` (anti-impostor).
     pub user_actor_pid_gate: Arc<std::sync::atomic::AtomicU32>,
+    /// Set to `true` only when a finalize has FULLY completed (persist and
+    /// final publishes included) — hosts wait on this instead of
+    /// `ended_at_ms`, which is stamped at the START of finalize.
+    pub finalize_done: Arc<std::sync::atomic::AtomicBool>,
     /// Derived-event bus (also handed to tests/simulator for extra assertions).
     pub bus: InMemoryEventBus<AgentBusEvent>,
 }
@@ -177,6 +181,8 @@ pub fn assemble(deps: AgentDeps) -> AgentKernel {
         autoshutdown: deps.config.study.autoshutdown,
         time: deps.config.time,
         skip_time_manipulation: deps.config.debug.skip_time_manipulation,
+        skip_reboot_and_shutdown: deps.config.debug.skip_reboot_and_shutdown,
+        finalize_done: Arc::clone(&deps.finalize_done),
         agent_version: env!("CARGO_PKG_VERSION").to_owned(),
         bus: deps.bus.clone(),
         seq: Arc::clone(&seq),

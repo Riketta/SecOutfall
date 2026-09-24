@@ -2,6 +2,11 @@
 //!
 //! Modes (first positional argument):
 //! - *(default)* `console` — full runtime on this host; Ctrl+C finalizes.
+//! - `console --demo` — same runtime over fakes (no NATS/VM needed).
+//! - `local` — standalone real-adapter run for quick local target testing:
+//!   real launchers, config from `--config` or `--target <path>`, every wire
+//!   event printed to stdout, no broker/Controller required. Safety-forced:
+//!   never shifts the clock, never kills processes, never asks for reboot.
 //! - `simulate` — the phase-3 scripted single-session demo (fakes only).
 //! - `service` — SCM service mode (`--features service`).
 //! - `install` / `uninstall` — manage the SCM entry (`--features service`).
@@ -9,10 +14,12 @@
 //!
 //! Flags:
 //! - `--config <path>` — TOML config location (default `C:\Agent.toml`;
-//!   used by console/service/install, ignored by `simulate`/`etw-probe`).
+//!   used by console/local/service/install, ignored by `simulate`/`etw-probe`).
 //! - `--start` — with `install`: start the service immediately after creating
 //!   it (otherwise it starts at the next boot).
-//! - `--demo` — console mode over fakes (demo config + captured broker) for
+//! - `--target <path>` — with `local`: sample path override (quick runs
+//!   without a config file).
+//! - `--demo` — console mode over fakes (demo config + printed broker) for
 //!   dev boxes without a NATS broker; never use in a real VM.
 
 use std::{
@@ -47,9 +54,28 @@ async fn main() -> anyhow::Result<()> {
         Some("service") => service_mode(&args).await,
         Some("install") => service_install(&args),
         Some("uninstall") => service_uninstall(),
+        Some("local") => local(&args).await,
         Some("etw-probe") => etw_probe().await,
         _ => console(&args).await,
     }
+}
+
+/// Build the standalone (local) config: base config with safety overrides —
+/// a dev host must never have its clock shifted, its processes killed at
+/// finalize, or a reboot requested. The target override (quick runs without
+/// a config file) is applied last.
+#[must_use]
+fn standalone_config(
+    mut config: protocol::config::AgentConfig,
+    target: Option<String>,
+) -> protocol::config::AgentConfig {
+    if let Some(target) = target {
+        config.target.path = target;
+    }
+    config.debug.skip_time_manipulation = true;
+    config.debug.skip_reboot_and_shutdown = true;
+    config.study.processes_to_terminate = Vec::new();
+    config
 }
 
 /// Single global subscriber: `registry` + `EnvFilter` (`RUST_LOG`-aware) +
@@ -107,6 +133,8 @@ struct Args {
     demo: bool,
     /// `install`: start the service after creating it.
     start: bool,
+    /// `local`: target path override (quick runs without a config file).
+    target: Option<String>,
 }
 
 impl Args {
@@ -124,6 +152,7 @@ impl Args {
             config_path: PathBuf::from("C:\\Agent.toml"),
             demo: false,
             start: false,
+            target: None,
         };
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -135,6 +164,11 @@ impl Args {
                 }
                 "--demo" => parsed.demo = true,
                 "--start" => parsed.start = true,
+                "--target" => {
+                    if let Some(target) = args.next() {
+                        parsed.target = Some(target.to_string_lossy().into_owned());
+                    }
+                }
                 positional => {
                     if parsed.mode.is_none() {
                         parsed.mode = Some(positional.to_owned());
@@ -195,6 +229,7 @@ async fn production_session_deps(
         user_actor_nonce,
         seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         user_actor_pid_gate: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        finalize_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
 }
 
@@ -346,6 +381,7 @@ async fn simulate() -> anyhow::Result<()> {
         user_actor_nonce: "demo-nonce".to_owned(),
         seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         user_actor_pid_gate: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        finalize_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         bus: kernel::bus::InMemoryEventBus::new(1024),
     });
 
@@ -381,10 +417,13 @@ async fn console(args: &Args) -> anyhow::Result<()> {
         (
             SessionDeps {
                 config: Arc::new(demo_config()?),
-                scope_repo: Arc::new(agent::adapters::scope_store_json::JsonScopeRepository::new(
-                    "scope.json",
-                )),
-                broker: Arc::new(agent::adapters::broker_fake::FakeBroker::default())
+                // In-memory: a leftover scope.json from a previous run would
+                // make this boot session N and silently disable the session-0
+                // target launch (the same trap `simulate` hit once).
+                scope_repo: Arc::new(
+                    agent::adapters::scope_store_memory::InMemoryScopeRepository::default(),
+                ),
+                broker: Arc::new(agent::adapters::broker_console::ConsoleBroker::default())
                     as Arc<dyn BrokerPort>,
                 clock: Arc::new(agent::adapters::clock_system::SystemClock),
                 uploader: Arc::new(agent::adapters::upload_fake::FakeUploader::default())
@@ -401,6 +440,7 @@ async fn console(args: &Args) -> anyhow::Result<()> {
                 user_actor_nonce: nonce.clone(),
                 seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 user_actor_pid_gate: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                finalize_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
             "fake broker (demo)".to_owned(),
         )
@@ -440,6 +480,104 @@ async fn console(args: &Args) -> anyhow::Result<()> {
 
     #[cfg(not(all(windows, feature = "etw")))]
     println!("ETW disabled (build with --features etw)");
+
+    drop(stop_tx);
+    session.run_until_stop(stop_rx).await?;
+    println!("session finalized, agent stopped");
+    Ok(())
+}
+
+/// Standalone run for quick LOCAL target testing: real launchers/adapters,
+/// every wire event printed to stdout, no NATS/Controller/user-actor needed.
+/// The scope DB is in-memory (every run is a fresh session 0), and the config
+/// is safety-forced: no clock shifting, no finalize kills, no reboot request —
+/// this runs on a dev host, not in the analysis VM.
+///
+/// Observation needs a live kernel trace: build with `--features etw` and run
+/// elevated. Without it the run starts the target only if the launcher fires
+/// on other signals — it will mostly sit idle and print why.
+async fn local(args: &Args) -> anyhow::Result<()> {
+    let has_config = args.config_path.exists();
+    let base = if has_config {
+        println!(
+            "{} v{} (local, config: {})",
+            agent::NAME,
+            env!("CARGO_PKG_VERSION"),
+            args.config_path.display()
+        );
+        agent::adapters::config_toml::load(&args.config_path)?
+    } else {
+        println!(
+            "{} v{} (local, built-in defaults; no config at {})",
+            agent::NAME,
+            env!("CARGO_PKG_VERSION"),
+            args.config_path.display()
+        );
+        demo_config()?
+    };
+    let config = Arc::new(standalone_config(base, args.target.clone()));
+    config.validate()?;
+    if !has_config && args.target.is_none() {
+        println!(
+            "hint: pass `--target <path-to-sample>` (or a --config file), or the\n             built-in placeholder target will fail to launch"
+        );
+    }
+    println!("target: {}", config.target.path);
+
+    // Event database: every envelope as one JSON line (`jq`/`tail -f`
+    // friendly), next to the printed stream. The scope snapshot (scoped
+    // processes, drops, timestamps) lands in a second file at finalize.
+    let events_path = PathBuf::from("events.jsonl");
+    let scope_path = PathBuf::from("local-scope.json");
+    let jsonl = Arc::new(
+        agent::adapters::broker_jsonl::JsonlBroker::create(&events_path)
+            .map_err(|error| anyhow::anyhow!("cannot open {}: {error}", events_path.display()))?,
+    );
+    let broker: Arc<dyn BrokerPort> = Arc::new(agent::adapters::broker_tee::TeeBroker::new(vec![
+        Arc::new(agent::adapters::broker_console::ConsoleBroker::default()),
+        jsonl,
+    ]));
+
+    let deps = SessionDeps {
+        config: Arc::clone(&config),
+        // Fresh-load + persisting snapshot: every local run is a fresh
+        // session 0, and the final scope still lands on disk.
+        scope_repo: Arc::new(agent::adapters::scope_store_local::LocalScopeRepository::new(
+            &scope_path,
+        )),
+        broker,
+        clock: Arc::new(agent::adapters::clock_system::SystemClock),
+        uploader: Arc::new(agent::adapters::upload_fake::FakeUploader::default())
+            as Arc<dyn FileUploadPort>,
+        launcher: production_launcher(&config),
+        shell: production_shell(),
+        killer: production_killer(),
+        shifter: production_shifter(),
+        statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
+        user_actor_nonce: generate_nonce(),
+        seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        user_actor_pid_gate: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        finalize_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    println!("events: {} (JSONL, one envelope per line)", events_path.display());
+    println!("scope snapshot: {} (written at finalize)", scope_path.display());
+
+    let (session, stop_tx, stop_rx) = agent::app::runtime::RunningSession::start(deps).await?;
+
+    // Ctrl+C → ServiceStop (the same event SCM delivers).
+    let ctrl_c_tx = stop_tx.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        let _ = ctrl_c_tx.send(SandboxEvent::ServiceStop).await;
+    });
+
+    #[cfg(all(windows, feature = "etw"))]
+    attach_etw(&session).await;
+
+    #[cfg(not(all(windows, feature = "etw")))]
+    println!(
+        "no event source: build with --features etw and run elevated, or\n         nothing will be observed and the run will idle"
+    );
 
     drop(stop_tx);
     session.run_until_stop(stop_rx).await?;
@@ -667,4 +805,44 @@ async fn run_service_body(args: Vec<std::ffi::OsString>) -> anyhow::Result<()> {
     session.run_until_stop(stop_rx).await?;
     status.stopped()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn standalone_config_forces_dev_host_safety() {
+        let mut base = demo_config().unwrap();
+        base.debug.skip_time_manipulation = false;
+        base.debug.skip_reboot_and_shutdown = false;
+        base.study.processes_to_terminate = vec!["WINWORD".to_owned()];
+        base.target.path = "C:\\old.exe".to_owned();
+
+        let config = standalone_config(base, Some("C:\\my\\target.exe".to_owned()));
+
+        assert!(config.debug.skip_time_manipulation, "a local run must never touch the host clock");
+        assert!(config.debug.skip_reboot_and_shutdown, "a local run must never request a reboot");
+        assert!(
+            config.study.processes_to_terminate.is_empty(),
+            "a local run must never kill host processes"
+        );
+        assert_eq!(config.target.path, "C:\\my\\target.exe");
+    }
+
+    #[test]
+    fn args_parse_local_mode_with_target() {
+        let args = Args::parse_from([
+            "local".into(),
+            "--target".into(),
+            "C:\\t.exe".into(),
+            "--config".into(),
+            "D:\\cfg.toml".into(),
+        ]);
+        assert_eq!(args.mode.as_deref(), Some("local"));
+        assert_eq!(args.target.as_deref(), Some("C:\\t.exe"));
+        assert_eq!(args.config_path, PathBuf::from("D:\\cfg.toml"));
+    }
 }

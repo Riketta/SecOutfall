@@ -1,8 +1,11 @@
 //! Infrastructure adapters: real ones ship in phases 4–6, fakes power tests and
 //! the simulation harness.
 
+pub mod broker_console;
 pub mod broker_fake;
+pub mod broker_jsonl;
 pub mod broker_nats;
+pub mod broker_tee;
 pub mod clock_fake;
 pub mod clock_shift;
 pub mod clock_system;
@@ -14,6 +17,7 @@ pub mod launcher_unavailable;
 pub mod process_killer_fake;
 pub mod scheduler;
 pub mod scope_store_json;
+pub mod scope_store_local;
 pub mod scope_store_memory;
 pub mod shell_association_fake;
 pub mod upload_fake;

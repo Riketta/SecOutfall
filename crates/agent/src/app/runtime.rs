@@ -68,6 +68,10 @@ pub struct SessionDeps {
     /// Expected user-actor client pid gate (shared with the IPC server; see
     /// [`AgentDeps::user_actor_pid_gate`]).
     pub user_actor_pid_gate: Arc<std::sync::atomic::AtomicU32>,
+    /// Set to `true` only when a finalize has FULLY completed (persist and
+    /// final publishes included) — hosts wait on this instead of
+    /// `ended_at_ms`, which is stamped at the START of finalize.
+    pub finalize_done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A running session: the assembled kernel plus its driving handles.
@@ -76,6 +80,7 @@ pub struct RunningSession {
     state: SharedScopeState,
     scheduler: Arc<SchedulerAdapter>,
     seq: Arc<std::sync::atomic::AtomicU64>,
+    finalize_done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RunningSession {
@@ -89,6 +94,7 @@ impl RunningSession {
     ) -> Result<(Self, mpsc::Sender<SandboxEvent>, mpsc::Receiver<SandboxEvent>), anyhow::Error>
     {
         let seq = deps.seq.clone();
+        let finalize_done = Arc::clone(&deps.finalize_done);
         let state = load_scope_state(deps.scope_repo.as_ref()).await?;
         let bus = kernel::bus::InMemoryEventBus::new(4096);
         let kernel = Arc::new(assemble(AgentDeps {
@@ -106,6 +112,7 @@ impl RunningSession {
             user_actor_nonce: deps.user_actor_nonce,
             seq: Arc::clone(&seq),
             user_actor_pid_gate: Arc::clone(&deps.user_actor_pid_gate),
+            finalize_done: Arc::clone(&finalize_done),
             bus,
         }));
         kernel.boot().await?;
@@ -124,7 +131,7 @@ impl RunningSession {
         });
 
         let (stop_tx, stop_rx) = mpsc::channel::<SandboxEvent>(8);
-        Ok((Self { kernel, state, scheduler, seq }, stop_tx, stop_rx))
+        Ok((Self { kernel, state, scheduler, seq, finalize_done }, stop_tx, stop_rx))
     }
 
     /// The shared per-boot wire sequence counter (adapters that publish to
@@ -146,10 +153,13 @@ impl RunningSession {
         &self.state
     }
 
-    /// Has the current session been finalized?
+    /// Has the current session's finalize FULLY completed (persist and final
+    /// publishes included)? `ended_at_ms` is stamped at the START of finalize,
+    /// so polling it here could make the host drop the pipeline future
+    /// mid-persist — killing the scope write.
     #[must_use]
     pub fn is_finalized(&self) -> bool {
-        self.state.lock().current_session().is_some_and(|session| session.ended_at_ms.is_some())
+        self.finalize_done.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Run until the stop channel delivers `ServiceStop` or the session

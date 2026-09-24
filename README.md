@@ -34,13 +34,14 @@ repository `AGENTS.md`.
 ## The agent binary
 
 ```
-secoutfall-agent [MODE] [--config <path>] [--demo] [--start]
+secoutfall-agent [MODE] [--config <path>] [--target <path>] [--demo] [--start]
 ```
 
 | Mode | What it does |
 |---|---|
 | *(default)* `console` | Full runtime on this host; Ctrl+C finalizes the session. |
-| `console --demo` | Same runtime over fakes (demo config, in-memory broker/uploader) for dev boxes without a NATS broker or VM isolation. |
+| `console --demo` | Same runtime over fakes (in-memory scope, console-printed events) for dev boxes without a NATS broker or VM isolation. |
+| `local` | Standalone run for quick local target testing: real launchers and adapters, no broker/Controller/user-actor needed. Every wire event is printed to stdout AND appended to `events.jsonl` (one envelope per line); the final scope snapshot lands in `local-scope.json`. Safety-forced: never shifts the clock, kills processes, or requests a reboot. Point it at a sample with `--target <path>`, or a full `--config <path>`. |
 | `simulate` | Scripted single-session demo, fakes only, prints a report. |
 | `service` | SCM service mode (`--features service`); Stop/Shutdown become finalize events. |
 | `install` | Create the SCM entry pointing at this exe with `--config <path>` (validates the config first; refuses double-install). `--start` boots it immediately. |
@@ -81,6 +82,12 @@ Dev box (no VM needed):
 ```sh
 cargo run -p agent -- simulate                 # scripted study demo
 cargo run -p agent -- console --demo           # full runtime over fakes
+
+# Standalone: real adapters against a local target, events on stdout,
+# no broker/Controller needed (add --features etw and run elevated to
+# actually observe process/file activity):
+cargo run -p agent --features launcher -- local --target C:\Windows\System32\notepad.exe
+
 cargo run -p devtools --bin dummy-broker       # observe real NATS traffic
 cargo run -p devtools --bin session-sim        # 24-session study in milliseconds
 ```
