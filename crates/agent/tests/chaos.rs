@@ -23,12 +23,12 @@ use std::{
 };
 
 use agent::{
-    adapters::{
-        clock_fake::FakeClock,
-        launcher_fake::FakeLauncher,
-        scope_store_memory::InMemoryScopeRepository,
-        shell_association_fake::FakeShellAssociation,
-        upload_fake::FakeUploader,
+    adapters::driven::{
+        clock::fake::FakeClock,
+        launcher::fake::FakeLauncher,
+        scope_store::memory::InMemoryScopeRepository,
+        shell_association::fake::FakeShellAssociation,
+        upload::fake::FakeUploader,
     },
     app::{
         builder::{
@@ -41,7 +41,7 @@ use agent::{
             SourceEvent,
         },
     },
-    ports::{
+    ports::driven::{
         broker::{
             BrokerError,
             BrokerPort,
@@ -71,12 +71,12 @@ use protocol::{
 /// A broker that accepts the first `remaining` publishes, then loses the
 /// connection (the Controller/NATS went away mid-study).
 struct DyingBroker {
-    inner: Arc<agent::adapters::broker_fake::FakeBroker>,
+    inner: Arc<agent::adapters::driven::broker::fake::FakeBroker>,
     remaining: AtomicU32,
 }
 
 impl DyingBroker {
-    fn new(inner: Arc<agent::adapters::broker_fake::FakeBroker>, die_after: u32) -> Self {
+    fn new(inner: Arc<agent::adapters::driven::broker::fake::FakeBroker>, die_after: u32) -> Self {
         Self { inner, remaining: AtomicU32::new(die_after) }
     }
 }
@@ -158,16 +158,16 @@ async fn boot(config: &AgentConfig, broker: Arc<dyn BrokerPort>) -> Harness {
         scope_state: state,
         scope_repo: Arc::clone(&repo) as Arc<dyn ScopeRepository>,
         broker,
-        clock: Arc::clone(&clock) as Arc<dyn agent::ports::clock::SystemClockPort>,
+        clock: Arc::clone(&clock) as Arc<dyn agent::ports::driven::clock::SystemClockPort>,
         uploader: Arc::new(FakeUploader::default())
-            as Arc<dyn agent::ports::uploader::FileUploadPort>,
+            as Arc<dyn agent::ports::driven::uploader::FileUploadPort>,
         launcher: Arc::new(FakeLauncher::default())
-            as Arc<dyn agent::ports::process_launcher::ProcessLauncherPort>,
+            as Arc<dyn agent::ports::driven::process_launcher::ProcessLauncherPort>,
         shell: Arc::new(FakeShellAssociation::new())
-            as Arc<dyn agent::ports::shell_association::ShellAssociationPort>,
-        killer: Arc::new(agent::adapters::process_killer_fake::FakeProcessKiller::default())
-            as Arc<dyn agent::ports::process_killer::ProcessKillerPort>,
-        shifter: Arc::clone(&clock) as Arc<dyn agent::ports::clock::ClockShiftPort>,
+            as Arc<dyn agent::ports::driven::shell_association::ShellAssociationPort>,
+        killer: Arc::new(agent::adapters::driven::killer::fake::FakeProcessKiller::default())
+            as Arc<dyn agent::ports::driven::process_killer::ProcessKillerPort>,
+        shifter: Arc::clone(&clock) as Arc<dyn agent::ports::driven::clock::ClockShiftPort>,
         statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
         bus: InMemoryEventBus::new(4096),
         user_actor_nonce: "chaos-nonce".to_owned(),
@@ -208,7 +208,7 @@ impl Harness {
 async fn broker_dying_mid_session_still_persists_the_scope() {
     let drops = temp_dir("dying-broker");
     let config = base_config(&drops);
-    let fake = Arc::new(agent::adapters::broker_fake::FakeBroker::default());
+    let fake = Arc::new(agent::adapters::driven::broker::fake::FakeBroker::default());
     let broker: Arc<dyn BrokerPort> = Arc::new(DyingBroker::new(Arc::clone(&fake), 4)); // dies mid-session
     let harness = boot(&config, broker).await;
 
@@ -242,7 +242,7 @@ async fn locked_drop_is_skipped_and_collection_continues() {
     let drops = temp_dir("locked-drop");
     let source_dir = temp_dir("locked-src");
     let config = base_config(&drops);
-    let fake = Arc::new(agent::adapters::broker_fake::FakeBroker::default());
+    let fake = Arc::new(agent::adapters::driven::broker::fake::FakeBroker::default());
     let harness = boot(&config, fake).await;
 
     let locked_path = source_dir.join("locked.txt");
@@ -305,7 +305,7 @@ async fn unusable_drops_target_does_not_block_finalization() {
     std::fs::write(&drops_file, b"not a directory").unwrap();
     let mut config = base_config(&drops_file);
     config.drops.extensions = vec![".txt".to_owned()];
-    let fake = Arc::new(agent::adapters::broker_fake::FakeBroker::default());
+    let fake = Arc::new(agent::adapters::driven::broker::fake::FakeBroker::default());
     let harness = boot(&config, fake).await;
 
     let source = base.join("drop.txt");
@@ -335,7 +335,7 @@ async fn failed_copy_leaves_no_part_litter_and_collection_survives() {
     let drops = temp_dir("part-litter");
     let source_dir = temp_dir("part-src");
     let config = base_config(&drops);
-    let fake = Arc::new(agent::adapters::broker_fake::FakeBroker::default());
+    let fake = Arc::new(agent::adapters::driven::broker::fake::FakeBroker::default());
     let harness = boot(&config, fake).await;
 
     // A directory with a dropping extension: matches the filter, then fails
@@ -384,7 +384,7 @@ async fn vanishing_and_unicode_drops_are_handled() {
     let mut config = base_config(&drops);
     // The Unicode drop is the only kind collected here; make it match.
     config.drops.extensions = vec![".txt".to_owned()];
-    let fake = Arc::new(agent::adapters::broker_fake::FakeBroker::default());
+    let fake = Arc::new(agent::adapters::driven::broker::fake::FakeBroker::default());
     let harness = boot(&config, fake).await;
 
     // A drop that never existed (malware deleted it between write and

@@ -73,7 +73,7 @@ use crate::{
         scope::SharedScopeState,
     },
     plugins::wire,
-    ports::{
+    ports::driven::{
         broker::{
             BrokerPort,
             Channel,

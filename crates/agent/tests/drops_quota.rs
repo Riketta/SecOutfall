@@ -15,12 +15,12 @@ use std::{
 };
 
 use agent::{
-    adapters::{
-        clock_fake::FakeClock,
-        launcher_fake::FakeLauncher,
-        scope_store_memory::InMemoryScopeRepository,
-        shell_association_fake::FakeShellAssociation,
-        upload_fake::FakeUploader,
+    adapters::driven::{
+        clock::fake::FakeClock,
+        launcher::fake::FakeLauncher,
+        scope_store::memory::InMemoryScopeRepository,
+        shell_association::fake::FakeShellAssociation,
+        upload::fake::FakeUploader,
     },
     app::{
         builder::{
@@ -33,7 +33,7 @@ use agent::{
             SourceEvent,
         },
     },
-    ports::{
+    ports::driven::{
         broker::BrokerPort,
         scope_repository::ScopeRepository,
     },
@@ -126,18 +126,18 @@ async fn boot(config: &AgentConfig) -> Harness {
         config: Arc::new(config.clone()),
         scope_state: state,
         scope_repo: Arc::clone(&repo) as Arc<dyn ScopeRepository>,
-        broker: Arc::new(agent::adapters::broker_fake::FakeBroker::default())
+        broker: Arc::new(agent::adapters::driven::broker::fake::FakeBroker::default())
             as Arc<dyn BrokerPort>,
-        clock: Arc::clone(&clock) as Arc<dyn agent::ports::clock::SystemClockPort>,
+        clock: Arc::clone(&clock) as Arc<dyn agent::ports::driven::clock::SystemClockPort>,
         uploader: Arc::new(FakeUploader::default())
-            as Arc<dyn agent::ports::uploader::FileUploadPort>,
+            as Arc<dyn agent::ports::driven::uploader::FileUploadPort>,
         launcher: Arc::new(FakeLauncher::default())
-            as Arc<dyn agent::ports::process_launcher::ProcessLauncherPort>,
+            as Arc<dyn agent::ports::driven::process_launcher::ProcessLauncherPort>,
         shell: Arc::new(FakeShellAssociation::new())
-            as Arc<dyn agent::ports::shell_association::ShellAssociationPort>,
-        killer: Arc::new(agent::adapters::process_killer_fake::FakeProcessKiller::default())
-            as Arc<dyn agent::ports::process_killer::ProcessKillerPort>,
-        shifter: Arc::clone(&clock) as Arc<dyn agent::ports::clock::ClockShiftPort>,
+            as Arc<dyn agent::ports::driven::shell_association::ShellAssociationPort>,
+        killer: Arc::new(agent::adapters::driven::killer::fake::FakeProcessKiller::default())
+            as Arc<dyn agent::ports::driven::process_killer::ProcessKillerPort>,
+        shifter: Arc::clone(&clock) as Arc<dyn agent::ports::driven::clock::ClockShiftPort>,
         statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
         bus: InMemoryEventBus::new(4096),
         user_actor_nonce: "drops-quota-nonce".to_owned(),

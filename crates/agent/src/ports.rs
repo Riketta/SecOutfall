@@ -1,10 +1,6 @@
-//! Agent port contracts beyond the kernel's (inventory in root `AGENTS.md`).
+//! Agent port contracts beyond the kernel's (inventory in root `AGENTS.md`),
+//! split by direction: [`driving`] is the inbound-source adapter SPI, [`driven`]
+//! are the outbound services the hexagon calls.
 
-pub mod broker;
-pub mod clock;
-pub mod event_source;
-pub mod process_killer;
-pub mod process_launcher;
-pub mod scope_repository;
-pub mod shell_association;
-pub mod uploader;
+pub mod driven;
+pub mod driving;

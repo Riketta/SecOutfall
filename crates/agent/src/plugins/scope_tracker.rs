@@ -44,7 +44,7 @@ use crate::{
             SharedScopeState,
         },
     },
-    ports::clock::SystemClockPort,
+    ports::driven::clock::SystemClockPort,
 };
 
 /// Membership + drop detection plugin. Owns the non-persisted tracking state;

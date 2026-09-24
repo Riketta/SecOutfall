@@ -12,7 +12,7 @@ use protocol::config::AgentConfig;
 use tokio::sync::mpsc;
 
 use crate::{
-    adapters::scheduler::SchedulerAdapter,
+    adapters::driving::scheduler::SchedulerAdapter,
     app::{
         builder::{
             AgentDeps,
@@ -24,17 +24,19 @@ use crate::{
     },
     domain::scope::SharedScopeState,
     ports::{
-        broker::BrokerPort,
-        clock::{
-            ClockShiftPort,
-            SystemClockPort,
+        driven::{
+            broker::BrokerPort,
+            clock::{
+                ClockShiftPort,
+                SystemClockPort,
+            },
+            process_killer::ProcessKillerPort,
+            process_launcher::ProcessLauncherPort,
+            scope_repository::ScopeRepository,
+            shell_association::ShellAssociationPort,
+            uploader::FileUploadPort,
         },
-        event_source::EventSourcePort,
-        process_killer::ProcessKillerPort,
-        process_launcher::ProcessLauncherPort,
-        scope_repository::ScopeRepository,
-        shell_association::ShellAssociationPort,
-        uploader::FileUploadPort,
+        driving::event_source::EventSourcePort,
     },
 };
 

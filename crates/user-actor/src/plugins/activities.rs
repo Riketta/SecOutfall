@@ -20,7 +20,7 @@ use crate::{
         ActivityStep,
         run_script,
     },
-    ports::{
+    ports::driven::{
         AppLauncherPort,
         InputSynthesisPort,
         Key,

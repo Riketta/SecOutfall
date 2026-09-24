@@ -17,14 +17,16 @@ use std::{
 
 use agent::{
     adapters::{
-        broker_fake::FakeBroker,
-        clock_fake::FakeClock,
-        ipc_server::IpcServerAdapter,
-        scope_store_memory::InMemoryScopeRepository,
+        driven::{
+            broker::fake::FakeBroker,
+            clock::fake::FakeClock,
+            scope_store::memory::InMemoryScopeRepository,
+        },
+        driving::ipc_server::IpcServerAdapter,
     },
     app::event::SandboxEvent,
     domain::scope::SharedScopeState,
-    ports::broker::Channel,
+    ports::driven::broker::Channel,
 };
 use kernel::app::api_ports::EventInletPort;
 use protocol::{
@@ -39,13 +41,13 @@ use protocol::{
 };
 use tokio_util::sync::CancellationToken;
 use user_actor::{
-    adapters::ipc_client::{
+    adapters::driving::ipc_client::{
         IpcClientAdapter,
         IpcClientError,
         IpcClientOptions,
     },
     domain::ActorEvent,
-    ports::ScreenshotSinkPort as _,
+    ports::driven::ScreenshotSinkPort as _,
 };
 
 /// Screenshot bytes recognizable end to end.
@@ -269,7 +271,7 @@ async fn oversized_screenshot_is_rejected_at_the_sink_and_never_queued() {
 
     let oversized = vec![0_u8; MAX_PAYLOAD_LEN + 1];
     let error = sink.send(1, oversized).await.unwrap_err();
-    assert!(matches!(error, user_actor::ports::ScreenshotSinkError::Oversize), "{error:?}");
+    assert!(matches!(error, user_actor::ports::driven::ScreenshotSinkError::Oversize), "{error:?}");
     assert!(queue.try_recv().is_err(), "an unwireable frame must never be queued");
 
     let at_cap = vec![0_u8; MAX_PAYLOAD_LEN - SCREENSHOT_SEQ_LEN];

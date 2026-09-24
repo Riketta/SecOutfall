@@ -2,9 +2,9 @@
 //! `SecOutfallB`).
 //!
 //! Layout: [`app`] (inbound taxonomy + composition), [`domain`] (study/session/
-//! scope/drop aggregates), [`ports`] (agent port contracts), [`adapters`]
-//! (real + fake adapters), [`plugins`] (hexagon plugins). The binary target is a
-//! thin composition root only.
+//! scope/drop aggregates), [`ports`] (agent port contracts, split driving/driven),
+//! [`adapters`] (driving + driven adapters, real + fake), [`plugins`] (hexagon
+//! plugins). The binary target is a thin composition root only.
 
 /// Crate name as launched on disk (the bin target name).
 pub const NAME: &str = "secoutfall-agent";

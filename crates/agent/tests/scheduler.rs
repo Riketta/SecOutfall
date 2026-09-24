@@ -12,9 +12,11 @@ use std::{
 
 use agent::{
     adapters::{
-        broker_fake::FakeBroker,
-        clock_fake::FakeClock,
-        scheduler::SchedulerAdapter,
+        driven::{
+            broker::fake::FakeBroker,
+            clock::fake::FakeClock,
+        },
+        driving::scheduler::SchedulerAdapter,
     },
     app::event::SandboxEvent,
     domain::scope::{
@@ -23,9 +25,11 @@ use agent::{
         SharedScopeState,
     },
     ports::{
-        broker::Channel,
-        clock::SystemClockPort,
-        event_source::EventSourcePort,
+        driven::{
+            broker::Channel,
+            clock::SystemClockPort,
+        },
+        driving::event_source::EventSourcePort,
     },
 };
 use kernel::app::api_ports::EventInletPort;
@@ -74,7 +78,7 @@ fn adapter(
     Arc::new(SchedulerAdapter::new(
         state,
         Arc::clone(clock) as Arc<dyn SystemClockPort>,
-        Arc::clone(broker) as Arc<dyn agent::ports::broker::BrokerPort>,
+        Arc::clone(broker) as Arc<dyn agent::ports::driven::broker::BrokerPort>,
         Arc::clone(seq),
     ))
 }

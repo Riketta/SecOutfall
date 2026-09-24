@@ -23,13 +23,13 @@ use std::{
 };
 
 use agent::{
-    adapters::{
-        broker_fake::FakeBroker,
-        clock_fake::FakeClock,
-        launcher_fake::FakeLauncher,
-        scope_store_memory::InMemoryScopeRepository,
-        shell_association_fake::FakeShellAssociation,
-        upload_fake::FakeUploader,
+    adapters::driven::{
+        broker::fake::FakeBroker,
+        clock::fake::FakeClock,
+        launcher::fake::FakeLauncher,
+        scope_store::memory::InMemoryScopeRepository,
+        shell_association::fake::FakeShellAssociation,
+        upload::fake::FakeUploader,
     },
     app::{
         builder::{
@@ -46,7 +46,7 @@ use agent::{
     },
     domain::scope::SharedScopeState,
     plugins::statistics::SessionStatistics,
-    ports::{
+    ports::driven::{
         process_launcher::{
             LaunchError,
             LaunchOutcome,
@@ -125,7 +125,7 @@ struct Harness {
     broker: Arc<FakeBroker>,
     uploader: Arc<FakeUploader>,
     launcher: Arc<FakeLauncher>,
-    killer: Arc<agent::adapters::process_killer_fake::FakeProcessKiller>,
+    killer: Arc<agent::adapters::driven::killer::fake::FakeProcessKiller>,
     clock: Arc<FakeClock>,
     stats: Arc<SessionStatistics>,
     state: SharedScopeState,
@@ -152,7 +152,7 @@ async fn boot_with_launcher(
     let broker = Arc::new(FakeBroker::default());
     let uploader = Arc::new(FakeUploader::default());
     let killer =
-        Arc::new(agent::adapters::process_killer_fake::FakeProcessKiller::with_killed_per_name(1));
+        Arc::new(agent::adapters::driven::killer::fake::FakeProcessKiller::with_killed_per_name(1));
     let counters = Arc::new(SessionStatistics::default());
     let repo = Arc::new(InMemoryScopeRepository::default());
     let state = load_scope_state(repo.as_ref()).await.unwrap();
@@ -161,13 +161,15 @@ async fn boot_with_launcher(
         config: Arc::new(config.clone()),
         scope_state: Arc::clone(&state),
         scope_repo: Arc::clone(&repo) as Arc<dyn ScopeRepository>,
-        broker: Arc::clone(&broker) as Arc<dyn agent::ports::broker::BrokerPort>,
-        clock: Arc::clone(&clock) as Arc<dyn agent::ports::clock::SystemClockPort>,
-        uploader: Arc::clone(&uploader) as Arc<dyn agent::ports::uploader::FileUploadPort>,
+        broker: Arc::clone(&broker) as Arc<dyn agent::ports::driven::broker::BrokerPort>,
+        clock: Arc::clone(&clock) as Arc<dyn agent::ports::driven::clock::SystemClockPort>,
+        uploader: Arc::clone(&uploader) as Arc<dyn agent::ports::driven::uploader::FileUploadPort>,
         launcher: installed,
-        shell: Arc::clone(shell) as Arc<dyn agent::ports::shell_association::ShellAssociationPort>,
-        killer: Arc::clone(&killer) as Arc<dyn agent::ports::process_killer::ProcessKillerPort>,
-        shifter: Arc::clone(&clock) as Arc<dyn agent::ports::clock::ClockShiftPort>,
+        shell: Arc::clone(shell)
+            as Arc<dyn agent::ports::driven::shell_association::ShellAssociationPort>,
+        killer: Arc::clone(&killer)
+            as Arc<dyn agent::ports::driven::process_killer::ProcessKillerPort>,
+        shifter: Arc::clone(&clock) as Arc<dyn agent::ports::driven::clock::ClockShiftPort>,
         statistics: Arc::clone(&counters),
         bus: InMemoryEventBus::new(4096),
         user_actor_nonce: "test-nonce".to_owned(),
@@ -451,7 +453,7 @@ async fn non_exe_target_launches_via_association_and_extends_scope() {
 
     let launched_event = harness
         .broker
-        .of_channel(agent::ports::broker::Channel::Event)
+        .of_channel(agent::ports::driven::broker::Channel::Event)
         .into_iter()
         .find(|envelope| envelope.event_type == EventType::TargetLaunched)
         .expect("target.launched on the wire");
@@ -625,7 +627,8 @@ async fn finalize_reports_score_summary_shifts_clock_and_kills() {
         .await;
     harness.settle().await;
 
-    let before_finalize = agent::ports::clock::SystemClockPort::now_ms(harness.clock.as_ref());
+    let before_finalize =
+        agent::ports::driven::clock::SystemClockPort::now_ms(harness.clock.as_ref());
     harness.kernel.accept(SandboxEvent::SessionDeadline).await;
     harness.settle().await;
     harness.shutdown().await;
@@ -635,7 +638,7 @@ async fn finalize_reports_score_summary_shifts_clock_and_kills() {
     // the reported score is the session maximum.
     let score_event = harness
         .broker
-        .of_channel(agent::ports::broker::Channel::Event)
+        .of_channel(agent::ports::driven::broker::Channel::Event)
         .into_iter()
         .find(|envelope| envelope.event_type == protocol::events::EventType::StudyScore)
         .expect("study.score at finalize");
@@ -650,7 +653,7 @@ async fn finalize_reports_score_summary_shifts_clock_and_kills() {
     // Drops summary: the structured histogram replaces the legacy string.
     let summary_event = harness
         .broker
-        .of_channel(agent::ports::broker::Channel::Event)
+        .of_channel(agent::ports::driven::broker::Channel::Event)
         .into_iter()
         .find(|envelope| envelope.event_type == protocol::events::EventType::StudyDropsSummary)
         .expect("study.drops_summary at finalize");
@@ -663,13 +666,13 @@ async fn finalize_reports_score_summary_shifts_clock_and_kills() {
 
     // Clock offset applied through the shifter (FakeClock = clock + shifter).
     assert_eq!(
-        agent::ports::clock::SystemClockPort::now_ms(harness.clock.as_ref()),
+        agent::ports::driven::clock::SystemClockPort::now_ms(harness.clock.as_ref()),
         before_finalize + 90 * 1000,
         "finalize must shift the fake clock by offset_secs"
     );
     let adjusted_event = harness
         .broker
-        .of_channel(agent::ports::broker::Channel::Event)
+        .of_channel(agent::ports::driven::broker::Channel::Event)
         .into_iter()
         .find(|envelope| envelope.event_type == protocol::events::EventType::ClockAdjusted)
         .expect("clock.adjusted at finalize");
@@ -792,7 +795,7 @@ async fn verbosity_none_silences_source_events_but_derived_events_flow() {
 
     let types: Vec<EventType> = harness
         .broker
-        .of_channel(agent::ports::broker::Channel::Event)
+        .of_channel(agent::ports::driven::broker::Channel::Event)
         .into_iter()
         .map(|envelope| envelope.event_type)
         .collect();

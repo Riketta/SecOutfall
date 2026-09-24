@@ -70,7 +70,7 @@ use crate::{
         marker::is_marker_process,
         scope::SharedScopeState,
     },
-    ports::{
+    ports::driven::{
         broker::{
             BrokerPort,
             Channel,

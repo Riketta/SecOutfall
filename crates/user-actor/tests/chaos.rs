@@ -20,10 +20,10 @@ use protocol::{
     ipc::messages::Welcome,
 };
 use user_actor::{
-    adapters::{
-        app_launcher_fake::FakeAppLauncher,
-        capture_fake::FakeCapture,
-        input_fake::FakeInput,
+    adapters::driven::{
+        capture::fake::FakeCapture,
+        input::fake::FakeInput,
+        launcher::fake::FakeAppLauncher,
         sink_fake::FakeSink,
     },
     app::{
@@ -66,11 +66,11 @@ async fn focus_storm_cannot_exceed_the_capture_quota() {
     let kernel = Arc::new(assemble(ActorDeps {
         runtime: Arc::clone(&runtime),
         bus: bus.clone(),
-        capture: Arc::clone(&capture) as Arc<dyn user_actor::ports::ScreenCapturePort>,
-        sink: Arc::clone(&sink) as Arc<dyn user_actor::ports::ScreenshotSinkPort>,
-        input: Arc::new(FakeInput::new()) as Arc<dyn user_actor::ports::InputSynthesisPort>,
+        capture: Arc::clone(&capture) as Arc<dyn user_actor::ports::driven::ScreenCapturePort>,
+        sink: Arc::clone(&sink) as Arc<dyn user_actor::ports::driven::ScreenshotSinkPort>,
+        input: Arc::new(FakeInput::new()) as Arc<dyn user_actor::ports::driven::InputSynthesisPort>,
         launcher: Arc::new(FakeAppLauncher::default())
-            as Arc<dyn user_actor::ports::AppLauncherPort>,
+            as Arc<dyn user_actor::ports::driven::AppLauncherPort>,
     }));
     kernel.boot().await.unwrap();
     // Subscribe before anything publishes so the exhaustion count is total.

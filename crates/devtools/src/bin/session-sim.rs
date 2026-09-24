@@ -7,10 +7,10 @@
 use std::sync::Arc;
 
 use agent::{
-    adapters::{
-        broker_fake::FakeBroker,
-        clock_fake::FakeClock,
-        scope_store_memory::InMemoryScopeRepository,
+    adapters::driven::{
+        broker::fake::FakeBroker,
+        clock::fake::FakeClock,
+        scope_store::memory::InMemoryScopeRepository,
     },
     app::{
         builder::{
@@ -23,7 +23,7 @@ use agent::{
             SourceEvent,
         },
     },
-    ports::scope_repository::ScopeRepository,
+    ports::driven::scope_repository::ScopeRepository,
 };
 use kernel::app::api_ports::EventInletPort;
 use protocol::{
@@ -54,18 +54,20 @@ async fn main() -> anyhow::Result<()> {
             config: Arc::new(config.clone()),
             scope_state: state,
             scope_repo: Arc::clone(&repo)
-                as Arc<dyn agent::ports::scope_repository::ScopeRepository>,
-            broker: Arc::clone(&broker) as Arc<dyn agent::ports::broker::BrokerPort>,
-            clock: Arc::clone(&clock) as Arc<dyn agent::ports::clock::SystemClockPort>,
-            uploader: Arc::new(agent::adapters::upload_fake::FakeUploader::default())
-                as Arc<dyn agent::ports::uploader::FileUploadPort>,
-            launcher: Arc::new(agent::adapters::launcher_fake::FakeLauncher::default())
-                as Arc<dyn agent::ports::process_launcher::ProcessLauncherPort>,
-            shell: Arc::new(agent::adapters::shell_association_fake::FakeShellAssociation::new())
-                as Arc<dyn agent::ports::shell_association::ShellAssociationPort>,
-            killer: Arc::new(agent::adapters::process_killer_fake::FakeProcessKiller::default())
-                as Arc<dyn agent::ports::process_killer::ProcessKillerPort>,
-            shifter: Arc::clone(&clock) as Arc<dyn agent::ports::clock::ClockShiftPort>,
+                as Arc<dyn agent::ports::driven::scope_repository::ScopeRepository>,
+            broker: Arc::clone(&broker) as Arc<dyn agent::ports::driven::broker::BrokerPort>,
+            clock: Arc::clone(&clock) as Arc<dyn agent::ports::driven::clock::SystemClockPort>,
+            uploader: Arc::new(agent::adapters::driven::upload::fake::FakeUploader::default())
+                as Arc<dyn agent::ports::driven::uploader::FileUploadPort>,
+            launcher: Arc::new(agent::adapters::driven::launcher::fake::FakeLauncher::default())
+                as Arc<dyn agent::ports::driven::process_launcher::ProcessLauncherPort>,
+            shell: Arc::new(
+                agent::adapters::driven::shell_association::fake::FakeShellAssociation::new(),
+            )
+                as Arc<dyn agent::ports::driven::shell_association::ShellAssociationPort>,
+            killer: Arc::new(agent::adapters::driven::killer::fake::FakeProcessKiller::default())
+                as Arc<dyn agent::ports::driven::process_killer::ProcessKillerPort>,
+            shifter: Arc::clone(&clock) as Arc<dyn agent::ports::driven::clock::ClockShiftPort>,
             statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
             user_actor_nonce: "sim-nonce".to_owned(),
             seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -90,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
         kernel.shutdown().await;
 
         total_events += broker.event_sequence().len();
-        for envelope in broker.of_channel(agent::ports::broker::Channel::Control) {
+        for envelope in broker.of_channel(agent::ports::driven::broker::Channel::Control) {
             control_requests.push(envelope.event_type);
         }
     }

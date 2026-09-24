@@ -6,7 +6,7 @@
 use proptest::prelude::*;
 use user_actor::{
     domain::FocusDedup,
-    ports::Key,
+    ports::driven::Key,
 };
 
 fn focus_snapshot(pid: u32, title: &str) -> user_actor::domain::FocusInfo {

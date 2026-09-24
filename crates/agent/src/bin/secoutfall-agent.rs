@@ -28,13 +28,13 @@ use std::{
 };
 
 #[cfg(all(windows, feature = "etw"))]
-use agent::ports::event_source::EventSourcePort;
+use agent::ports::driving::event_source::EventSourcePort;
 use agent::{
     app::{
         event::SandboxEvent,
         runtime::SessionDeps,
     },
-    ports::{
+    ports::driven::{
         broker::BrokerPort,
         clock::ClockShiftPort,
         process_killer::ProcessKillerPort,
@@ -207,18 +207,19 @@ async fn production_session_deps(
     config_path: &std::path::Path,
     user_actor_nonce: String,
 ) -> anyhow::Result<SessionDeps> {
-    let config = Arc::new(agent::adapters::config_toml::load(config_path)?);
-    let broker = agent::adapters::broker_nats::NatsBrokerAdapter::connect(&config.broker).await?;
+    let config = Arc::new(agent::adapters::driven::config_toml::load(config_path)?);
+    let broker =
+        agent::adapters::driven::broker::nats::NatsBrokerAdapter::connect(&config.broker).await?;
     tracing::info!(uri = %config.broker.uri, "NATS broker connected");
     Ok(SessionDeps {
         config: Arc::clone(&config),
-        scope_repo: Arc::new(agent::adapters::scope_store_json::JsonScopeRepository::new(
+        scope_repo: Arc::new(agent::adapters::driven::scope_store::json::JsonScopeRepository::new(
             config.study.scope_path.clone(),
         )),
         broker: Arc::new(broker),
-        clock: Arc::new(agent::adapters::clock_system::SystemClock),
+        clock: Arc::new(agent::adapters::driven::clock::system::SystemClock),
         uploader: Arc::new(
-            agent::adapters::http_upload::HttpUploadAdapter::new()
+            agent::adapters::driven::upload::http::HttpUploadAdapter::new()
                 .map_err(|error| anyhow::anyhow!("HTTP uploader unavailable: {error}"))?,
         ),
         launcher: production_launcher(&config),
@@ -245,26 +246,26 @@ fn production_launcher(config: &protocol::config::AgentConfig) -> Arc<dyn Proces
 
 #[cfg(all(windows, feature = "launcher"))]
 fn token_launcher() -> Arc<dyn ProcessLauncherPort> {
-    Arc::new(agent::adapters::launcher_token::TokenProcessLauncher::new())
+    Arc::new(agent::adapters::driven::launcher::token::TokenProcessLauncher::new())
 }
 
 #[cfg(not(all(windows, feature = "launcher")))]
 fn token_launcher() -> Arc<dyn ProcessLauncherPort> {
     tracing::warn!("token launcher not compiled in (build with --features launcher)");
-    Arc::new(agent::adapters::launcher_unavailable::UnavailableLauncher::new(
+    Arc::new(agent::adapters::driven::launcher::unavailable::UnavailableLauncher::new(
         "build with --features launcher",
     ))
 }
 
 #[cfg(all(windows, feature = "schedtask"))]
 fn schedtask_launcher(helper_path: String) -> Arc<dyn ProcessLauncherPort> {
-    Arc::new(agent::adapters::launcher_schedtask::SchedTaskLauncher::new(helper_path))
+    Arc::new(agent::adapters::driven::launcher::schedtask::SchedTaskLauncher::new(helper_path))
 }
 
 #[cfg(not(all(windows, feature = "schedtask")))]
 fn schedtask_launcher(_helper_path: String) -> Arc<dyn ProcessLauncherPort> {
     tracing::warn!("sched-task launcher not compiled in (build with --features schedtask)");
-    Arc::new(agent::adapters::launcher_unavailable::UnavailableLauncher::new(
+    Arc::new(agent::adapters::driven::launcher::unavailable::UnavailableLauncher::new(
         "build with --features schedtask",
     ))
 }
@@ -272,34 +273,37 @@ fn schedtask_launcher(_helper_path: String) -> Arc<dyn ProcessLauncherPort> {
 /// Shell-association resolver (registry adapter is feature-gated).
 #[cfg(all(windows, feature = "associations"))]
 fn production_shell() -> Arc<dyn ShellAssociationPort> {
-    Arc::new(agent::adapters::shell_association_registry::RegistryShellAssociationAdapter::new())
+    Arc::new(
+        agent::adapters::driven::shell_association::registry::RegistryShellAssociationAdapter::new(
+        ),
+    )
 }
 
 #[cfg(not(all(windows, feature = "associations")))]
 fn production_shell() -> Arc<dyn ShellAssociationPort> {
-    Arc::new(agent::adapters::shell_association_fake::UnavailableShellAssociation)
+    Arc::new(agent::adapters::driven::shell_association::fake::UnavailableShellAssociation)
 }
 
 /// Finalize process cleanup (Toolhelp adapter is feature-gated).
 #[cfg(all(windows, feature = "killer"))]
 fn production_killer() -> Arc<dyn ProcessKillerPort> {
-    Arc::new(agent::adapters::process_killer_windows::WindowsProcessKiller::new())
+    Arc::new(agent::adapters::driven::killer::windows::WindowsProcessKiller::new())
 }
 
 #[cfg(not(all(windows, feature = "killer")))]
 fn production_killer() -> Arc<dyn ProcessKillerPort> {
-    Arc::new(agent::adapters::process_killer_fake::UnavailableProcessKiller)
+    Arc::new(agent::adapters::driven::killer::fake::UnavailableProcessKiller)
 }
 
 /// Clock manipulation (`SetSystemTime` adapter is feature-gated).
 #[cfg(all(windows, feature = "time_shift"))]
 fn production_shifter() -> Arc<dyn ClockShiftPort> {
-    Arc::new(agent::adapters::clock_shift::windows_shifter::WindowsClockShifter::new())
+    Arc::new(agent::adapters::driven::clock::shift::windows_shifter::WindowsClockShifter::new())
 }
 
 #[cfg(not(all(windows, feature = "time_shift")))]
 fn production_shifter() -> Arc<dyn ClockShiftPort> {
-    Arc::new(agent::adapters::clock_shift::UnavailableClockShifter)
+    Arc::new(agent::adapters::driven::clock::shift::UnavailableClockShifter)
 }
 
 fn demo_script() -> Vec<SandboxEvent> {
@@ -360,22 +364,26 @@ fn source_file_written(pid: u32, path: &str) -> SandboxEvent {
 async fn simulate() -> anyhow::Result<()> {
     println!("{} v{} (simulate)", agent::NAME, env!("CARGO_PKG_VERSION"));
     let config = demo_config()?;
-    let clock = Arc::new(agent::adapters::clock_fake::FakeClock::new(1_465_182_366_000));
-    let broker = Arc::new(agent::adapters::broker_fake::FakeBroker::default());
-    let uploader = Arc::new(agent::adapters::upload_fake::FakeUploader::default());
-    let repo = Arc::new(agent::adapters::scope_store_memory::InMemoryScopeRepository::default());
+    let clock = Arc::new(agent::adapters::driven::clock::fake::FakeClock::new(1_465_182_366_000));
+    let broker = Arc::new(agent::adapters::driven::broker::fake::FakeBroker::default());
+    let uploader = Arc::new(agent::adapters::driven::upload::fake::FakeUploader::default());
+    let repo =
+        Arc::new(agent::adapters::driven::scope_store::memory::InMemoryScopeRepository::default());
 
     let scope_state = agent::app::builder::load_scope_state(repo.as_ref()).await?;
     let kernel = agent::app::builder::assemble(agent::app::builder::AgentDeps {
         config: Arc::new(config),
         scope_state,
-        scope_repo: Arc::clone(&repo) as Arc<dyn agent::ports::scope_repository::ScopeRepository>,
-        broker: Arc::clone(&broker) as Arc<dyn agent::ports::broker::BrokerPort>,
-        clock: Arc::clone(&clock) as Arc<dyn agent::ports::clock::SystemClockPort>,
+        scope_repo: Arc::clone(&repo)
+            as Arc<dyn agent::ports::driven::scope_repository::ScopeRepository>,
+        broker: Arc::clone(&broker) as Arc<dyn agent::ports::driven::broker::BrokerPort>,
+        clock: Arc::clone(&clock) as Arc<dyn agent::ports::driven::clock::SystemClockPort>,
         uploader: Arc::clone(&uploader) as Arc<dyn FileUploadPort>,
-        launcher: Arc::new(agent::adapters::launcher_fake::FakeLauncher::default()),
-        shell: Arc::new(agent::adapters::shell_association_fake::FakeShellAssociation::new()),
-        killer: Arc::new(agent::adapters::process_killer_fake::FakeProcessKiller::default()),
+        launcher: Arc::new(agent::adapters::driven::launcher::fake::FakeLauncher::default()),
+        shell: Arc::new(
+            agent::adapters::driven::shell_association::fake::FakeShellAssociation::new(),
+        ),
+        killer: Arc::new(agent::adapters::driven::killer::fake::FakeProcessKiller::default()),
         shifter: Arc::clone(&clock) as Arc<dyn ClockShiftPort>,
         statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
         user_actor_nonce: "demo-nonce".to_owned(),
@@ -395,10 +403,10 @@ async fn simulate() -> anyhow::Result<()> {
     kernel.shutdown().await;
 
     println!("published {} wire events this session", broker.event_sequence().len());
-    for envelope in broker.of_channel(agent::ports::broker::Channel::Event) {
+    for envelope in broker.of_channel(agent::ports::driven::broker::Channel::Event) {
         println!("  event: {}", envelope.event_type);
     }
-    for envelope in broker.of_channel(agent::ports::broker::Channel::Control) {
+    for envelope in broker.of_channel(agent::ports::driven::broker::Channel::Control) {
         println!("  control: {}", envelope.event_type);
     }
     println!("collector uploads: {} (demo drop source does not exist)", uploader.uploads().len());
@@ -421,20 +429,22 @@ async fn console(args: &Args) -> anyhow::Result<()> {
                 // make this boot session N and silently disable the session-0
                 // target launch (the same trap `simulate` hit once).
                 scope_repo: Arc::new(
-                    agent::adapters::scope_store_memory::InMemoryScopeRepository::default(),
+                    agent::adapters::driven::scope_store::memory::InMemoryScopeRepository::default(
+                    ),
                 ),
-                broker: Arc::new(agent::adapters::broker_console::ConsoleBroker::default())
+                broker: Arc::new(agent::adapters::driven::broker::console::ConsoleBroker::default())
                     as Arc<dyn BrokerPort>,
-                clock: Arc::new(agent::adapters::clock_system::SystemClock),
-                uploader: Arc::new(agent::adapters::upload_fake::FakeUploader::default())
+                clock: Arc::new(agent::adapters::driven::clock::system::SystemClock),
+                uploader: Arc::new(agent::adapters::driven::upload::fake::FakeUploader::default())
                     as Arc<dyn FileUploadPort>,
-                launcher: Arc::new(agent::adapters::launcher_fake::FakeLauncher::default())
+                launcher: Arc::new(agent::adapters::driven::launcher::fake::FakeLauncher::default())
                     as Arc<dyn ProcessLauncherPort>,
-                shell: Arc::new(agent::adapters::shell_association_fake::FakeShellAssociation::new())
-                    as Arc<dyn ShellAssociationPort>,
-                killer: Arc::new(agent::adapters::process_killer_fake::FakeProcessKiller::default())
+                shell: Arc::new(
+                    agent::adapters::driven::shell_association::fake::FakeShellAssociation::new(),
+                ) as Arc<dyn ShellAssociationPort>,
+                killer: Arc::new(agent::adapters::driven::killer::fake::FakeProcessKiller::default())
                     as Arc<dyn ProcessKillerPort>,
-                shifter: Arc::new(agent::adapters::clock_fake::FakeClock::new(0))
+                shifter: Arc::new(agent::adapters::driven::clock::fake::FakeClock::new(0))
                     as Arc<dyn ClockShiftPort>,
                 statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
                 user_actor_nonce: nonce.clone(),
@@ -505,7 +515,7 @@ async fn local(args: &Args) -> anyhow::Result<()> {
             env!("CARGO_PKG_VERSION"),
             args.config_path.display()
         );
-        agent::adapters::config_toml::load(&args.config_path)?
+        agent::adapters::driven::config_toml::load(&args.config_path)?
     } else {
         println!(
             "{} v{} (local, built-in defaults; no config at {})",
@@ -530,24 +540,25 @@ async fn local(args: &Args) -> anyhow::Result<()> {
     let events_path = PathBuf::from("events.jsonl");
     let scope_path = PathBuf::from("local-scope.json");
     let jsonl = Arc::new(
-        agent::adapters::broker_jsonl::JsonlBroker::create(&events_path)
+        agent::adapters::driven::broker::jsonl::JsonlBroker::create(&events_path)
             .map_err(|error| anyhow::anyhow!("cannot open {}: {error}", events_path.display()))?,
     );
-    let broker: Arc<dyn BrokerPort> = Arc::new(agent::adapters::broker_tee::TeeBroker::new(vec![
-        Arc::new(agent::adapters::broker_console::ConsoleBroker::default()),
-        jsonl,
-    ]));
+    let broker: Arc<dyn BrokerPort> =
+        Arc::new(agent::adapters::driven::broker::tee::TeeBroker::new(vec![
+            Arc::new(agent::adapters::driven::broker::console::ConsoleBroker::default()),
+            jsonl,
+        ]));
 
     let deps = SessionDeps {
         config: Arc::clone(&config),
         // Fresh-load + persisting snapshot: every local run is a fresh
         // session 0, and the final scope still lands on disk.
-        scope_repo: Arc::new(agent::adapters::scope_store_local::LocalScopeRepository::new(
-            &scope_path,
-        )),
+        scope_repo: Arc::new(
+            agent::adapters::driven::scope_store::local::LocalScopeRepository::new(&scope_path),
+        ),
         broker,
-        clock: Arc::new(agent::adapters::clock_system::SystemClock),
-        uploader: Arc::new(agent::adapters::upload_fake::FakeUploader::default())
+        clock: Arc::new(agent::adapters::driven::clock::system::SystemClock),
+        uploader: Arc::new(agent::adapters::driven::upload::fake::FakeUploader::default())
             as Arc<dyn FileUploadPort>,
         launcher: production_launcher(&config),
         shell: production_shell(),
@@ -588,9 +599,9 @@ async fn local(args: &Args) -> anyhow::Result<()> {
 #[cfg(all(windows, feature = "etw"))]
 #[allow(clippy::unused_async)] // keeps the console flow shape uniform across features
 async fn attach_etw(session: &agent::app::runtime::RunningSession) {
-    let adapter = Arc::new(agent::adapters::etw_adapter::EtwKernelTraceAdapter::new(
+    let adapter = Arc::new(agent::adapters::driving::etw_adapter::EtwKernelTraceAdapter::new(
         8192,
-        agent::adapters::etw_adapter::SESSION_NAME,
+        agent::adapters::driving::etw_adapter::SESSION_NAME,
     ));
     let inlet = session.inlet();
     tokio::spawn(async move {
@@ -609,15 +620,16 @@ async fn attach_ipc(
     session: &agent::app::runtime::RunningSession,
     config: &Arc<protocol::config::AgentConfig>,
     broker: Arc<dyn BrokerPort>,
-    clock: Arc<dyn agent::ports::clock::SystemClockPort>,
+    clock: Arc<dyn agent::ports::driven::clock::SystemClockPort>,
     nonce: &str,
     pid_gate: Arc<std::sync::atomic::AtomicU32>,
 ) {
-    let sddl = agent::adapters::ipc_server::console_user_pipe_sddl().await.unwrap_or_else(|| {
-        tracing::warn!("no console-session user; IPC DACL covers SYSTEM/Administrators only");
-        agent::adapters::ipc_server::DEFAULT_PIPE_SDDL.to_owned()
-    });
-    let adapter = agent::adapters::ipc_server::IpcServerAdapter::with_sddl(
+    let sddl =
+        agent::adapters::driving::ipc_server::console_user_pipe_sddl().await.unwrap_or_else(|| {
+            tracing::warn!("no console-session user; IPC DACL covers SYSTEM/Administrators only");
+            agent::adapters::driving::ipc_server::DEFAULT_PIPE_SDDL.to_owned()
+        });
+    let adapter = agent::adapters::driving::ipc_server::IpcServerAdapter::with_sddl(
         session.scope_state().clone(),
         Arc::new(config.user_actor_config()),
         nonce.to_owned(),
@@ -648,7 +660,7 @@ async fn attach_ipc(
     _session: &agent::app::runtime::RunningSession,
     _config: &Arc<protocol::config::AgentConfig>,
     _broker: Arc<dyn BrokerPort>,
-    _clock: Arc<dyn agent::ports::clock::SystemClockPort>,
+    _clock: Arc<dyn agent::ports::driven::clock::SystemClockPort>,
     _nonce: &str,
     _pid_gate: Arc<std::sync::atomic::AtomicU32>,
 ) {
@@ -660,7 +672,7 @@ async fn attach_ipc(
 #[allow(clippy::unused_async)] // dispatch signature parity across features
 async fn service_mode(_args: &Args) -> anyhow::Result<()> {
     windows_service::service_dispatcher::start(
-        agent::adapters::service_control::SERVICE_NAME,
+        agent::adapters::driving::service_control::SERVICE_NAME,
         ffi_service_main,
     )
     .map_err(|error| anyhow::anyhow!("service dispatch failed: {error}"))
@@ -676,13 +688,15 @@ async fn service_mode(_args: &Args) -> anyhow::Result<()> {
 /// Create the SCM entry pointing at this exe (feature `service`).
 #[cfg(all(windows, feature = "service"))]
 fn service_install(args: &Args) -> anyhow::Result<()> {
-    agent::adapters::service_control::install(
+    agent::adapters::driving::service_control::install(
         &args.config_path,
-        agent::adapters::service_control::InstallOptions { start_after_install: args.start },
+        agent::adapters::driving::service_control::InstallOptions {
+            start_after_install: args.start,
+        },
     )?;
     println!(
         "service `{}` installed (config: {}){}",
-        agent::adapters::service_control::SERVICE_NAME,
+        agent::adapters::driving::service_control::SERVICE_NAME,
         args.config_path.display(),
         if args.start { "; started" } else { "" }
     );
@@ -698,10 +712,10 @@ fn service_install(_args: &Args) -> anyhow::Result<()> {
 /// Stop and delete the SCM entry (feature `service`).
 #[cfg(all(windows, feature = "service"))]
 fn service_uninstall() -> anyhow::Result<()> {
-    agent::adapters::service_control::uninstall()?;
+    agent::adapters::driving::service_control::uninstall()?;
     println!(
         "service `{}` uninstalled; the entry disappears once the current process exits",
-        agent::adapters::service_control::SERVICE_NAME
+        agent::adapters::driving::service_control::SERVICE_NAME
     );
     Ok(())
 }
@@ -727,9 +741,9 @@ async fn etw_probe() -> anyhow::Result<()> {
 
     let seconds: u64 = std::env::args().nth(2).and_then(|raw| raw.parse().ok()).unwrap_or(10);
     println!("ETW probe: consuming kernel trace for {seconds}s (admin required)");
-    let adapter = Arc::new(agent::adapters::etw_adapter::EtwKernelTraceAdapter::new(
+    let adapter = Arc::new(agent::adapters::driving::etw_adapter::EtwKernelTraceAdapter::new(
         65_536,
-        format!("{}-probe", agent::adapters::etw_adapter::SESSION_NAME),
+        format!("{}-probe", agent::adapters::driving::etw_adapter::SESSION_NAME),
     ));
 
     let inlet: Arc<dyn kernel::app::api_ports::EventInletPort<SandboxEvent>> =
@@ -792,7 +806,7 @@ async fn run_service_body(args: Vec<std::ffi::OsString>) -> anyhow::Result<()> {
 
     // SCM handler (sync thread) → runtime stop channel (async).
     let (scm_tx, scm_rx) = std::sync::mpsc::channel::<SandboxEvent>();
-    let status = agent::adapters::service_control::register_control_handler(scm_tx)?;
+    let status = agent::adapters::driving::service_control::register_control_handler(scm_tx)?;
     status.running()?;
     tokio::task::spawn_blocking(move || {
         for event in &scm_rx {

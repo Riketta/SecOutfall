@@ -18,7 +18,7 @@ use kernel::app::{
     plugin_ports::event_bus_port::EventBusPort as _,
 };
 use user_actor::{
-    adapters::capture_fake::UnavailableCapture,
+    adapters::driven::capture::fake::UnavailableCapture,
     app::{
         ActorDeps,
         ActorKernel,
@@ -29,7 +29,7 @@ use user_actor::{
         ActorEvent,
         SharedRuntime,
     },
-    ports::{
+    ports::driven::{
         AppLauncherPort,
         InputSynthesisPort,
         ScreenCapturePort,
@@ -189,13 +189,16 @@ type SinkQueue = (Arc<dyn ScreenshotSinkPort>, tokio::sync::mpsc::Receiver<(u32,
 
 #[cfg(all(windows, feature = "ipc"))]
 fn transport_parts() -> SinkQueue {
-    let (sink, rx) = user_actor::adapters::ipc_client::IpcClientAdapter::channel();
+    let (sink, rx) = user_actor::adapters::driving::ipc_client::IpcClientAdapter::channel();
     (Arc::new(sink), rx)
 }
 
 #[cfg(not(all(windows, feature = "ipc")))]
 fn transport_parts() -> SinkQueue {
-    (Arc::new(user_actor::adapters::sink_fake::UnavailableSink), tokio::sync::mpsc::channel(1).1)
+    (
+        Arc::new(user_actor::adapters::driven::sink_fake::UnavailableSink),
+        tokio::sync::mpsc::channel(1).1,
+    )
 }
 
 /// IPC transport (feature `ipc`): builds the client (its inlet is the
@@ -208,8 +211,8 @@ fn build_ipc(
     sink_rx: tokio::sync::mpsc::Receiver<(u32, Vec<u8>)>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Option<tokio::task::JoinHandle<anyhow::Result<()>>> {
-    let client = user_actor::adapters::ipc_client::IpcClientAdapter::new(
-        user_actor::adapters::ipc_client::IpcClientOptions::new(
+    let client = user_actor::adapters::driving::ipc_client::IpcClientAdapter::new(
+        user_actor::adapters::driving::ipc_client::IpcClientOptions::new(
             args.nonce.clone(),
             env!("CARGO_PKG_VERSION").to_owned(),
         ),
@@ -235,8 +238,8 @@ fn build_ipc(
 
 fn build_capture() -> Arc<dyn ScreenCapturePort> {
     #[cfg(all(windows, feature = "capture"))]
-    match user_actor::adapters::screen_capture::GdiScreenCapture::new(
-        user_actor::adapters::screen_capture::DEFAULT_JPEG_QUALITY,
+    match user_actor::adapters::driven::capture::screen::GdiScreenCapture::new(
+        user_actor::adapters::driven::capture::screen::DEFAULT_JPEG_QUALITY,
     ) {
         Ok(capture) => return Arc::new(capture),
         Err(error) => tracing::error!(%error, "GDI capture unavailable"),
@@ -248,21 +251,21 @@ fn build_capture() -> Arc<dyn ScreenCapturePort> {
 
 fn build_input() -> Arc<dyn InputSynthesisPort> {
     #[cfg(all(windows, feature = "input"))]
-    return Arc::new(user_actor::adapters::input_synthesis::SendInputSynthesizer::new());
+    return Arc::new(user_actor::adapters::driven::input::synthesis::SendInputSynthesizer::new());
     #[cfg(not(all(windows, feature = "input")))]
     {
         tracing::warn!("built without the input feature: reactive input disabled");
-        Arc::new(user_actor::adapters::input_fake::UnavailableInput)
+        Arc::new(user_actor::adapters::driven::input::fake::UnavailableInput)
     }
 }
 
 fn build_app_launcher() -> Arc<dyn AppLauncherPort> {
     #[cfg(all(windows, feature = "apps"))]
-    return Arc::new(user_actor::adapters::app_launcher::NativeAppLauncher::new());
+    return Arc::new(user_actor::adapters::driven::launcher::app::NativeAppLauncher::new());
     #[cfg(not(all(windows, feature = "apps")))]
     {
         tracing::warn!("built without the apps feature: scripted activities cannot launch");
-        Arc::new(user_actor::adapters::app_launcher_fake::UnavailableAppLauncher)
+        Arc::new(user_actor::adapters::driven::launcher::fake::UnavailableAppLauncher)
     }
 }
 
@@ -319,8 +322,8 @@ fn start_polling(
     inlet: Arc<dyn EventInletPort<ActorEvent>>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
-    let adapter = user_actor::adapters::focus_poll::PollingFocusAdapter::new(
-        user_actor::adapters::focus_poll::DEFAULT_POLL_INTERVAL,
+    let adapter = user_actor::adapters::driving::focus_poll::PollingFocusAdapter::new(
+        user_actor::adapters::driving::focus_poll::DEFAULT_POLL_INTERVAL,
         cancel,
     );
     tokio::spawn(async move {
@@ -344,7 +347,7 @@ fn start_winevents(
     inlet: Arc<dyn EventInletPort<ActorEvent>>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
-    let adapter = user_actor::adapters::focus_winevents::WinEventFocusAdapter::new(cancel);
+    let adapter = user_actor::adapters::driving::focus_winevents::WinEventFocusAdapter::new(cancel);
     tokio::spawn(async move {
         if let Err(error) = adapter.run(Arc::clone(&inlet)).await {
             tracing::error!(%error, "win-event focus source failed");

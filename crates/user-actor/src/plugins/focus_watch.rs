@@ -31,7 +31,7 @@ use crate::{
         ActorEvent,
         ActorServices,
     },
-    ports::{
+    ports::driven::{
         ScreenCapturePort,
         ScreenshotSinkPort,
     },

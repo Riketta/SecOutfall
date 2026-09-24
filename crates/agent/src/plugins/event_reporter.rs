@@ -50,7 +50,7 @@ use crate::{
         },
     },
     domain::scope::SharedScopeState,
-    ports::{
+    ports::driven::{
         broker::{
             BrokerPort,
             Channel,

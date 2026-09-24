@@ -56,7 +56,7 @@ use crate::{
             UserActorSupervisorPlugin,
         },
     },
-    ports::{
+    ports::driven::{
         broker::BrokerPort,
         clock::{
             ClockShiftPort,
@@ -138,7 +138,7 @@ pub struct AgentDeps {
 /// Propagates repository load failures.
 pub async fn load_scope_state(
     repo: &dyn ScopeRepository,
-) -> Result<SharedScopeState, crate::ports::scope_repository::ScopeRepositoryError> {
+) -> Result<SharedScopeState, crate::ports::driven::scope_repository::ScopeRepositoryError> {
     let mut state = repo.load().await?;
     if state.study_id.is_nil() {
         state.study_id = uuid::Uuid::new_v4();

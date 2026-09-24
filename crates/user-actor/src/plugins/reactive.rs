@@ -26,7 +26,7 @@ use crate::{
         ActorBusEvent,
         SharedRuntime,
     },
-    ports::InputSynthesisPort,
+    ports::driven::InputSynthesisPort,
 };
 
 /// Legacy Enter-hold duration.

@@ -23,9 +23,11 @@ use std::{
 
 use agent::{
     adapters::{
-        clock_fake::FakeClock,
-        ipc_server::IpcServerAdapter,
-        scope_store_memory::InMemoryScopeRepository,
+        driven::{
+            clock::fake::FakeClock,
+            scope_store::memory::InMemoryScopeRepository,
+        },
+        driving::ipc_server::IpcServerAdapter,
     },
     app::event::{
         SandboxEvent,
@@ -202,7 +204,7 @@ async fn ipc_server_handshake_config_and_screenshots() {
         })
     };
     let server_error = |rx: &mut tokio::sync::oneshot::Receiver<
-        Result<(), agent::adapters::ipc_server::IpcServerError>,
+        Result<(), agent::adapters::driving::ipc_server::IpcServerError>,
     >| {
         match rx.try_recv() {
             Ok(Ok(())) => "completed".to_owned(),

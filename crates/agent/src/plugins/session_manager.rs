@@ -77,7 +77,7 @@ use crate::{
         SessionRecord,
         SharedScopeState,
     },
-    ports::{
+    ports::driven::{
         broker::{
             BrokerPort,
             Channel,

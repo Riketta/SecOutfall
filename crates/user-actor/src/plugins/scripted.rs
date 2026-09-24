@@ -36,7 +36,7 @@ use crate::{
         ActorEvent,
         ActorServices,
     },
-    ports::{
+    ports::driven::{
         AppLauncherPort,
         InputSynthesisPort,
     },
@@ -66,13 +66,13 @@ pub enum ActivityStep {
     /// Press a single key.
     Key {
         /// The key to press.
-        key: crate::ports::Key,
+        key: crate::ports::driven::Key,
     },
     /// Press a chord (e.g. `Win+E`, `Ctrl+L`): modifiers down first, the
     /// last key pressed and released, modifiers up in reverse.
     Hotkey {
         /// The chord keys, modifiers first, trigger last.
-        keys: Vec<crate::ports::Key>,
+        keys: Vec<crate::ports::driven::Key>,
     },
 }
 

@@ -15,14 +15,14 @@ use std::{
 use kernel::app::plugin_ports::middleware_plugin_port::MiddlewarePluginPort as _;
 use tokio::sync::watch;
 use user_actor::{
-    adapters::{
-        app_launcher_fake::{
-            FakeAppLauncher,
-            RecordedLaunch,
-        },
-        input_fake::{
+    adapters::driven::{
+        input::fake::{
             FakeInput,
             RecordedInput,
+        },
+        launcher::fake::{
+            FakeAppLauncher,
+            RecordedLaunch,
         },
     },
     plugins::{
@@ -39,7 +39,7 @@ use user_actor::{
             ScriptedRunnerPlugin,
         },
     },
-    ports::Key,
+    ports::driven::Key,
 };
 
 /// Await a watch count reaching `threshold`; panic with context on stall.
@@ -62,8 +62,8 @@ fn env_pair() -> (Arc<FakeAppLauncher>, Arc<FakeInput>, ActivityEnv) {
     let launcher = Arc::new(FakeAppLauncher::default());
     let input = Arc::new(FakeInput::new());
     let env = ActivityEnv {
-        launcher: Arc::clone(&launcher) as Arc<dyn user_actor::ports::AppLauncherPort>,
-        input: Arc::clone(&input) as Arc<dyn user_actor::ports::InputSynthesisPort>,
+        launcher: Arc::clone(&launcher) as Arc<dyn user_actor::ports::driven::AppLauncherPort>,
+        input: Arc::clone(&input) as Arc<dyn user_actor::ports::driven::InputSynthesisPort>,
     };
     (launcher, input, env)
 }

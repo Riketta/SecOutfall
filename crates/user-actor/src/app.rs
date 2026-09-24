@@ -39,7 +39,7 @@ use crate::{
             ScriptedRunnerPlugin,
         },
     },
-    ports::{
+    ports::driven::{
         AppLauncherPort,
         InputSynthesisPort,
         ScreenCapturePort,

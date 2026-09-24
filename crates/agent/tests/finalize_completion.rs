@@ -20,20 +20,20 @@ use std::{
 };
 
 use agent::{
-    adapters::{
-        broker_fake::FakeBroker,
-        clock_fake::FakeClock,
-        launcher_fake::FakeLauncher,
-        scope_store_json::JsonScopeRepository,
-        shell_association_fake::FakeShellAssociation,
-        upload_fake::FakeUploader,
+    adapters::driven::{
+        broker::fake::FakeBroker,
+        clock::fake::FakeClock,
+        launcher::fake::FakeLauncher,
+        scope_store::json::JsonScopeRepository,
+        shell_association::fake::FakeShellAssociation,
+        upload::fake::FakeUploader,
     },
     app::runtime::{
         RunningSession,
         SessionDeps,
     },
     domain::scope::ScopeState,
-    ports::{
+    ports::driven::{
         broker::Channel,
         clock::{
             ClockShiftPort,
@@ -96,16 +96,16 @@ async fn finalize_survives_host_teardown() -> Result<(), Box<dyn std::error::Err
     let deps = SessionDeps {
         config: Arc::new(config),
         scope_repo: Arc::new(repo) as Arc<dyn ScopeRepository>,
-        broker: Arc::clone(&broker) as Arc<dyn agent::ports::broker::BrokerPort>,
+        broker: Arc::clone(&broker) as Arc<dyn agent::ports::driven::broker::BrokerPort>,
         clock: Arc::clone(&clock) as Arc<dyn SystemClockPort>,
         uploader: Arc::new(FakeUploader::default())
-            as Arc<dyn agent::ports::uploader::FileUploadPort>,
+            as Arc<dyn agent::ports::driven::uploader::FileUploadPort>,
         launcher: Arc::new(FakeLauncher::default())
-            as Arc<dyn agent::ports::process_launcher::ProcessLauncherPort>,
+            as Arc<dyn agent::ports::driven::process_launcher::ProcessLauncherPort>,
         shell: Arc::new(FakeShellAssociation::new())
-            as Arc<dyn agent::ports::shell_association::ShellAssociationPort>,
-        killer: Arc::new(agent::adapters::process_killer_fake::FakeProcessKiller::default())
-            as Arc<dyn agent::ports::process_killer::ProcessKillerPort>,
+            as Arc<dyn agent::ports::driven::shell_association::ShellAssociationPort>,
+        killer: Arc::new(agent::adapters::driven::killer::fake::FakeProcessKiller::default())
+            as Arc<dyn agent::ports::driven::process_killer::ProcessKillerPort>,
         shifter: Arc::clone(&clock) as Arc<dyn ClockShiftPort>,
         statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
         user_actor_nonce: "finalize-race-nonce".to_owned(),
