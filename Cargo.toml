@@ -12,7 +12,10 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# 1.88 is not arbitrary: it is the MSRV of `time` >= 0.3.46, required to
+# carry the RUSTSEC-2026-0009 fix. The effective floor is max(our needs,
+# locked dependency MSRVs) — keep this true when bumping dependencies.
+rust-version = "1.88"
 publish = false
 
 [workspace.dependencies]
