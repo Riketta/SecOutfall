@@ -103,11 +103,10 @@ fn read_sz(sub_key: &str, value: &str) -> Option<String> {
 /// instead of being silently eaten.
 fn decode_utf16_reg_sz(buffer: &[u8]) -> Option<String> {
     let units: Vec<u16> = buffer
-        .chunks_exact(2)
-        .map(|pair| match pair {
-            [low, high] => u16::from_le_bytes([*low, *high]),
-            _ => 0, // unreachable: `chunks_exact` yields exactly two bytes
-        })
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[low, high]| u16::from_le_bytes([*low, *high]))
         .collect();
     let mut text = String::from_utf16(&units).ok()?;
     if text.ends_with('\0') {

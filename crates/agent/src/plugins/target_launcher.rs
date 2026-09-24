@@ -256,22 +256,21 @@ impl PluginPort for TargetLauncherPlugin {
 #[async_trait]
 impl MiddlewarePluginPort<SandboxEvent, AgentServices> for TargetLauncherPlugin {
     async fn pre(&self, event: &mut SandboxEvent, _services: &AgentServices) -> Next {
-        if let SandboxEvent::Source(crate::app::event::SourceEvent::ProcessStarted(data)) = event {
-            if is_marker_process(&self.deps.config.platform.non_s0_process, &data.name)
-                && !self.attempted.swap(true, Ordering::SeqCst)
-                && self.should_launch()
-            {
-                // Submit, never await: the pipeline must keep draining while
-                // the launch (potentially a 15 s SchedTask budget) runs.
-                let accepted =
-                    self.queue.lock().as_ref().is_some_and(|queue| queue.handle().submit(()));
-                if !accepted {
-                    // A lost detonation voids the session; surface it loudly.
-                    tracing::error!(
-                        target = %self.deps.config.target.path,
-                        "launch queue refused the detonation job — the launch is lost"
-                    );
-                }
+        if let SandboxEvent::Source(crate::app::event::SourceEvent::ProcessStarted(data)) = event
+            && is_marker_process(&self.deps.config.platform.non_s0_process, &data.name)
+            && !self.attempted.swap(true, Ordering::SeqCst)
+            && self.should_launch()
+        {
+            // Submit, never await: the pipeline must keep draining while
+            // the launch (potentially a 15 s SchedTask budget) runs.
+            let accepted =
+                self.queue.lock().as_ref().is_some_and(|queue| queue.handle().submit(()));
+            if !accepted {
+                // A lost detonation voids the session; surface it loudly.
+                tracing::error!(
+                    target = %self.deps.config.target.path,
+                    "launch queue refused the detonation job — the launch is lost"
+                );
             }
         }
         Next::Continue

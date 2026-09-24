@@ -283,11 +283,12 @@ impl PluginPort for ScriptedRunnerPlugin {
 #[async_trait]
 impl MiddlewarePluginPort<ActorEvent, ActorServices> for ScriptedRunnerPlugin {
     async fn pre(&self, event: &mut ActorEvent, _services: &ActorServices) -> Next {
-        if let ActorEvent::Welcome(welcome) = event {
-            if welcome.config.scripted && !self.started.load(Ordering::SeqCst) {
-                tracing::info!("scripted activities enabled by config push");
-                self.start_all();
-            }
+        if let ActorEvent::Welcome(welcome) = event
+            && welcome.config.scripted
+            && !self.started.load(Ordering::SeqCst)
+        {
+            tracing::info!("scripted activities enabled by config push");
+            self.start_all();
         }
         Next::Continue
     }

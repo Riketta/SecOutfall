@@ -27,7 +27,7 @@ pub fn split_command_line(line: &str) -> Vec<String> {
                 backslashes += 1;
             }
             '"' => {
-                if backslashes % 2 == 0 {
+                if backslashes.is_multiple_of(2) {
                     // Even run: the quote is a delimiter/toggle; backslashes pass.
                     for _ in 0..backslashes / 2 {
                         current.push('\\');

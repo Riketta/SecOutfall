@@ -229,10 +229,10 @@ pub fn uninstall() -> Result<(), ServiceOpError> {
     match service.query_status() {
         Ok(status) if status.current_state == ServiceState::Stopped => {}
         Ok(_) => {
-            if let Err(error) = service.stop() {
-                if !raw_is(&error, ERROR_SERVICE_NOT_ACTIVE) {
-                    return Err(error.into());
-                }
+            if let Err(error) = service.stop()
+                && !raw_is(&error, ERROR_SERVICE_NOT_ACTIVE)
+            {
+                return Err(error.into());
             }
             wait_until_stopped(&service, STOP_WAIT);
         }

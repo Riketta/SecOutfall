@@ -275,10 +275,10 @@ impl MiddlewarePluginPort<SandboxEvent, AgentServices> for ScreenshotIntakePlugi
             let workers = self.workers.lock();
             workers.as_ref().map(|workers| workers.queue.handle())
         };
-        if let Some(handle) = handle {
-            if !handle.submit(FrameJob { study_id, session_id, frame }) {
-                tracing::warn!("screenshot queue refused a frame");
-            }
+        if let Some(handle) = handle
+            && !handle.submit(FrameJob { study_id, session_id, frame })
+        {
+            tracing::warn!("screenshot queue refused a frame");
         }
         Next::Continue
     }

@@ -157,22 +157,21 @@ impl PluginPort for UserActorSupervisorPlugin {
 #[async_trait]
 impl MiddlewarePluginPort<SandboxEvent, AgentServices> for UserActorSupervisorPlugin {
     async fn pre(&self, event: &mut SandboxEvent, _services: &AgentServices) -> Next {
-        if let SandboxEvent::Source(crate::app::event::SourceEvent::ProcessStarted(data)) = event {
-            if is_marker_process(&self.deps.config.platform.non_s0_process, &data.name)
-                && !self.attempted.swap(true, Ordering::SeqCst)
-            {
-                // Submit, never await: the pipeline keeps draining while the
-                // launch runs off-pipeline.
-                let spec = self.launch_spec();
-                let accepted =
-                    self.queue.lock().as_ref().is_some_and(|queue| queue.handle().submit(spec));
-                if !accepted {
-                    tracing::error!(
-                        path = %self.deps.config.user_actor.path,
-                        "launch queue refused the user-actor job — the launch is lost \
-                         (screenshots/reactive degraded for this session)"
-                    );
-                }
+        if let SandboxEvent::Source(crate::app::event::SourceEvent::ProcessStarted(data)) = event
+            && is_marker_process(&self.deps.config.platform.non_s0_process, &data.name)
+            && !self.attempted.swap(true, Ordering::SeqCst)
+        {
+            // Submit, never await: the pipeline keeps draining while the
+            // launch runs off-pipeline.
+            let spec = self.launch_spec();
+            let accepted =
+                self.queue.lock().as_ref().is_some_and(|queue| queue.handle().submit(spec));
+            if !accepted {
+                tracing::error!(
+                    path = %self.deps.config.user_actor.path,
+                    "launch queue refused the user-actor job — the launch is lost \
+                     (screenshots/reactive degraded for this session)"
+                );
             }
         }
         Next::Continue

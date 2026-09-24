@@ -188,15 +188,15 @@ impl SessionManagerPlugin {
 fn open_session_if_needed(deps: &SessionManagerDeps) {
     let now_ms = deps.clock.now_ms();
     let mut state = deps.state.lock();
-    if let Some(session) = state.sessions.last_mut() {
-        if session.ended_at_ms.is_none() {
-            tracing::warn!(
-                abandoned_session = session.id,
-                "unclean reboot: session still open at boot; stamping abandoned"
-            );
-            session.ended_at_ms = Some(now_ms);
-            session.abandoned = true;
-        }
+    if let Some(session) = state.sessions.last_mut()
+        && session.ended_at_ms.is_none()
+    {
+        tracing::warn!(
+            abandoned_session = session.id,
+            "unclean reboot: session still open at boot; stamping abandoned"
+        );
+        session.ended_at_ms = Some(now_ms);
+        session.abandoned = true;
     }
     let id = u32::try_from(state.sessions.len()).unwrap_or(u32::MAX);
     let scheduled = deps.uptimes.get(id as usize).copied();

@@ -49,10 +49,10 @@ impl PollingFocusAdapter {
                 biased;
                 () = self.cancel.cancelled() => return Ok(()),
                 () = tokio::time::sleep(self.interval) => {
-                    if let Some(focus) = resolve_foreground() {
-                        if let Some(focus) = dedup.changed(focus) {
-                            inlet.accept(ActorEvent::FocusChanged(focus)).await;
-                        }
+                    if let Some(focus) = resolve_foreground()
+                        && let Some(focus) = dedup.changed(focus)
+                    {
+                        inlet.accept(ActorEvent::FocusChanged(focus)).await;
                     }
                 }
             }
