@@ -82,3 +82,22 @@ jobs:
 
       - name: Build injectee (separate nightly workspace)
         run: cargo build --locked --manifest-path crates/injectee/Cargo.toml
+
+  driver:
+    name: Windows · driver build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # WDK 10.0.26100 matches the dev box. The WDK installer deploys the
+      # `WindowsKernelModeDriver10.0` MSBuild toolset into the preinstalled
+      # VS2022 (verified locally: VS-integrated under VC/v170 PlatformToolsets).
+      - name: Install Windows SDK + WDK (winget)
+        shell: pwsh
+        run: |
+          winget install --id Microsoft.WindowsSDK.10.0.26100 --exact --silent --accept-package-agreements --accept-source-agreements
+          winget install --id Microsoft.WindowsWDK.10.0.26100 --exact --silent --accept-package-agreements --accept-source-agreements
+
+      - name: Build driver + dumper
+        shell: pwsh
+        run: ./driver/build.ps1 -Configuration Release
