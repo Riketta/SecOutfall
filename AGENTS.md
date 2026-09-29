@@ -1,0 +1,237 @@
+# AGENTS Instructions
+
+## Project overview
+
+SecOutfall is an agentic **Windows malware analysis sandbox**. An in-VM agent detonates a sample ("target") inside an isolated Windows VM and observes it; an external **Controller** (not in this repo) receives reports over NATS and HTTP.
+
+**Execution model (critical to understand):** one analysis run = a **study** = N **sessions** separated by **reboots**. The agent (session-0 service) and its scope database persist across reboots — the agent is the only persistent component. Each boot starts a new session (id increments), session duration comes from an `uptimes` table; after the last session the agent requests shutdown, otherwise reboot. System time is manipulated (fake timestamp at first session, per-reboot offset).
+
+**Components:**
+
+- `Legacy/SecOutfallB` — C# session-0 Windows service (LocalSystem, Automatic). The agent: ETW consumption, scope tracking, drop collection/upload, screenshots intake, NATS reporting, finalization/reboot orchestration. **Rewrite focus.**
+- `Legacy/ExternalModuleUA` — C# user-session component launched by the agent into the interactive session (as SYSTEM). Focus tracking, screenshots, reactive input. Receives ALL config via IPC from the agent; reads no files. **Rewrite focus** — becomes the **user actor**.
+- `Legacy/SecOutfallA` — kernel driver. Planned, never integrated. **OUT OF SCOPE**; `EventSourcePort` stays shaped so a driver adapter can join later.
+- Legacy support: `Shared` (RPC contract + P/Invoke grab-bag), `SharedNative` (driver IOCTL/token-theft drafts), `VersaINI` (INI reflection binder), `DummyBroker` (launches real nats-server + logs messages), `DummySample*` (fake targets).
+
+**Repo layout:**
+
+- `Legacy/` — read-only reference, source of behavioral truth. Poorly written ON PURPOSE of rewrite: we refactor and enrich, NOT bug-compatible (unless explicitly stated).
+- `Reference/` — Rust hexagonal microkernel chat-bot reference (architecture template). Read `Reference/AGENTS.md` and its `src/kernel/` for target patterns.
+- `secoutfall/` — new Rust workspace (this is what we build).
+
+**Goals of rewrite:** Rust, hexagonal (ports & adapters) **microkernel** with middleware pipeline + event bus, event-driven fire-and-forget core, INI → TOML, well-tested (this is a security tool — the analyzed malware is an adversarial user; every byte coming from inside the VM is hostile input).
+
+**Legacy compatibility is NOT a goal:** wire protocols, names, and artifacts are improved freely wherever better; legacy facts in this file are behavioral grounding, not obligations.
+
+## Workspace shape (resolved)
+
+`secoutfall/` Cargo workspace, **lib + bin** per project:
+
+- `kernel` — lib only. Generic microkernel: ports, pipeline runner, event bus, plugin lifecycle. Pure Rust, no Windows deps, runs on any OS (testable in Linux CI).
+- `protocol` — lib only. Shared models at port/adapter boundaries: canonical event taxonomy, NATS envelope + payload DTOs, IPC frame schema, TOML config schema. **No hexagon/kernel types leak here** — pure DTOs shared between agent and user-actor.
+- `agent` — lib + bin `secoutfall-agent`. Lib: hexagon (domain + app + plugins + adapters). Bin: thin composition root only.
+- `user-actor` — lib + bin `secoutfall-user-actor`. Same pattern.
+
+**Role/family layout (both hexagons):** `ports/` and `adapters/` are split by direction — `driving/` (inbound: the adapter SPI that pushes into the kernel `EventInletPort` — ETW, scheduler, SCM, IPC server; UA: focus sources + IPC client) and `driven/` (outbound ports the hexagon calls). `driven` adapters are grouped further by port FAMILY (`broker/`, `clock/`, `launcher/`, `killer/`, `scope_store/`, `shell_association/`, `upload/`; UA: `capture/`, `input/`, `launcher/`), and every fake lives beside its production twin in the same family (e.g. `driven/broker/fake.rs` next to `driven/broker/nats.rs`). Two cross-direction facts by design: the agent's ETW mapping is pure and always compiled (`adapters/driving/etw_mapping`), and the UA's production screenshot sink is the IPC client's channel pair — an adapter spanning both directions — so its fake sits alone at `adapters/driven/sink_fake.rs`.
+- `devtools` — bins: `dummy-broker` (Rust replacement of legacy DummyBroker), `session-sim` (fake event source + fake clock harness for study simulations).
+
+## Target architecture
+
+Hexagonal microkernel, following `Reference/AGENTS.md` doctrine:
+
+- Plugin contracts ARE ports; plugins ARE adapters; kernel IS the inner hexagon. Kernel never imports plugins; plugins never import each other (bus only); kernel domain minimal.
+- Port families in kernel: `api_ports` (driving, kernel-implemented — the pipeline entry), `spi_ports` (driven, kernel-consumed — storage/config/scheduler/telemetry), `plugin_ports` (plugin-facing — `PluginPort`, `MiddlewarePluginPort`, `EventBusPort`).
+- Cardinality: kernel service ports = single adapter, single instance, kernel-owned, injected into plugins. Plugin-facing ports = many adapters (one per plugin), registered into kernel.
+- Lifecycle: `boot()` = `init()` all plugins, then `start()` all; `shutdown()` = `stop()` all.
+- Pipeline: inbound events flow forward through `pre` hooks, backward through `post` hooks. `Next::Continue` / `Next::Stop` (skip remaining `pre`, still run `post`) / `Next::Abort` (skip everything). **No payload in `Next`** — fire-and-forget core, no response-context; outputs happen only via injected driven ports.
+- Event bus carries only DERIVED plugin-owned domain events, never raw inbound events. Pipeline→bus bridging is plugin behavior. `KernelService<E, S, B, D = E>` keeps the bus event type `D` decoupled from the inbound `E`.
+- Kernel checklist: required for every deployment / breaks platform when removed → kernel. Everything else → plugin.
+
+### Agent (session-0 service) — kernel + plugins
+
+- **Driving adapters** (inject events into pipeline): `EtwKernelTraceAdapter` (today; `DriverAdapter` for SecOutfallA later — both implement `EventSourcePort`), `WindowsServiceAdapter`/`ConsoleModeAdapter` (SCM stop/shutdown/power; console mode for dev), `SchedulerAdapter` (session deadline, keepalive 15 s, stats tick, persist tick), `InteractiveSessionWatchAdapter` (explorer seen → InteractiveSessionReady), `IpcServerAdapter` (user-actor pipe: ScreenshotReceived inbound; config push in Welcome), *(future)* NATS control subscription (port + fake exist now).
+- **Driven ports**: `BrokerPort` (NATS publish), `FileUploadPort` (HTTP multipart), `ScopeRepository` (atomic JSON file `scope.json`), `ConfigPort` (TOML), `ProcessLauncherPort` (**two swappable adapters**: `TokenProcessLauncher` = CreateProcessAsUser/WTSQueryUserToken; `SchedTaskLauncher` = legacy schtasks EventID-777 trick; config selects), `SystemClockPort` (SetSystemTime/W32Time/w32tm), `ShellAssociationPort`, `UserActorLauncherPort`, `TelemetryPort`.
+- **Plugins**: `scope-tracker` (process-tree membership, drop detection; publishes `DropObserved`/`DropClosed`/`ScopeDied`), `event-reporter` (NATS forwarding, verbosity gate), `drops-collector` (copy/dedupe/quota/upload), `screenshot-intake`, `finalizer` (session state machine, reboot/shutdown, kills configured processes, persists scope), `system-time`, `target-launcher`, `user-actor-supervisor`, `scoring`, `heartbeat` + `state-reporter`, `statistics`.
+
+### User actor (user session) — hexagon reusing the kernel crate lightly
+
+The user actor (legacy `ExternalModuleUA`; "UA" in old notes) both **observes** the desktop (focus tracking, screenshots) and **acts** in it (reactive + scripted input) — hence the name.
+
+- Same kernel crate, light configuration (few middleware plugins, sparse bus). Scripted activities ARE plugins (`ActivityPort`: Start/Stop/Pause/Resume — implementing legacy `IActivity` intent).
+- **Driving**: `WinEventHookAdapter` (EVENT_SYSTEM_FOREGROUND 0x0003 / EVENT_OBJECT_FOCUS 0x8005 — REQUIRES a dedicated thread with a Win32 message pump bridging into tokio via channel), `PollingFocusAdapter` (50 ms), `IpcClientAdapter` (connect, Hello handshake, future commands).
+- **Driven**: `ScreenCaptureAdapter` (GDI→JPEG, DPI-aware, all monitors), `InputSynthesisAdapter` (`SendInput` only — `SendMessage`/`mouse_event` are deprecated), `ScreenshotSink` (IPC), `TelemetryPort`.
+- UIA element tracking is NOT in scope yet, but port shapes must accommodate it later.
+
+## Canonical event taxonomy (resolved)
+
+Source-agnostic (ETW today, driver later, mixed feeds possible). Owned by `protocol` crate. The envelope `type` field carries this name; the `data` payload schema is keyed by it. `agent.state` (legacy StateReport), `study.score` (ScoreReport), `study.drops_summary` (DropsReport) are regular typed events — no separate "Report" packet kind.
+
+```
+process.started | process.stopped
+thread.started | thread.stopped
+image.loaded | image.unloaded
+registry.key_created | registry.key_deleted | registry.key_opened | registry.key_closed
+registry.key_queried | registry.value_queried | registry.value_set
+file.created | file.written | file.closed | file.cleaned_up | file.deleted | file.renamed | file.fsctl
+net.tcp.connected | net.tcp.accepted | net.tcp.disconnected
+session.started | session.finalizing | session.ended | scope.died | target.launched
+drop.observed | drop.closed | drop.copied | drop.uploaded
+screenshot.received | screenshot.uploaded
+user_actor.started | user_actor.stopped | clock.adjusted
+agent.state | study.score | study.drops_summary
+study.reboot_requested | study.shutdown_requested
+```
+
+The ETW adapter maps Task/Opcode → these names; mapping table lives (and is tested) in the adapter.
+
+## Wire protocol v3 (clean break)
+
+- NATS kept — `async-nats` is the officially maintained native Rust client; no support gap. Broker and GlitchTip are reachable from analysis VMs on the lab network.
+- Channels: `control_channel` + `event_channel` only. **`trace_channel` dropped** (dead in legacy; agent self-diagnostics go to Sentry/GlitchTip, behavioral telemetry to `event_channel` with verbosity gating).
+- Envelope (all messages, both channels):
+
+  ```json
+  {"v": 3, "type": "process.started", "ts": 1699999999999, "study": "<uuid>", "session": 4, "seq": 12345, "data": {}}
+  ```
+
+  `ts` = unix ms from the (deliberately fake) clock; `study` = id generated at session 0, persisted in scope.json; `seq` = monotonic per publisher connection → Controller-side loss detection.
+- Control events: `control.keepalive` (every 15 s), `control.reboot`, `control.shutdown` (`data.error` optional). Agent never subscribes yet (observe-only); inbound control port + fake exist for the future.
+- HTTP uploads: multipart parts `meta` (`application/json`, `{"path", "study", "session"}`) + `blob` (`application/octet-stream`), streamed and size-capped. Screenshot pseudo-name: `screenshot-{session}-{seq}.jpeg`. No auth.
+
+## Agent↔User-actor IPC v1 (resolved: named pipes)
+
+- Pipe `\\.\pipe\secoutfall\user-actor-v1`, tokio `ServerOptions` + `security_attributes_raw` with restrictive DACL (SYSTEM, Administrators, launch user only), `reject_remote_clients` + deny-Network ACE, bounded instances.
+- Frames: 8-byte header `{len: u32 LE, type: u16, flags: u16}` + payload; hard cap 16 MiB. Control frames = JSON; screenshot frames = raw JPEG.
+- Anti-impostor: per-boot random nonce passed to the user actor at launch, echoed in `Hello`; server verifies client token is SYSTEM and client PID is the child we spawned.
+- Commands: `Hello {protocol, nonce, module_version}` → `Welcome {session_id, config}` (config push; legacy pull-only `GetConfig` kept as re-pull), `Screenshot {seq, jpeg}`, `Error`. Correlation ids where confirmation matters.
+- **Resolved (phase 8):** the client adapter lives in `user-actor` (`adapters/driving/ipc_client`) — sink/queue channel pair (`IpcClientAdapter::channel`) so plugins get the sink at assembly; bounded queue (4) applies backpressure; client reconnects on connection loss (nonce stays valid per boot, server re-pushes `WELCOME`), a pre-WELCOME `ERROR` is fatal (`HandshakeRejected`); connect retries have a deadline. The server DACL gains a console-user SID ACE at runtime (`console_user_pipe_sddl`, WTSQueryUserToken → TokenUser → ConvertSidToStringSidW); `with_pipe_name` overrides the pipe for tests (parallel test binaries must not compete for `first_pipe_instance`).
+- **`user_actor.started`/`stopped` are handshake-evidence events:** published by the IPC server on verified `HELLO` (module_version + client pid via `GetNamedPipeClientProcessId`) and on disconnect-after-handshake — never on launch intention. The supervisor (`user-actor-supervisor` plugin) only launches the UA on the marker-process sighting, passing `--nonce <hex>`; marker matching lives in `agent::domain::marker::is_marker_process` (case-insensitive `.exe` strip).
+- User-actor crate shape: kernel-light hexagon (`app::assemble`), inbound `ActorEvent {Welcome, FocusChanged}`, bus `ActorBusEvent {ConfigApplied, ForegroundChanged, ScreenshotTaken, CaptureQuotaExhausted}`; plugins `config-apply`, `focus-watch` (capture + quota, strictly gated by pushed config — bug #4), `reactive` (bus subscriber, Enter hold 300 ms), `scripted-runner`. Windows adapters are feature-gated: `ipc`, `focus-poll` (50 ms), `focus-winevents` (pump thread + std→tokio bridge), `capture` (GDI DIB section → jpeg-encoder, DPI-aware), `input` (SendInput: `press_enter`, `type_text` via `KEYEVENTF_UNICODE`, `press_key`, `press_hotkey` chords), `apps` (`CreateProcessW` app launcher). Focus sources dedup via `domain::FocusDedup`; the focus source starts only after the config push names it.
+- **Scripted activities (resolved, phase 9):** legacy `IActivity` was a Start/Stop/Pause/Resume interface with ALL three activities being `NotImplementedException` stubs — the contract shape is the only legacy truth (`ua_emulation` → `user_actor.scripted` config flag). Implementation: `plugins/scripted` holds `ActivityPort` (name/start/stop/pause/resume over an `ActivityControl` token pair), the pure `ActivityStep` script model (Launch/Wait/TypeText/Key/Hotkey), the `run_script` loop (passes forever, `iteration_delay` 30 s; a failed launch aborts the pass — typing into a missing window is skipped — and the loop retries; stop/pause check before every step), and the `scripted-runner` plugin (starts activities when the pushed config has `scripted: true`; kernel shutdown stops them). `plugins/activities` holds the three scenarios as pure step data: notepad (launch → type notes), calc (launch → digit/operator sequences, numpad VKs), explorer (`Win+E`, `Ctrl+L` address-bar navigation — hotkey, not launch). Activities are `ActivityPort` components OWNED by the runner plugin (assembly-time injection) — kernel plugins never call each other, so activities are not kernel plugins themselves. Scripts favor layout-independent input: Unicode typing for text, named VKs (`ports::Key`) for keys/chords.
+- Legacy transport (`SharedMemory` 2.3.2 `RpcBuffer`, `Global\SecOutfall-9C3CE55B`, BinaryFormatter) is reference-only — do not implement.
+
+## Config (resolved: TOML)
+
+- `C:\Agent.toml`, strict validation (reject unknown/ill-typed keys with clear errors), no auto-back-fill, native arrays. Defaults in code.
+- Structure instead of flat keys; mapping (old → new) lives in `protocol` crate with golden tests. Sketch: `[broker] uri/control_channel/event_channel`, `[target] path/args/every_session`, `[study] uptimes/autoshutdown`, `[drops] path/extensions/max_size/limit_per_session`, `[screenshots] path/save/max_per_session/upload_uri`, `[time] timestamp/offset`, `[platform] launch_mechanism`, `[user_actor] reactive/scripted/focus_method/screencapture`, `[scoring] cli_started/drop_observed` (session score = max over signals), `[telemetry] sentry_enabled/dsn`, `[debug] skip_reboot_and_shutdown/skip_time_manipulation`.
+- VersaINI quirks must NOT carry over: unparseable int → 0; bool accepts only `True`/`False`; enum int-or-exact-name; delimiter-string lists; `_file_path` stash convention (inert).
+
+## Telemetry (resolved)
+
+- `tracing` macros everywhere = single instrumentation API. Subscriber = `registry()` + `EnvFilter` + `tracing-appender` non-blocking rolling files + console (debug) + `sentry-tracing` layer → **local GlitchTip** (Sentry-protocol compatible; standard DSN).
+- No conflict between `sentry` and `tracing-subscriber` — Sentry joins as a layer in the single global registry, set up once in each bin's composition root. Layer captures ERROR+ as events, spans as breadcrumbs — tune filters.
+- Gated by `telemetry.sentry_enabled` (egress from analysis VM is visible to malware). Scrub file paths/malware-derived strings from outbound breadcrumbs.
+- **Fake clock caveat:** Sentry/GlitchTip timestamps will be skewed by deliberate time manipulation — correlate by session id in payloads, never by SDK timestamps.
+- User actor reports to GlitchTip directly (own DSN, received via IPC config push; reads no files) — independent failure domains, no custom relay through the agent.
+
+## CI strategy (planned; runner decision deferred until after initial rewrite)
+
+- **Linux container job** (fast, cheap): `kernel`, `protocol`, all platform-independent domain logic, proptests, `cargo-deny`/audit, fmt/clippy gates, `cargo-fuzz` builds + scheduled fuzz batches. This is why parsers stay platform-independent.
+- **`windows-latest` hosted job**: compile full workspace, Windows-runnable tests.
+- **Optional self-hosted runner** on lab Win10/11 VM with auto-logon: true integration suite (SCM, ETW kernel session, user actor on a real desktop) + nightly soak. No Windows containers — no SCM/desktop/kernel ETW there.
+- Target matrix: Windows 10/11 x64.
+
+## Legacy wire facts (behavioral grounding, NOT compat obligations)
+
+### NATS (legacy)
+
+- Subjects from config `ctl_channel`/`event_channel`/`trace_channel` (sample values ctlch/eventch/tracech). Legacy envelope: `{"packetType": "Report"|"Event", "payload": {...}, "eventName": "Task/Opcode", "comment": "...", "timestamp": <unix-ms>}`. JSON indented, nulls omitted, enums as strings. Reports: `StateReport {protocolVersion: 2, agentVersion, sessionId}`; `ScoreReport {score}`; `DropsReport {extensions: histogram-string}`.
+- Legacy agent never subscribes; trace channel dead; NATS request/reply exists but dead code.
+
+### ETW (single provider: Windows Kernel logger)
+
+- Session `SecOutfall_Session`, buffer 256 MB, keywords `Process|Thread|ImageLoad|Registry|DiskFileIO|FileIOInit|FileIO|NetworkTCPIP`.
+- Consumed: Image Load/Unload; Process Start/Stop; Thread Start/DCStart/Stop/DCStop; Registry Create/Delete/Open/Close/Query/QueryValue/QueryMultipleValue/SetValue; FileIO Name/Rename/Create/Delete/Write/Close/Cleanup/FSControl (Read deliberately disabled — too noisy); TCP Accept/Connect/Disconnect (+IPv6). UDP never implemented.
+- Legacy threading: ALL processing serialized on one ETW pump thread. Rewrite: explicit async pipeline with bounded channels + loss accounting.
+
+### Config keys (legacy INI, `C:\Agent.ini`)
+
+- Sections `[agent]` + `[internal]`. Required: `file_path`, `broker_uri`, `ctl_channel`, `event_channel`. Full inventory: `Legacy/SecOutfallB/Configuration/Configs/AgentConfig.cs`, `InternalConfig.cs`.
+- Notable: `uptimes` (space-sep seconds, e.g. 24 × 6000), `processes_to_terminate` (`|`-sep, def `WINWORD|POWERPNT|EXCEL|OfficeClickToRun`), `drops_extensions` (`,`/`;`-sep, def `.txt,.exe,.dll,.bat,.ps1,.py,.js,.vbs,none`; `*` = all, `none` = extensionless), `drops_maxsize` (def 10 MB — legacy never enforces), `drops_limit_per_session` (30), `system_time_timestamp` (unix-sec), `system_time_offset` (sec added per finalize), `start_target_every_session`, `autoshutdown`, `ua_*` family, `external_module_rpc_name`, `shutdown_delay` (5 s), `debug_skiprebootandshutdown`, `debug_skipsystemtimemanipulation`, `resave_config_with_missing_fields`.
+
+### Filesystem artifacts (legacy)
+
+- Scope DB `Storage.json.bin` next to exe → rewrite: `scope.json` (atomic temp+rename, now also carries `study_id`). Drops `Drops\{ticks}_{n}_{ext}` → rewrite `{session}-{seq}-{hash8}.{ext}`. Screenshots `Screenshots\Screenshot-{random}.jpeg` → `screenshot-{session}-{seq}.jpeg`. Logs `Logs\*.log.bin` + `FatalError.log`. `reboot.txt` marker. Config `C:\Agent.ini` → rewrite `C:\Agent.toml`.
+
+### Key legacy numbers
+
+- Startup retries 18 × 5 s (network, NATS, interactive-session waits). Keepalive 15 s; scope save 15 s; uploader poll 250 ms; focus poll 50 ms; Enter-key hold 300 ms; min session duration 60 s; SchTasks helper event ID 777, task `RunAsSystem`, helper `windows-run-as-system.exe`; drop-write skip heuristic sizes {4096, 8192, 16384} with offset > 0; w32tm resync wait 10 s; ETW buffer 256 MB; legacy RPC: 1 MiB × 30 nodes, 30 s timeout.
+
+## Known legacy bugs to FIX in rewrite (verified in legacy sources)
+
+1. Dead-session detection inverted (`Any(p => p.IsRunning)` fires while processes still alive) — breaks `autoshutdown`.
+2. Drop de-duplication by file LENGTH only — different same-size files collide.
+3. `drops_maxsize` parsed but never enforced; whole file read into memory.
+4. Screenshots sent even when `ua_screencapture_enabled=false` (manager created unconditionally).
+5. Drop copy subscribed to both write AND close events → duplicate/locking upload races.
+6. `uptimes` overrun → `IndexOutOfRangeException`; empty `uptimes` → NRE (dynamic mode promised, never implemented).
+7. WMI owner `"NO OWNER"` → crash at target launch; file-association command split → crash on single-token commands.
+8. `BinaryFormatter` + default DACLs on `Global\` shared memory while running as SYSTEM — malware in VM can attack the channel.
+9. `Thread.Abort()` on ETW pump; finalizers doing IO; `async void` everywhere; unsynchronized queues/counters.
+10. Scope DB truncated in place (no temp+rename), concurrent saves unguarded.
+11. `SetSystemTime` takes UTC but offset math uses local `DateTime.Now` — skew bug.
+12. Trace channel dead; telemetry timer never started; scoring ignores its own parameters.
+
+## Non-negotiables for new code
+
+- No `BinaryFormatter`-style opaque serialization — explicit, versioned schemas on every wire boundary.
+- No `Thread.Abort`, no `async void` equivalents, no unsynchronized shared mutable state. Single-owner tasks + channels.
+- Atomic file writes (write temp + rename). Never truncate persistent state in place.
+- Bounded queues with explicit overflow policy (coalesce + loss counter + report, never OOM) — malware WILL flood ETW.
+- No `unwrap`/`expect`/panic in production paths of agent/user-actor crates (clippy-denied).
+- Validate every external byte: IPC frames, config files, drop file paths (unicode, >MAX_PATH, reserved names CON/NUL, locked files). Fuzz the parsers.
+- Restrictive DACLs on any `Global\` kernel objects and named pipes.
+- Timestamps on the wire: unix milliseconds. Careful UTC vs local everywhere (system time is deliberately fake).
+- Windows-only target (x86_64-pc-windows-msvc, edition 2024, stable toolchain), but keep domain logic pure and platform-agnostic; adapters thin.
+
+## Tech choices
+
+- Runtime: `tokio` (rt-multi-thread, time, sync, net, process). Serialization: `serde`/`serde_json`; config: TOML parsed directly with the `toml` crate (strict schema: deny-unknown-keys + explicit defaults; the `config` crate was rejected — it merges loosely and cannot enforce a strict schema). Transport: `async-nats`, `reqwest` (multipart, streaming). Windows: `windows` + `windows-service` crates. ETW: `ferrisetw` (phase-4 spike verdict; `etw-reader` was rejected — dead ETL-file fork; live kernel trace unverified without admin, `etw-probe` mode exists for the elevated check). Uploader: `reqwest` with `multipart`+`stream`+`native-tls` (schannel — avoids aws-lc-rs build pain; switch to rustls only if https to controller becomes mandatory). Broker: `async-nats`. Error handling: `thiserror` (domain) + `anyhow` (bin edges). Builders: `bon`. Locks: `parking_lot`. Observability: `tracing` + `tracing-subscriber` + `tracing-appender` + `sentry`/`sentry-tracing` → local GlitchTip (see Telemetry). **NO database inside the VM** — scope stays a local atomic JSON file.
+- Conventions: copy `Reference/rustfmt.toml` and its clippy lints (`pedantic` warn, `indexing_slicing` deny, `string_slice` deny, `cargo` warn + `cargo_common_metadata`/`multiple_crate_versions` allow). English comments/docs.
+- Testing doctrine: Fake adapter per port; property tests (`proptest`) for scope membership & drop invariants; golden wire tests vs legacy-captured JSON; `cargo-fuzz` targets for IPC framing + config parsing (pure Rust, fuzzable on Linux CI); chaos tests (broker death mid-finalize, locked/unicode/oversized drops, IPC peer death mid-transfer, concurrent focus storms, disk full); deterministic injected clock — a full 24-session study must simulate in milliseconds as the core regression suite.
+- **Hardening (resolved, phase 10):** `fuzz/` at the workspace root (cargo-fuzz layout, own workspace, excluded) with 3 targets — `parse_frame`, `parse_config`, `decode_screenshot_payload` — Linux-CI only (`cargo +nightly fuzz run`; MSVC/libFuzzer unsupported); the same call sites carry `proptest` coverage that runs on every host (`crates/protocol/tests/prop_wire.rs`, `crates/agent/tests/prop_scope.rs`, `crates/user-actor/tests/prop_domain.rs`). Chaos suites: `crates/agent/tests/chaos.rs` (broker dying mid-session → scope still persists; share-locked drop skipped, collection continues; vanishing + Unicode drops) and `crates/user-actor/tests/chaos.rs` (200-task concurrent focus storm). The capture quota is reserved via `compare_exchange` — the kernel inlet accepts concurrent adapters, so check-then-act could over-run (fixed in phase 10; sink/capture failures release the slot). `twenty_four_session_full_study_simulation` (multi_session_study.rs) drives 24 boots in ~1 s and asserts study-id stability, per-session stamps, gap-free sequences, reboot/shutdown control tail, and drop observation. Lesson: parallel tests sharing a named pipe must use distinct names (`with_pipe_name` / `test_pipe(suffix)`) — `first_pipe_instance` and cross-connect otherwise break them (bug found in phase 10's own new IPC test).
+
+- **Leftovers (resolved, phase 12):** `SchedTaskLauncher` adapter (`schedtask` feature): legacy `ONEVENT` task on Application-log `EventID 777` runs the configured run-as helper with `--path <target> -- <args>` (Create → Run → Delete per launch, task deleted even when `/Run` fails); console user from WTS (`WTSQuerySessionInformationW`) — no WMI owner parsing, bug #7's crash class cannot recur; the action line quotes every element by MSVCRT rules and is unit-tested through a test-only argv splitter (the exact `CreateProcess` inverse); **no manual `/TR` escaping** — the legacy `\` → `\\` doubling was a `UseShellExecute` workaround and would corrupt paths under `std::process::Command`, which argv-quotes each element itself (schtasks then parses standard argv, byte-exact round-trip); 15 s legacy budget enforced as a real timeout; failures surface as typed `LaunchError`s. Telemetry egress is live in both bins per doctrine: one `tracing_subscriber::registry` (EnvFilter + console fmt + `sentry-tracing` layer — the layer is a no-op until a client activates, so it can be wired at init); agent activates Sentry after config load (`telemetry.sentry_enabled` + DSN; `sentry::init` PANICS on a malformed DSN, so parse first — malformed = warn + no egress); user-actor activates once on the WELCOME-pushed DSN (an invalid first DSN must not lock out a valid re-push; guard leaked deliberately — process-lifetime transport). Lesson: the agent bin previously had NO tracing subscriber — its logs went nowhere; any new bin gets `init_tracing` on day one. Disk-full chaos: a drops path that refuses every write (occupied by a file) never blocks finalization or the scope persist; a failed copy leaves no `.part` litter and does not poison collection. CI windows job runs all-features clippy + tests (`.github/workflows/ci.yml`). Validate with the CI-exact gates — never a bare clippy (warnings don't fail it, and new clippy releases keep adding lints: 1.98 added `manual_is_multiple_of`, let-chain `collapsible_if`, `chunks_exact_to_as_chunks`). Full local match of the Windows lane: `cargo +nightly fmt --all --check`; clippy twice (`--workspace --all-targets -- -D warnings`, then `--all-features` added); tests twice (`--workspace`, then `--all-features`) — the default lane does NOT see Windows-feature-gated code, so lints/tests can pass there and fail under `--all-features`.
+- **WSL lane for `#[cfg(unix)]` code:** neither Windows lane compiles unix-gated code — a cfg(unix) `collapsible_if` in `scope_store_json` slipped through both Windows clippy lanes into Linux CI. The host has WSL Ubuntu with a matching stable toolchain; run the Linux lane there: `wsl -e sh -c 'export PATH="$HOME/.cargo/bin:$PATH"; export CARGO_TARGET_DIR="$HOME/secoutfall-target"; cd /mnt/d/Dev/SecOutfall/secoutfall; cargo clippy --workspace --all-targets -- -D warnings'` (and the same for `cargo test --workspace`). WSL needs `pkg-config libssl-dev` for `openssl-sys` (reqwest/native-tls); keep the target dir on ext4 (`CARGO_TARGET_DIR`), never on `/mnt`. WSL caveat: `.wslconfig` uses `networkingMode=VirtioProxy`, which BREAKS in-VM loopback TCP (bind works, connect refused — even raw python is refused). The one Linux test that spins an in-process HTTP server (`uploads_meta_and_blob_parts`) fails there for environment reasons, not code — skip it locally with `-- --skip uploads_meta_and_blob_parts`; CI's ubuntu runner covers it.
+
+- **Ops (resolved, phase 11):** agent bin `install`/`uninstall` subcommands (`service` feature): install validates the config through the strict loader first (a service that cannot read its config must never be created), refuses double-install, creates the SCM entry (LocalSystem, AutoStart) pointing at the current exe with `--config <path>`; `--start` boots it immediately; uninstall stops with a bounded 10 s wait, then deletes (SCM completes the removal at process exit). `dummy-broker` is real now: subscribes both channels, pretty-prints v3 envelopes, tracks per-channel seq gaps (loss) and regressions (publisher restart), per-type histogram summary on Ctrl+C, optional `--spawn <nats-server.exe>` (bind coordinates derived from `--uri`, bracket-form IPv6 supported); unparsable/hostile bytes are truncated at char boundaries, counted, and printed raw — never a panic. Docs: workspace `README.md` (crates, modes, features, quick start, VM setup, testing) and `docs/Agent.toml` — the shipped full-defaults sample is pinned to the schema by a golden test (`crates/protocol/tests/config_sample.rs`): parse(sample) must equal the built-in defaults plus a non-empty `target.path`, must validate, and a stripped minimal document must parse to the same config. Config keys added/renamed/retyped break that test until the sample is updated — by design.
+
+- **Review hardening tier 3 (all leftovers resolved):** kernel `boot()` rolls back on failure (reverse-order `stop` over every processed plugin, including a mid-start failure — `stop` is contractually idempotent and must tolerate init-only/partially-started plugins); `InMemoryEventBus::new(0)` clamps to 1 (tokio broadcast panics on 0); scope.json persist now `create_new` temp + `write_all` + `sync_all` before rename (leftover temp removed first; dir fsync is unix-only — Windows cannot `File::open` a directory); **unclean reboot** no longer reuses the stale session — an open session at init is stamped `ended_at_ms` + `abandoned: true` (serde-default field) and a fresh session always opens, so ids advance one-per-boot and the clock is never re-faked (an abandoned session consumes its `uptimes` slot — ids stay index-aligned); **PID recycling**: `is_scoped` matches only LIVE records (a stopped pid neither inherits scope nor attributes drops) and a repeated `process.started` for a pid REPLACES its record (newest wins; stale record could fake scope liveness/death) — prop_scope model updated to match; `EventVerbosity::Partial` is REJECTED at config validation until implemented; **launches are off the pipeline** (target-launcher + supervisor submit to a bounded JobQueue spawned in `start`, refusal = detonation lost = error-logged), and the scope-expectation race is closed by ordering: the tracker drains its expectation subscription via `try_recv` at the top of every `pre`, and the launcher publishes BEFORE launching — the interpreter's `process.started` can only arrive after, so the drain always sees it; **UA sink never blocks** (`try_send` → `ScreenshotSinkError::Full`, focus-watch releases the quota slot — the overflow policy is drop + count, per doctrine); reactive input has a **storm gate** (`PRESS_MIN_INTERVAL` = 1 s, pure `press_allowed` helper, tested); IPC frames REJECT nonzero `flags` (`FrameError::ReservedFlags`, proptest updated — generate known types, not `prop_assume`, which starves); armed pid gate now also accepts a **LocalSystem client** (`client_is_system`, `S-1-5-18` via client-pid → OpenProcess → token → SID string; FFI failure can only deny) — covering the sched-task UA whose pid is never reported. Still-by-design gaps: nonce-only verification when the gate is 0; SYSTEM-token probes are best-effort under the user's session ACL.
+
+- **Review hardening (tier 1+2, post-review):** the whole-project review found 6 verified HIGH defects — all in Windows-adapter/async-boundary code the test suite cannot see. Fixed: **ONE wire seq counter per boot** (`AgentDeps::seq`, shared by runtime + assembler + IPC server; runtime/builder no longer mint their own — never add a second); **drop quota counts successful collections**, not attempts (gate = cheap `load()`, increment after `persist_copy` returns Some; single-consumer JobQueue makes this exact), and the dedup hash is inserted only after a successful rename (rename failure removes the `.part`); **REG_SZ is UTF-16LE** — `decode_utf16_reg_sz` + `RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ` in the registry association adapter; **ETW registry events map explicitly** (no `_` fallthrough can fabricate `key_created`; PID parsed via candidates `PID`/`ProcessId`); **UA IPC reads run on a dedicated task** — `read_exact` consumes pipe bytes even when its future is dropped, so a `select!` over reads desyncs the stream (the historical HIGH); the reader is cancel-aware, teardown closes the writer then allows a 1 s grace before aborting (the reader holds the ReadHalf — without closing the writer first this DEADLOCKS); **outbound screenshot frames are capped at the sink** (`ScreenshotSinkError::Oversize`, never queued — an over-cap frame would be rejected by the peer and resent forever across reconnects); reconnect has a 500 ms backoff (accept-then-drop cannot spin the loop). IPC server: no WELCOME/GET_CONFIG before verified HELLO; 10 s handshake deadline (silent client cannot squat the instance); next pipe instance created before serving (spawn per-client task); SDDL descriptor converted once per `run()` with RAII `LocalFree`; `with_expected_client_pid(Arc<AtomicU32>)` gate — supervisor stores the launched pid (`0` = ungated sentinel), server compares `GetNamedPipeClientProcessId` at HELLO. UA `init_sentry_once` is called on EVERY config push (idempotent) — gating it behind the one-shot flag locked out a valid re-push after an invalid first DSN. `debug.skip_reboot_and_shutdown` is honored at finalize (suppresses the reboot/shutdown REQUEST — the agent never executes an OS reboot itself; the Controller/VM acts on the request).
+
+- **Edge-case test sweep (post-tier-3):** +18 tests; two latent bugs found and fixed by writing them: `app_launcher` (UA) built its `CreateProcessW` command line NUL-joined — every argument after the program was silently dropped (the child parses `lpCommandLine` up to the first NUL) — now space-joined MSVCRT quoting with a roundtrip test through a test-only argv splitter; `command_line::split_command_line` dropped a trailing backslash-only token (`a b \\` lost `\\`) — `has_token`/emptiness flush fixed. Edge cases now pinned: IPC screenshot decode roundtrip + sub-prefix truncation (proptest — closes the decode-screenshot coverage gap vs the fuzz target); kernel bus lag semantics (capacity 1 → `Lagged(1)` then newest), zero-capacity clamp, double shutdown, empty pipeline; scope.json pre-`abandoned` schema backward compatibility; `config_toml::load` non-UTF-8 bytes + directory-as-path; scheduler zero-duration deadline fires exactly once; event-reporter `None` verbosity silences source events while derived lifecycle/drop events flow; config duplicate keys/sections, negative-for-unsigned, `verbosity = "none"`, negative `offset_secs`; marker-process degenerate names (empty `""/""` matched before — `is_marker_process` now rejects empty sides).
+
+- **Standalone `local` mode (bin):** `secoutfall-agent local` — quick local target testing with real adapters and zero services: config from `--config` or `--target <path>` (built-in defaults otherwise, with a hint), in-memory scope DB (every run is a fresh session 0 — the launch precondition always holds), `ConsoleBroker` prints every envelope one-line to stdout (keepalives suppressed but counted — seq numbering stays honest), uploads no-op, IPC server not attached. Event persistence: a `TeeBroker` fans each publish out to the `ConsoleBroker` and a `JsonlBroker` (`events.jsonl`, one wire envelope per line — `jq`/`tail -f` friendly), and the scope repo is `LocalScopeRepository` (always loads a fresh session 0, saves the final snapshot to `local-scope.json`). Safety-forced by `standalone_config` (tested): `skip_time_manipulation` + `skip_reboot_and_shutdown` on, `processes_to_terminate` cleared — a dev host never has its clock shifted, its processes killed, or a reboot requested. `debug.skip_reboot_and_shutdown` is now honored by the finalizer for ALL modes (gates the finalize REQUEST publish — the agent only ever publishes the request; the Controller/VM acts on it). Observation requires `--features etw` + elevation; without it the run says so and idles. `console --demo` shares the console broker + in-memory scope (its old persisted `scope.json` made repeat runs non-session-0 and silently disabled the target launch). Regression: `crates/agent/tests/finalize_completion.rs` — `run_until_stop` must poll `finalize_done` (set at the END of finalize), never `ended_at_ms` (stamped at the START): polling the latter dropped the pipeline future mid-persist, killing the scope write and the `session.ended` publish.
+
+- **Linux-CI platform-divergence sweep:** two Windows-only-passing bugs, both root-caused to host-separator dependence. (1) `target_image_name` and the launcher's scope-expectation used `Path::file_name()` — on Unix a `C:\...` config path is ONE component, so the derived name never matched an ETW process name: target never entered scope, drops went unattributed (chaos suite failed with 0-vs-N). Fixed at the root with `domain::image_name` — pure textual split on BOTH `/` and `\`, deterministic on every host; `Path::file_name` on config/event paths is BANNED, use the helper. (2) a test asserted `path.ends_with("Agent.toml")` on a hand-written Windows path — `Path::ends_with` compares components, so build test paths with `join` (real components) instead of `Path::new("Z:\\...")` literals. Lesson: any test or logic feeding a Windows-style path string into `std::path` APIs diverges on Linux; keep path-string logic textual or build paths with joins.
+
+## Development sequence (walking skeleton)
+
+1. Workspace scaffolding + CI + conventions.
+2. Kernel crate: ports, pipeline runner, in-memory bus; unit-tested with fakes. Walks when: plugin registered + bus routes one event + pipeline delivers + plugin emits via fake port.
+3. Protocol crate: canonical event taxonomy, NATS DTOs (v3), IPC frame schema, TOML config schema + golden tests.
+4. Agent skeleton in console mode: config → fake event source → pipeline → scope-tracker → fake broker; simulated multi-reboot study.
+5. Risky adapters first: ETW spike; windows-service adapter; token-based launcher spike.
+6. Real driven side: NATS + heartbeat + state report; scope repository; uploader; clock; associations.
+7. Remaining plugins (drops, screenshots, scoring, statistics, finalizer with FIXED dead-session logic, user-actor-supervisor).
+8. User actor: kernel light config, IPC both ends, focus tracking, screenshots, reactive.
+9. Scripted activities framework + notepad/calc/explorer.
+10. Hardening: fuzz, chaos, backpressure/loss accounting, 24-session VM soak.
+11. Ops: install/uninstall/run-console subcommands, Rust dummy-broker dev observer, docs.
+
+## Open items (small, non-blocking)
+
+1. CI runner decision — strategy planned above; decision deferred until after initial rewrite.
+2. Controller side must implement protocol v3 (envelope, taxonomy, upload `meta`) — external repo; coordinate when it is updated.
+
+## Glossary
+
+- **Study** — one full analysis run; N sessions separated by reboots.
+- **Session** — one boot-to-reboot interval; has id, uptime, scoped processes, drops.
+- **Scope** — set of processes deemed part of the analysis (seeded by target, inherited by parent PID); persisted across reboots in the scope DB.
+- **Drop** — file written by a scoped process, matched by extension filter, copied + uploaded.
+- **Target/sample** — the detonated malware.
+- **Controller** — external fleet manager consuming agent reports.
+- **User actor** — interactive-session module that observes the desktop (focus tracking, screenshots) and acts in it (reactive/scripted input). Legacy name: ExternalModuleUA/"UA".
+- **Finalize** — end-of-session orchestration (reports, clock offset, kills, persist, reboot/shutdown request).
