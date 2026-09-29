@@ -1,0 +1,6 @@
+# The injectee builds on nightly: `retour` static detours use nightly-only
+# language features. This file stops rustup's upward lookup, so commands run
+# inside crates/injectee never fall back to the workspace's stable pin.
+[toolchain]
+channel = "nightly"
+profile = "minimal"

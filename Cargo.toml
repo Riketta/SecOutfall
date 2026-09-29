@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
-exclude = ["fuzz"]
+# `fuzz` is its own cargo-fuzz workspace (nightly, libFuzzer).
+# `crates/injectee` is the sensor DLL: nightly-only via `retour` static
+# detours, pinned by its own `rust-toolchain.toml` — build it from its
+# directory, never through this workspace.
+exclude = ["fuzz", "crates/injectee"]
 members = [
     "crates/kernel",
     "crates/protocol",

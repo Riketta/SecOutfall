@@ -74,3 +74,11 @@ jobs:
 
       - name: Build
         run: cargo build --workspace
+
+      # The injectee sensor DLL is a separate nightly workspace (retour
+      # static detours need nightly); excluded from the main workspace, so
+      # build it explicitly — it must not rot in a corner.
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - name: Build injectee (separate nightly workspace)
+        run: cargo build --locked --manifest-path crates/injectee/Cargo.toml

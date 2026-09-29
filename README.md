@@ -29,6 +29,7 @@ repository `AGENTS.md`.
 | `agent` | lib + bin `secoutfall-agent` | The session-0 agent. Lib: hexagon (domain, app, plugins, adapters). Bin: thin composition root. |
 | `user-actor` | lib + bin `secoutfall-user-actor` | Interactive-session component: observes the desktop (focus tracking, screenshots) and acts in it (reactive + scripted input). Kernel-light hexagon; all config arrives over IPC, it reads no files. |
 | `devtools` | bins | `dummy-broker` (NATS traffic observer), `session-sim` (fake-source multi-session study simulator). |
+| `crates/injectee` | cdylib `injectee.dll` | In-process sensor DLL: declarative API hooks (retour static detours) that report what the host process asks the OS to do. Separate **nightly** workspace, excluded from the main one — build from its directory. Driver-track component, not yet wired to the agent. |
 | `fuzz/` | separate workspace | cargo-fuzz targets (IPC framing, config parsing, screenshot payload decode). Linux + nightly only. |
 
 ## The agent binary
