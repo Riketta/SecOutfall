@@ -474,9 +474,8 @@ fn drops_histogram(
         return histogram;
     };
     for path in &session.observed_drops {
-        let extension = std::path::Path::new(path)
-            .extension()
-            .map(|ext| ext.to_string_lossy().to_lowercase())
+        let extension = crate::domain::image_name::extension_of(path)
+            .map(str::to_lowercase)
             .unwrap_or_default();
         *histogram.entry(extension).or_insert(0) += 1;
     }

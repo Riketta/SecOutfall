@@ -294,10 +294,21 @@ proptest! {
         prop_assert!(!none.matches(&path));
 
         let rule = DropFilter::new(&[format!(".{ext}")]);
-        let path_ext = std::path::Path::new(&path)
-            .extension()
-            .map(|value| value.to_string_lossy().to_lowercase());
-        prop_assert_eq!(rule.matches(&path), path_ext.as_deref() == Some(ext.to_lowercase().as_str()));
+        // The oracle is an INDEPENDENT textual implementation of the contract
+        // — never the same std::path call the implementation used to make;
+        // that made this property tautological and blind to the exact
+        // host-separator divergence the contract forbids.
+        let expected_extension = {
+            let component = path.rsplit(['/', '\\']).next().unwrap_or_default();
+            match component.rfind('.') {
+                Some(dot) if dot > 0 => component.get(dot + 1..).map(str::to_lowercase),
+                _ => None,
+            }
+        };
+        prop_assert_eq!(
+            rule.matches(&path),
+            expected_extension.as_deref() == Some(ext.to_lowercase().as_str())
+        );
     }
 
     /// Hostile extensions sanitize into the whitelist: ASCII

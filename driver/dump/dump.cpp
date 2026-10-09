@@ -42,7 +42,10 @@ void DisplayTime(const LARGE_INTEGER& time) {
 void DisplayData(const BYTE* buffer, DWORD size) {
 	while (size >= sizeof(ItemHeader)) {
 		auto header = reinterpret_cast<const ItemHeader*>(buffer);
-		if (header->Size < static_cast<short>(sizeof(ItemHeader)) || header->Size > static_cast<short>(size)) {
+		// The drained stream is hostile input (any SYSTEM/Admin process can
+		// drain the device too): bound sizes in DWORD space — a `short` cast
+		// of a large remaining size goes negative and breaks the parse.
+		if (header->Size < static_cast<short>(sizeof(ItemHeader)) || static_cast<DWORD>(header->Size) > size) {
 			printf("malformed item size %d — stopping parse\n", header->Size);
 			return;
 		}
@@ -55,8 +58,18 @@ void DisplayData(const BYTE* buffer, DWORD size) {
 			{
 				SetColor(ConsoleColor::Green);
 				auto item = reinterpret_cast<const ProcessCreateInfo*>(header);
-				auto commandLine = std::wstring(
-					reinterpret_cast<const WCHAR*>(buffer + item->CommandLineOffset), item->CommandLineLength);
+				// Validate the offsets against the checked item size before
+				// reading: a truncated/corrupt record must not read out of
+				// bounds (the drain buffer is not trusted).
+				auto commandBytes = static_cast<ULONG>(item->CommandLineLength) * sizeof(WCHAR);
+				bool commandLineOk = item->CommandLineLength >= 0
+					&& item->CommandLineOffset >= sizeof(ProcessCreateInfo)
+					&& item->CommandLineOffset + commandBytes <= static_cast<ULONG>(header->Size);
+				auto commandLine = commandLineOk
+					? std::wstring(
+						reinterpret_cast<const WCHAR*>(buffer + item->CommandLineOffset),
+						item->CommandLineLength)
+					: std::wstring(L"<out of range>");
 				printf("process %lu created (parent %lu): %.*ls\n",
 					item->ProcessId, item->ParentProcessId,
 					static_cast<int>(commandLine.size()), commandLine.c_str());

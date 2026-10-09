@@ -211,7 +211,8 @@ impl Default for ScreenshotsConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TimeConfig {
-    /// Fake wall clock at study start, unix seconds; `0` = NTP resync then freeze.
+    /// Fake wall clock at study start, unix seconds; `0` = skip (the host
+    /// clock keeps running).
     pub timestamp: u64,
     /// Seconds added to the clock at each finalization (may be negative).
     pub offset_secs: i64,

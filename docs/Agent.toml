@@ -18,7 +18,8 @@ uri = "nats://127.0.0.1:4222"
 control_channel = "control"
 # Event subject: all sandbox events and reports.
 event_channel = "events"
-# Event stream verbosity gate: "full" or "minimal".
+# Event stream verbosity gate: "full" or "none" ("partial" is reserved and
+# rejected at validation until implemented).
 verbosity = "full"
 
 [target]
@@ -30,9 +31,9 @@ args = []
 every_session = false
 
 [study]
-# Session durations in seconds, one entry per planned session (e.g. 24 studies
-# of 100 min: [6000, 6000, ...]). An EMPTY list means dynamic mode: sessions
-# end when every scoped process has died (legacy bug #6 fixed).
+# Session durations in seconds, one entry per planned session (e.g. 24
+# sessions of 100 min: [6000, 6000, ...]). An EMPTY list means dynamic mode:
+# sessions end when every scoped process has died (legacy bug #6 fixed).
 # uptimes = [6000, 6000, 6000]
 uptimes = []
 # Finalize early (and end the study) once every scoped process died — requires
@@ -73,9 +74,10 @@ max_per_session = 30
 # upload_uri = "http://127.0.0.1:8085"
 
 [time]
-# Fake wall clock at study start, unix seconds. 0 = resync via NTP/w32tm and
-# freeze; any other value is set directly. The clock is DELIBERATELY fake —
-# correlate telemetry by study/session ids, never by wall timestamps.
+# Fake wall clock at study start, unix seconds. 0 = skip (the host clock
+# keeps running); any other value is set directly at study start. The clock
+# is DELIBERATELY fake — correlate telemetry by study/session ids, never by
+# wall timestamps.
 timestamp = 0
 # Seconds added to the clock at each finalization (may be negative).
 offset_secs = 0

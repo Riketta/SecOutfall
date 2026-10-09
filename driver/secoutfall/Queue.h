@@ -33,6 +33,26 @@ public:
 		return CONTAINING_RECORD(entry, T, Entry);
 	}
 
+	//
+	// Pop the head item only when its serialized size fits in `available`
+	// bytes. Peek + Pop as separate lock acquisitions let two concurrent
+	// drains validate one item and pop another (size from X, bytes from Y —
+	// a pool over-read and a corrupt record stream). One lock hold makes the
+	// check-and-remove atomic; a head that does not fit stays queued.
+	//
+	template<typename T>
+	T* PopIfFits(ULONG available) {
+		AutoLock<TLock> locker(_lock);
+		if (_size == 0)
+			return nullptr;
+		auto item = CONTAINING_RECORD(_head.Flink, T, Entry);
+		if (static_cast<ULONG>(item->Item.Size) > available)
+			return nullptr;
+		RemoveHeadList(&_head);
+		_size--;
+		return item;
+	}
+
 	int GetCount() const {
 		return _size;
 	}

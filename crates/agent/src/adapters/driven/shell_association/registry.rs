@@ -123,10 +123,11 @@ fn open_command_for(sub_key: &str) -> Option<String> {
     read_sz(&format!("{sub_key}\\shell\\open\\command"), "")
 }
 
-/// Extension of a document path, lowercased with the leading dot.
+/// Extension of a document path as the association key (lowercased, leading
+/// dot) — textual split, host-independent (`domain::image_name::extension_of`;
+/// `std::path` on these Windows-style strings diverges per host).
 fn extension_of(document: &str) -> Option<String> {
-    let path = std::path::Path::new(document);
-    let extension = path.extension()?.to_str()?;
+    let extension = crate::domain::image_name::extension_of(document)?;
     if extension.is_empty() {
         return None;
     }

@@ -4,8 +4,11 @@
 // D0 deltas vs the base: renamed, secure device creation (SDDL: SYSTEM +
 // Administrators only), ExAllocatePool2 allocations, clamped command-line
 // capture (the base could overflow `short Size`), clamped registry name
-// copies (the base memcpied attacker-controlled lengths into fixed buffers).
-// The full hardening list and phase plan live in the repo AGENTS.md.
+// copies (the base memcpied attacker-controlled lengths into fixed buffers),
+// atomic pop-if-fits drain (the base peeked and popped under separate locks),
+// validated IOCTL buffers (the base asserted instead of checking), and a
+// failure path that unwinds every resource. The full hardening list and
+// phase plan live in the repo AGENTS.md.
 
 #include "pch.h"
 #include "secoutfallCommon.h"
@@ -99,6 +102,16 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 		if (processCallbacks)
 			::PsSetCreateProcessNotifyRoutineEx(OnProcessNotify, TRUE);
 
+		// A failed DriverEntry does not reclaim driver-tagged pool: the queue
+		// and the symbolic link must be unwound here, not just at unload.
+		if (g_Data.Items) {
+			g_Data.Items->FreeAll<ItemFull<ItemHeader>>();
+			delete g_Data.Items;
+			g_Data.Items = nullptr;
+		}
+		UNICODE_STRING symName = RTL_CONSTANT_STRING(L"\\??\\" SECOUTFALL_NAME);
+		::IoDeleteSymbolicLink(&symName);
+
 		if (DeviceObject)
 			::IoDeleteDevice(DeviceObject);
 		return status;
@@ -141,23 +154,30 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
 	switch (stack->Parameters.DeviceIoControl.IoControlCode) {
 		case IOCTL_SECOUTFALL_GET_DATA:
 		{
-			NT_ASSERT(Irp->MdlAddress);
-
-			auto buffer = (UCHAR*)::MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority);
 			auto size = stack->Parameters.DeviceIoControl.OutputBufferLength;
+			// METHOD_OUT_DIRECT with a zero-length buffer carries no MDL — and
+			// MmGetSystemAddressForMdlSafe dereferences the MDL pointer, so the
+			// null check must come FIRST (NT_ASSERT compiles out in free
+			// builds; every IOCTL is hostile input).
+			if (size == 0 || Irp->MdlAddress == nullptr) {
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			auto buffer = (UCHAR*)::MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority);
 			if (buffer == nullptr) {
 				status = STATUS_INSUFFICIENT_RESOURCES;
 				break;
 			}
 			auto count = 0UL;
 			while (true) {
-				auto next = g_Data.Items->Peek<ItemFull<ItemHeader>>();
-				if (next == nullptr)
+				// Check-and-pop under one lock: peeking and popping separately
+				// let two concurrent drains validate one item and pop another
+				// (size from X, bytes from Y — a pool over-read and a corrupt
+				// record stream). A head that does not fit stays queued.
+				auto item = g_Data.Items->PopIfFits<ItemFull<ItemHeader>>(size - count);
+				if (item == nullptr)
 					break;
-				auto nextSize = (ULONG)next->Item.Size;
-				if (nextSize > size - count)
-					break;
-				auto item = g_Data.Items->Pop<ItemFull<ItemHeader>>();
+				auto nextSize = (ULONG)item->Item.Size;
 				::memcpy(buffer + count, &item->Item, nextSize);
 				count += nextSize;
 
@@ -247,10 +267,13 @@ void OnThreadNotify(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _In_ BOOLEAN Cr
 	g_Data.Items->Push(info);
 }
 
-NTSTATUS OnRegistryNotify(_In_ PVOID CallbackContext, _In_opt_ PVOID Argument1, _In_opt_ PVOID Argument2) {
+void OnRegistryNotify(_In_ PVOID CallbackContext, _In_opt_ PVOID Argument1, _In_opt_ PVOID Argument2) {
 	UNREFERENCED_PARAMETER(CallbackContext);
 
-	static const WCHAR machine[] = L"\\REGISTRY\\MACHINE";
+	// Counted string, not guaranteed NUL-terminated: prefix-compare instead of
+	// wcsncmp (which would read past name->Length). Registry paths are
+	// case-insensitive.
+	static const UNICODE_STRING machine = RTL_CONSTANT_STRING(L"\\REGISTRY\\MACHINE");
 
 	switch ((REG_NOTIFY_CLASS)(ULONG_PTR)Argument1) {
 		case RegNtPostSetValueKey:
@@ -261,7 +284,7 @@ NTSTATUS OnRegistryNotify(_In_ PVOID CallbackContext, _In_opt_ PVOID Argument1, 
 				break;
 
 			// filter out non-HKLM writes
-			if (::wcsncmp(name->Buffer, machine, ARRAYSIZE(machine) - 1) == 0) {
+			if (::RtlPrefixUnicodeString(&machine, name, TRUE)) {
 				auto preInfo = (REG_SET_VALUE_KEY_INFORMATION*)args->PreInformation;
 				if (preInfo && preInfo->ValueName && preInfo->Data) {
 					auto info = (ItemFull<RegistrySetValueInfo>*)::ExAllocatePool2(POOL_FLAG_PAGED,
@@ -273,14 +296,26 @@ NTSTATUS OnRegistryNotify(_In_ PVOID CallbackContext, _In_opt_ PVOID Argument1, 
 						item.Size = (short)sizeof(item);
 						item.Type = ItemType::RegistrySetValue;
 						// attacker-controlled lengths: clamp to the fixed buffers,
-						// the zeroed remainder keeps the names NUL-terminated
-						::memcpy(item.KeyName, name->Buffer, min(name->Length, sizeof(item.KeyName)));
-						::memcpy(item.ValueName, preInfo->ValueName->Buffer,
-							min(preInfo->ValueName->Length, sizeof(item.ValueName)));
+						// always leaving one WCHAR for the terminator (the zeroed
+						// remainder keeps the names NUL-terminated even at the clamp
+						// boundary), whole WCHARs only
+						auto keyBytes = (USHORT)min(name->Length,
+							sizeof(item.KeyName) - sizeof(WCHAR));
+						keyBytes &= (USHORT)~1;
+						::memcpy(item.KeyName, name->Buffer, keyBytes);
+						auto valueBytes = (USHORT)min(preInfo->ValueName->Length,
+							sizeof(item.ValueName) - sizeof(WCHAR));
+						valueBytes &= (USHORT)~1;
+						::memcpy(item.ValueName, preInfo->ValueName->Buffer, valueBytes);
 						item.DataType = preInfo->Type;
 						item.DataSize = (ULONG)preInfo->DataSize;
 						item.ProcessId = HandleToULong(PsGetCurrentProcessId());
-						::memcpy(item.Data, preInfo->Data, min(item.DataSize, sizeof(item.Data)));
+						// Bound the reported size by what was actually copied — a
+						// consumer must never read past the record on Data. (The D1
+						// wire schema replaces this with explicit truncation flags.)
+						auto dataBytes = (ULONG)min(item.DataSize, sizeof(item.Data));
+						::memcpy(item.Data, preInfo->Data, dataBytes);
+						item.DataSize = dataBytes;
 
 						g_Data.Items->Push(info);
 					}

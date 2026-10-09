@@ -41,8 +41,10 @@ impl DropFilter {
     /// Does this file path pass the filter?
     #[must_use]
     pub fn matches(&self, path: &str) -> bool {
-        let extension =
-            std::path::Path::new(path).extension().map(|ext| ext.to_string_lossy().to_lowercase());
+        // Textual extension split (host-independent) — see
+        // `domain::image_name::extension_of` for why std::path is banned on
+        // these attacker-chosen Windows-style strings.
+        let extension = crate::domain::image_name::extension_of(path).map(str::to_lowercase);
         self.rules.iter().any(|rule| match rule {
             Rule::All => true,
             Rule::Extensionless => extension.as_ref().is_none_or(String::is_empty),

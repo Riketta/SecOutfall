@@ -221,10 +221,7 @@ async fn persist_copy(inner: &Inner, source: &str, session_id: u32) -> Option<(S
         let _ = tokio::fs::remove_file(&part_path).await;
         return None;
     }
-    let extension = std::path::Path::new(source)
-        .extension()
-        .map(|ext| ext.to_string_lossy().to_string())
-        .unwrap_or_default();
+    let extension = crate::domain::image_name::extension_of(source).unwrap_or_default().to_owned();
     let copy_name = drop_copy::copy_file_name(
         session_id,
         seq,

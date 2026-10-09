@@ -37,7 +37,12 @@ impl FakeShellAssociation {
 }
 
 fn extension_of(document: &str) -> Option<String> {
-    let extension = std::path::Path::new(document).extension()?.to_str()?;
+    // Same contract as the registry adapter (host-independent textual split,
+    // lowercased, leading dot, empty extension = extensionless = no match).
+    let extension = crate::domain::image_name::extension_of(document)?;
+    if extension.is_empty() {
+        return None;
+    }
     Some(format!(".{}", extension.to_lowercase()))
 }
 

@@ -136,8 +136,7 @@ impl TargetLauncherPlugin {
     async fn resolve_spec(deps: &TargetLauncherDeps) -> Result<LaunchSpec, String> {
         let target = &deps.config.target.path;
         let config_args = deps.config.target.args.clone();
-        let is_exe = std::path::Path::new(target)
-            .extension()
+        let is_exe = crate::domain::image_name::extension_of(target)
             .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
 
         if is_exe {

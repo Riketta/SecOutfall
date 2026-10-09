@@ -45,6 +45,20 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+      # The fuzz targets are Linux+nightly only (libFuzzer); these short
+      # batches are the CI-visible twin of the host proptests in
+      # `crates/protocol/tests/prop_wire.rs` — same call sites, hostile input.
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz (short batches)
+        working-directory: fuzz
+        timeout-minutes: 15
+        run: |
+          for target in parse_frame parse_config decode_screenshot_payload; do
+            cargo +nightly fuzz run "$target" -- -max_total_time=60
+          done
+
       - name: Deny (licenses / advisories / bans)
         uses: EmbarkStudios/cargo-deny-action@v2
 
