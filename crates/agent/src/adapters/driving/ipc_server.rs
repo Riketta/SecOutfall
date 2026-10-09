@@ -41,6 +41,7 @@ use protocol::{
         FrameError,
         FrameHeader,
         HEADER_LEN,
+        MAX_PAYLOAD_LEN,
         message_type,
         messages::{
             ErrorFrame,
@@ -95,6 +96,19 @@ pub const DEFAULT_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)";
 /// [`IpcServerAdapter::with_handshake_timeout`].
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Pre-handshake payload cap. Until the nonce is proven, the only legal
+/// frames are tiny (HELLO JSON / `GET_CONFIG`): anything declaring more is
+/// refused WITHOUT reading the body — an unverified client (the pipe DACL
+/// admits the console user, i.e. the detonated malware) must never cause an
+/// attacker-chosen allocation.
+const PRE_HANDSHAKE_MAX_PAYLOAD: usize = 4096;
+
+/// Default cap on concurrent client connections. Each connection parks up to
+/// [`HANDSHAKE_TIMEOUT`] before eviction; unbounded stacking would be a
+/// memory-amplification lever against the session-0 agent. Bounded instances
+/// are doctrine. Tests override it via [`IpcServerAdapter::with_max_clients`].
+const MAX_CONCURRENT_CLIENTS: usize = 16;
+
 /// IPC server failures.
 #[derive(Debug, thiserror::Error)]
 pub enum IpcServerError {
@@ -128,6 +142,8 @@ pub struct IpcServerAdapter {
     expected_client_pid: Arc<AtomicU32>,
     /// Pre-handshake silence budget; see [`HANDSHAKE_TIMEOUT`].
     handshake_timeout: Duration,
+    /// Concurrent-connection cap (see [`MAX_CONCURRENT_CLIENTS`]).
+    clients: Arc<tokio::sync::Semaphore>,
     cancel: CancellationToken,
 }
 
@@ -172,8 +188,17 @@ impl IpcServerAdapter {
             wire: None,
             expected_client_pid: Arc::new(AtomicU32::new(0)),
             handshake_timeout: HANDSHAKE_TIMEOUT,
+            clients: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CLIENTS)),
             cancel: CancellationToken::new(),
         }
+    }
+
+    /// Cap concurrent client connections (tests). Production default is
+    /// [`MAX_CONCURRENT_CLIENTS`].
+    #[must_use]
+    pub fn with_max_clients(mut self, max: usize) -> Self {
+        self.clients = Arc::new(tokio::sync::Semaphore::new(max));
+        self
     }
 
     /// Override the pipe name (tests); production uses the fixed IPC v1 name.
@@ -263,6 +288,16 @@ impl IpcServerAdapter {
                 break;
             }
 
+            // Bounded instances: a hostile console user must not stack
+            // unverified connections (each parks up to the handshake
+            // deadline). Surplus clients are dropped immediately; the permit
+            // lives for the whole serve task and frees on disconnect.
+            let Ok(permit) = self.clients.clone().try_acquire_owned() else {
+                tracing::warn!("client cap reached; dropping the new connection");
+                drop(server);
+                continue;
+            };
+
             // The serve task owns the connection; the accept loop immediately
             // creates the next listening instance. Served tasks end on cancel
             // (every read selects on the token).
@@ -270,6 +305,7 @@ impl IpcServerAdapter {
             let cancel = self.cancel.clone();
             let inlet = Arc::clone(&inlet);
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(error) = session.serve(server, cancel, inlet).await {
                     tracing::warn!(%error, "user-actor IPC connection ended with error");
                 }
@@ -380,7 +416,7 @@ impl ClientSession {
         let deadline = tokio::time::Instant::now() + self.handshake_timeout;
         loop {
             let received = if handshaked.is_none() {
-                let read = read_frame_or_disconnect(server, cancel);
+                let read = read_frame_or_disconnect(server, cancel, PRE_HANDSHAKE_MAX_PAYLOAD);
                 match tokio::time::timeout_at(deadline, read).await {
                     Ok(received) => received?,
                     Err(_elapsed) => {
@@ -398,7 +434,7 @@ impl ClientSession {
                     }
                 }
             } else {
-                read_frame_or_disconnect(server, cancel).await?
+                read_frame_or_disconnect(server, cancel, MAX_PAYLOAD_LEN).await?
             };
             let Some((frame, payload)) = received else {
                 return Ok(()); // clean disconnect or shutdown
@@ -509,12 +545,21 @@ async fn read_exact_or_disconnect(
 async fn read_frame_or_disconnect(
     server: &mut NamedPipeServer,
     cancel: &CancellationToken,
+    payload_cap: usize,
 ) -> Result<Option<(FrameHeader, Vec<u8>)>, IpcServerError> {
     let mut header = [0_u8; HEADER_LEN];
     if read_exact_or_disconnect(server, &mut header, cancel).await? {
         return Ok(None);
     }
     let frame = FrameHeader::from_bytes(&header)?;
+    // Refuse BEFORE allocating: the cap keeps a pre-handshake peer from
+    // allocating attacker-chosen buffers through the header alone.
+    if usize::try_from(frame.payload_len).is_ok_and(|len| len > payload_cap) {
+        return Err(io_plain(format!(
+            "declared payload of {} bytes exceeds the {payload_cap}-byte cap",
+            frame.payload_len
+        )));
+    }
     let mut payload = vec![0_u8; frame.payload_len as usize];
     if read_exact_or_disconnect(server, &mut payload, cancel).await? {
         return Ok(None);

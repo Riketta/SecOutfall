@@ -20,14 +20,17 @@
 //! - The periodic persist tick (`PersistTick`) keeps the scope DB fresh so a
 //!   VM power loss cannot erase the whole study.
 
-use std::sync::{
-    Arc,
-    atomic::{
-        AtomicBool,
-        AtomicU32,
-        AtomicU64,
-        Ordering,
+use std::{
+    sync::{
+        Arc,
+        atomic::{
+            AtomicBool,
+            AtomicU32,
+            AtomicU64,
+            Ordering,
+        },
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -113,6 +116,9 @@ pub struct SessionManagerDeps {
     pub autoshutdown: bool,
     /// Time manipulation policy (fake start timestamp, finalize offset).
     pub time: TimeConfig,
+    /// Legacy `shutdown_delay_secs`: pause before the reboot/shutdown
+    /// REQUEST publishes, so the final reports drain to the wire first.
+    pub shutdown_delay_secs: u32,
     /// Debug gate for all clock manipulation.
     pub skip_time_manipulation: bool,
     /// Debug gate for the finalize reboot/shutdown REQUEST (the agent only
@@ -162,6 +168,7 @@ impl SessionManagerPlugin {
             shifter: &self.deps.shifter,
             killer: &self.deps.killer,
             time: &self.deps.time,
+            shutdown_delay_secs: self.deps.shutdown_delay_secs,
             skip_time_manipulation: self.deps.skip_time_manipulation,
             skip_reboot_and_shutdown: self.deps.skip_reboot_and_shutdown,
             finalize_done: &self.deps.finalize_done,
@@ -226,6 +233,7 @@ struct FinalizeCtx<'a> {
     shifter: &'a Arc<dyn ClockShiftPort>,
     killer: &'a Arc<dyn ProcessKillerPort>,
     time: &'a TimeConfig,
+    shutdown_delay_secs: u32,
     skip_time_manipulation: bool,
     skip_reboot_and_shutdown: bool,
     finalize_done: &'a AtomicBool,
@@ -245,6 +253,7 @@ async fn finalize_session(ctx: &FinalizeCtx<'_>, reason: FinalizeReason) {
         shifter,
         killer,
         time,
+        shutdown_delay_secs,
         skip_time_manipulation,
         skip_reboot_and_shutdown,
         finalize_done,
@@ -340,6 +349,7 @@ async fn finalize_session(ctx: &FinalizeCtx<'_>, reason: FinalizeReason) {
         &emit,
         uptimes,
         session_count,
+        Duration::from_secs(u64::from(*shutdown_delay_secs)),
         *skip_reboot_and_shutdown,
         reason,
     )
@@ -360,12 +370,18 @@ async fn request_reboot_or_shutdown(
     emit: &impl Fn(EventType, Payload) -> Envelope<Payload>,
     uptimes: &[u64],
     session_count: usize,
+    delay: Duration,
     skip_reboot_and_shutdown: bool,
     reason: FinalizeReason,
 ) {
     if skip_reboot_and_shutdown {
         tracing::info!("reboot/shutdown request suppressed (debug gate)");
         return;
+    }
+    // Legacy `shutdown_delay_secs`: let the final reports drain to the wire
+    // (NATS, GlitchTip) before the request that makes the VM bounce.
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
     }
     let shutdown = !uptimes.is_empty() && session_count >= uptimes.len();
     let reason_text = format!("{reason:?}").to_lowercase();
@@ -557,6 +573,7 @@ impl PluginPort for SessionManagerPlugin {
         let killer = Arc::clone(&self.deps.killer);
         let processes_to_terminate = Arc::clone(&self.deps.processes_to_terminate);
         let time = self.deps.time;
+        let shutdown_delay_secs = self.deps.shutdown_delay_secs;
         let skip_time_manipulation = self.deps.skip_time_manipulation;
         let skip_reboot_and_shutdown = self.deps.skip_reboot_and_shutdown;
         let finalize_done = Arc::clone(&self.deps.finalize_done);
@@ -582,6 +599,7 @@ impl PluginPort for SessionManagerPlugin {
                                     shifter: &shifter,
                                     killer: &killer,
                                     time: &time,
+                                    shutdown_delay_secs,
                                     skip_time_manipulation,
                                     skip_reboot_and_shutdown,
                                     finalize_done: &finalize_done,

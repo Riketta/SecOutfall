@@ -67,6 +67,7 @@ fn base_config(drops_dir: &std::path::Path, limit_per_session: u32) -> AgentConf
     config.drops.extensions = vec![".txt".to_owned()];
     config.drops.path = drops_dir.display().to_string();
     config.drops.limit_per_session = limit_per_session;
+    config.platform.shutdown_delay_secs = 0;
     config
 }
 

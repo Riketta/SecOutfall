@@ -85,6 +85,7 @@ fn base_config() -> AgentConfig {
     let mut config = AgentConfig::default();
     config.target.path = "C:\\Targets\\evil.exe".into();
     config.target.every_session = false;
+    config.platform.shutdown_delay_secs = 0;
     config
 }
 

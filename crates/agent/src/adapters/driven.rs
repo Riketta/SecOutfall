@@ -6,6 +6,8 @@ pub mod clock;
 pub mod config_toml;
 pub mod killer;
 pub mod launcher;
+#[cfg(windows)]
+pub mod privileges;
 pub mod scope_store;
 pub mod shell_association;
 pub mod upload;

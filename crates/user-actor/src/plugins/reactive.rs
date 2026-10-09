@@ -47,16 +47,61 @@ fn press_allowed(
     last_press.is_none_or(|last| now.duration_since(last) >= min_interval)
 }
 
+/// The bus consumer: presses Enter on enabled foreground changes until the
+/// bus closes; lag skips events (loss counted, never a crash). The storm
+/// gate is task-local state — the consumer is the single task, so a plain
+/// local is the whole guard.
+async fn consume_bus_events(
+    bus: InMemoryEventBus<ActorBusEvent>,
+    input: std::sync::Arc<dyn InputSynthesisPort>,
+    runtime: SharedRuntime,
+    hold: Duration,
+) {
+    let mut receiver = bus.subscribe();
+    let mut last_press: Option<std::time::Instant> = None;
+    loop {
+        match receiver.recv().await {
+            Ok(ActorBusEvent::ForegroundChanged { .. }) => {
+                let Some(config) = runtime.lock().config.clone() else { continue };
+                if !config.reactive {
+                    continue;
+                }
+                // Storm gate BEFORE synthesizing: at most one press per
+                // window, whatever the foreground flicker rate.
+                let now = std::time::Instant::now();
+                if !press_allowed(last_press, now, PRESS_MIN_INTERVAL) {
+                    tracing::debug!("reactive press skipped: storm gate");
+                    continue;
+                }
+                last_press = Some(now);
+                if let Err(error) = input.press_enter(hold).await {
+                    tracing::warn!(%error, "reactive Enter press failed");
+                } else {
+                    tracing::debug!(
+                        hold_ms = u64::try_from(hold.as_millis()).unwrap_or(u64::MAX),
+                        "reactive Enter"
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                tracing::warn!(missed, "reactive plugin lagged; events skipped");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
 /// Reactive input plugin (bus subscriber, not pipeline middleware).
 pub struct ReactivePlugin {
     bus: InMemoryEventBus<ActorBusEvent>,
     input: std::sync::Arc<dyn InputSynthesisPort>,
     runtime: SharedRuntime,
     hold: Duration,
-    /// Instant of the last accepted press (storm gate). The run loop is a
-    /// single task; the guard is taken only around a check-and-set, never
-    /// across the `press_enter` await.
-    last_press: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// The consumer task spawned at [`PluginPort::start`] — the plugin is
+    /// inert without it (the historical bug: only tests ever spawned the
+    /// loop).
+    consumer: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ReactivePlugin {
@@ -67,62 +112,18 @@ impl ReactivePlugin {
         input: std::sync::Arc<dyn InputSynthesisPort>,
         runtime: SharedRuntime,
     ) -> Self {
-        Self { bus, input, runtime, hold: ENTER_HOLD, last_press: parking_lot::Mutex::new(None) }
+        Self { bus, input, runtime, hold: ENTER_HOLD, consumer: parking_lot::Mutex::new(None) }
     }
 
     /// Assemble with an explicit hold duration (tests).
     #[must_use]
-    pub const fn with_hold(
+    pub fn with_hold(
         bus: InMemoryEventBus<ActorBusEvent>,
         input: std::sync::Arc<dyn InputSynthesisPort>,
         runtime: SharedRuntime,
         hold: Duration,
     ) -> Self {
-        Self { bus, input, runtime, hold, last_press: parking_lot::Mutex::new(None) }
-    }
-
-    /// Consume bus events until the bus closes; lag skips events (loss
-    /// counted, never a crash).
-    pub async fn run(self: std::sync::Arc<Self>) {
-        let mut rx = self.bus.subscribe();
-        loop {
-            match rx.recv().await {
-                Ok(ActorBusEvent::ForegroundChanged { .. }) => {
-                    let Some(config) = self.runtime.lock().config.clone() else { continue };
-                    if !config.reactive {
-                        continue;
-                    }
-                    // Storm gate BEFORE synthesizing: at most one press per
-                    // window, whatever the foreground flicker rate.
-                    let allowed = {
-                        let mut last = self.last_press.lock();
-                        let allowed =
-                            press_allowed(*last, std::time::Instant::now(), PRESS_MIN_INTERVAL);
-                        if allowed {
-                            *last = Some(std::time::Instant::now());
-                        }
-                        allowed
-                    };
-                    if !allowed {
-                        tracing::debug!("reactive press skipped: storm gate");
-                        continue;
-                    }
-                    if let Err(error) = self.input.press_enter(self.hold).await {
-                        tracing::warn!(%error, "reactive Enter press failed");
-                    } else {
-                        tracing::debug!(
-                            hold_ms = u64::try_from(self.hold.as_millis()).unwrap_or(u64::MAX),
-                            "reactive Enter"
-                        );
-                    }
-                }
-                Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
-                    tracing::warn!(missed, "reactive plugin lagged; events skipped");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-            }
-        }
+        Self { bus, input, runtime, hold, consumer: parking_lot::Mutex::new(None) }
     }
 }
 
@@ -130,6 +131,27 @@ impl ReactivePlugin {
 impl PluginPort for ReactivePlugin {
     fn name(&self) -> &'static str {
         "reactive"
+    }
+
+    /// Spawns the bus consumer. The loop ends by itself when the bus closes
+    /// (kernel shutdown drops it); `stop` aborts it explicitly so shutdown
+    /// never depends on drop timing.
+    async fn start(&self) -> Result<(), kernel::models::PluginError> {
+        let handle = tokio::spawn(consume_bus_events(
+            self.bus.clone(),
+            std::sync::Arc::clone(&self.input),
+            self.runtime.clone(),
+            self.hold,
+        ));
+        *self.consumer.lock() = Some(handle);
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<(), kernel::models::PluginError> {
+        if let Some(handle) = self.consumer.lock().take() {
+            handle.abort();
+        }
+        Ok(())
     }
 }
 

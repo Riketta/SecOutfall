@@ -71,6 +71,9 @@ fn base_config(uptimes: Vec<u64>, autoshutdown: bool) -> AgentConfig {
     config.study.autoshutdown = autoshutdown;
     config.target.every_session = true;
     config.drops.extensions = vec![".txt".to_owned()];
+    // 24 finalizes must not pay the legacy drain delay in real time; the
+    // delay itself is proven separately (finalize_completion, paused time).
+    config.platform.shutdown_delay_secs = 0;
     config
 }
 

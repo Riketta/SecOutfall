@@ -242,8 +242,17 @@ impl ScopeTracker {
 
     /// Apply a `file.closed`/`file.cleaned_up`. Returns the path when it was an
     /// observed drop getting its close reported (reported once per path).
+    ///
+    /// The CLOSER must be a live scoped process: an unrelated process closing
+    /// a handle to an observed path (Defender scan, search indexer) must not
+    /// trigger a premature capture of a still-open, partial artifact — and
+    /// must not burn the one-shot close either, so the real writer's close
+    /// stays eligible. Same live-scope rule as the write side.
     pub fn drop_closed(&mut self, state: &ScopeState, data: &FileReleasedData) -> Option<String> {
         let path = data.file_name.as_ref()?;
+        if !self.is_scoped(state, data.pid) {
+            return None;
+        }
         let observed =
             state.current_session().is_some_and(|session| session.observed_drops.contains(path));
         if !observed {
@@ -438,5 +447,53 @@ mod tests {
         );
         assert_eq!(tracker.drop_closed(&state, &release("C:\\a.exe")), None);
         assert_eq!(tracker.drop_closed(&state, &release("C:\\never-seen.txt")), None);
+    }
+
+    #[test]
+    fn drop_close_requires_a_live_scoped_closer() {
+        let mut state = state();
+        let mut tracker = ScopeTracker::default();
+        tracker.open_session(&mut state, 0, None);
+        tracker.expect("evil.exe");
+        assert!(tracker.entered(&mut state, 100, "evil.exe", 1));
+        let filter = DropFilter::new(&["*".to_owned()]);
+        assert!(tracker.drop_observed(&mut state, &written(100, "C:\\a.exe"), &filter).is_some());
+
+        // An unrelated process (Defender, indexer) closing the observed path
+        // is ignored — AND does not consume the one-shot close.
+        let foreign = |name: &str| FileReleasedData {
+            pid: 900,
+            file_object: Some(9),
+            file_key: Some(9),
+            file_name: Some(name.to_owned()),
+        };
+        assert_eq!(tracker.drop_closed(&state, &foreign("C:\\a.exe")), None);
+
+        // The scoped writer's own close still fires, exactly once.
+        let release = |name: &str| FileReleasedData {
+            pid: 100,
+            file_object: Some(1),
+            file_key: Some(2),
+            file_name: Some(name.to_owned()),
+        };
+        assert_eq!(
+            tracker.drop_closed(&state, &release("C:\\a.exe")),
+            Some("C:\\a.exe".to_owned())
+        );
+        assert_eq!(tracker.drop_closed(&state, &release("C:\\a.exe")), None);
+
+        // A scoped process that has EXITED is no longer live: its late close
+        // is not attributed (tier-3 pid-recycling semantics, same as writes).
+        // Second live scoped process, so the write itself is still observed.
+        assert!(tracker.entered(&mut state, 101, "evil.exe", 3));
+        assert!(tracker.drop_observed(&mut state, &written(101, "C:\\b.exe"), &filter).is_some());
+        assert!(tracker.exited(&mut state, 101, "evil.exe", 4));
+        let release_101 = |name: &str| FileReleasedData {
+            pid: 101,
+            file_object: Some(3),
+            file_key: Some(4),
+            file_name: Some(name.to_owned()),
+        };
+        assert_eq!(tracker.drop_closed(&state, &release_101("C:\\b.exe")), None);
     }
 }

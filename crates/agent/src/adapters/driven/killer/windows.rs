@@ -47,7 +47,11 @@ impl WindowsProcessKiller {
 }
 
 fn normalize(image: &str) -> String {
-    image.strip_suffix(".exe").unwrap_or(image).to_lowercase()
+    // Lowercase FIRST, then strip: the on-disk casing is preserved by the
+    // toolhelp snapshot ("WINWORD.EXE"), and stripping ".exe" case-sensitively
+    // before lowering turned every mixed-case extension into a mismatch.
+    let lowered = image.to_lowercase();
+    lowered.strip_suffix(".exe").unwrap_or(&lowered).to_owned()
 }
 
 /// All running pids + image names, one snapshot.
@@ -114,5 +118,27 @@ impl ProcessKillerPort for WindowsProcessKiller {
         // The snapshot walk is blocking and cheap; keep it off the executor.
         let names = image_names.to_vec();
         tokio::task::spawn_blocking(move || sweep(&names)).await?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize;
+
+    /// Toolhelp preserves on-disk case; the default kill list uses bare
+    /// names ("WINWORD"). Strip must be case-insensitive or the finalize
+    /// sweep silently matches nothing.
+    #[test]
+    fn normalize_is_case_insensitive_and_exe_tolerant() {
+        assert_eq!(normalize("WINWORD.EXE"), "winword");
+        assert_eq!(normalize("winword.exe"), "winword");
+        assert_eq!(normalize("WinWord"), "winword");
+        assert_eq!(normalize("POWERPNT"), "powerpnt");
+        assert_eq!(normalize("powershell.EXE"), "powershell");
+        assert_eq!(normalize("explorer.exe"), "explorer");
+        assert_eq!(normalize(""), "");
+        // ".exe" alone collapses to the empty stem — still a valid comparison
+        // key, and no panic.
+        assert_eq!(normalize(".EXE"), "");
     }
 }

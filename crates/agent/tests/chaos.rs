@@ -109,6 +109,7 @@ fn base_config(drops_dir: &std::path::Path) -> AgentConfig {
     config.target.every_session = false;
     config.drops.extensions = vec![".txt".to_owned()];
     config.drops.path = drops_dir.display().to_string();
+    config.platform.shutdown_delay_secs = 0;
     config
 }
 

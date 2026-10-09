@@ -110,6 +110,11 @@ fn launch_blocking(spec: &LaunchSpec) -> Result<LaunchOutcome, LaunchError> {
 
     // SAFETY: no preconditions — returns the current console session id.
     let session_id = unsafe { WTSGetActiveConsoleSessionId() };
+    // SeTcbPrivilege gates WTSQueryUserToken; LocalSystem holds it
+    // present-but-disabled — enable it or the query always fails.
+    if !crate::adapters::driven::privileges::enable("SeTcbPrivilege") {
+        tracing::warn!("SeTcbPrivilege could not be enabled; WTSQueryUserToken will likely fail");
+    }
     let mut token = HANDLE::default();
     // SAFETY: `token` is a valid, initialized output handle; `session_id` is
     // an arbitrary session id, which the API accepts from privileged callers.
@@ -142,6 +147,18 @@ fn launch_blocking(spec: &LaunchSpec) -> Result<LaunchOutcome, LaunchError> {
     // SAFETY: `token` is owned and closed exactly once here.
     let _ = unsafe { CloseHandle(token) };
     duplicated.map_err(|error| LaunchError::Token(error.to_string()))?;
+
+    // CreateProcessAsUserW needs both assignment privileges enabled on the
+    // caller's token; LocalSystem holds them present-but-disabled.
+    let assign = crate::adapters::driven::privileges::enable("SeAssignPrimaryTokenPrivilege");
+    let quota = crate::adapters::driven::privileges::enable("SeIncreaseQuotaPrivilege");
+    if !assign || !quota {
+        tracing::warn!(
+            assign,
+            quota,
+            "primary-token privileges could not be enabled; CreateProcessAsUserW will likely fail"
+        );
+    }
 
     // The command line is ONE space-joined, NUL-terminated string — the
     // child's parser reads `lpCommandLine` up to the first NUL, so every

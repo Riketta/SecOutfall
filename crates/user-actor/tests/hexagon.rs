@@ -42,7 +42,6 @@ use user_actor::{
         ActorEvent,
         SharedRuntime,
     },
-    plugins::reactive::ReactivePlugin,
 };
 
 fn welcome(config: UserActorConfig) -> Welcome {
@@ -198,14 +197,11 @@ async fn capture_failure_does_not_consume_quota() {
 
 #[tokio::test]
 async fn reactive_presses_enter_only_when_enabled() {
+    // The assembled kernel's own reactive plugin runs (spawned at boot):
+    // a regression that left it unspawned made reactive input dead in every
+    // production run while tests that hand-spawned the loop kept passing.
     // Disabled: focus changes produce no presses.
     let harness = boot(config(false, false, 1)).await;
-    let reactive = Arc::new(ReactivePlugin::new(
-        harness.bus.clone(),
-        Arc::clone(&harness.input) as Arc<dyn user_actor::ports::driven::InputSynthesisPort>,
-        Arc::clone(&harness.runtime),
-    ));
-    let runner = tokio::spawn(reactive.clone().run());
     harness.kernel.accept(focus(5, "dialog")).await;
     drain().await;
     assert!(harness.input.holds().is_empty(), "reactive off must not press");
@@ -220,7 +216,6 @@ async fn reactive_presses_enter_only_when_enabled() {
     drain().await;
     assert_eq!(harness.input.holds(), vec![300]);
     harness.kernel.shutdown().await;
-    runner.abort();
 }
 
 #[tokio::test]

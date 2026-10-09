@@ -178,6 +178,7 @@ pub fn assemble(deps: AgentDeps) -> AgentKernel {
         uptimes: Arc::new(deps.config.study.uptimes.clone()),
         autoshutdown: deps.config.study.autoshutdown,
         time: deps.config.time,
+        shutdown_delay_secs: deps.config.platform.shutdown_delay_secs,
         skip_time_manipulation: deps.config.debug.skip_time_manipulation,
         skip_reboot_and_shutdown: deps.config.debug.skip_reboot_and_shutdown,
         finalize_done: Arc::clone(&deps.finalize_done),

@@ -90,6 +90,7 @@ async fn finalize_survives_host_teardown() -> Result<(), Box<dyn std::error::Err
     let mut config = AgentConfig::default();
     config.target.path = "C:\\Targets\\evil.exe".into();
     config.study.uptimes = vec![1]; // deadline fires 1 simulated second in
+    config.platform.shutdown_delay_secs = 0;
 
     let clock = Arc::new(FakeClock::new(1_465_182_366_000));
     let broker = Arc::new(FakeBroker::default());
@@ -155,6 +156,71 @@ async fn finalize_survives_host_teardown() -> Result<(), Box<dyn std::error::Err
             .iter()
             .any(|envelope| envelope.event_type == EventType::SessionEnded),
         "session.ended must be published by the completed finalize"
+    );
+
+    let _ = std::fs::remove_file(&scope_path);
+    Ok(())
+}
+
+/// A nonzero `platform.shutdown_delay_secs` must not wedge the finalize: the
+/// request still publishes after the (auto-advanced, paused-time) delay — the
+/// legacy drain window between the final reports and the reboot REQUEST.
+#[tokio::test(start_paused = true)]
+async fn shutdown_delay_elapses_before_the_request_publishes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let scope_path = std::env::temp_dir().join(format!(
+        "secoutfall-finalize-delay-{}-{}.json",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut config = AgentConfig::default();
+    config.target.path = "C:\\Targets\\evil.exe".into();
+    config.study.uptimes = vec![1];
+    config.platform.shutdown_delay_secs = 3600; // absurd — paused time advances it
+    let delay_secs = config.platform.shutdown_delay_secs;
+
+    let clock = Arc::new(FakeClock::new(1_465_182_366_000));
+    let broker = Arc::new(FakeBroker::default());
+    let deps = SessionDeps {
+        config: Arc::new(config),
+        scope_repo: Arc::new(JsonScopeRepository::new(&scope_path)) as Arc<dyn ScopeRepository>,
+        broker: Arc::clone(&broker) as Arc<dyn agent::ports::driven::broker::BrokerPort>,
+        clock: Arc::clone(&clock) as Arc<dyn SystemClockPort>,
+        uploader: Arc::new(FakeUploader::default())
+            as Arc<dyn agent::ports::driven::uploader::FileUploadPort>,
+        launcher: Arc::new(FakeLauncher::default())
+            as Arc<dyn agent::ports::driven::process_launcher::ProcessLauncherPort>,
+        shell: Arc::new(FakeShellAssociation::new())
+            as Arc<dyn agent::ports::driven::shell_association::ShellAssociationPort>,
+        killer: Arc::new(agent::adapters::driven::killer::fake::FakeProcessKiller::default())
+            as Arc<dyn agent::ports::driven::process_killer::ProcessKillerPort>,
+        shifter: Arc::clone(&clock) as Arc<dyn ClockShiftPort>,
+        statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
+        user_actor_nonce: "finalize-delay-nonce".to_owned(),
+        seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        user_actor_pid_gate: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        finalize_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+
+    let (session, _stop_tx, stop_rx) = RunningSession::start(deps).await?;
+    // The outer timeout shares the paused clock, so it must exceed the delay
+    // itself; auto-advance burns the whole virtual timeline instantly in real
+    // time — that is exactly the no-wedge property under test.
+    let result = tokio::time::timeout(
+        Duration::from_secs(u64::from(delay_secs) * 2 + 600),
+        session.run_until_stop(stop_rx),
+    )
+    .await;
+    result.expect("the delay must not wedge the finalize (paused time advances it)")?;
+
+    // The tail still fires: the (shutdown — the planned table is exhausted)
+    // REQUEST reached the control channel after the delay.
+    assert!(
+        broker
+            .of_channel(Channel::Control)
+            .iter()
+            .any(|envelope| envelope.event_type == EventType::StudyShutdownRequested),
+        "the delayed shutdown request must still publish"
     );
 
     let _ = std::fs::remove_file(&scope_path);

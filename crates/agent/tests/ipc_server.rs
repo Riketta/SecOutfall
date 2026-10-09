@@ -266,6 +266,123 @@ async fn ipc_server_handshake_config_and_screenshots() {
     assert_eq!(seq.load(Ordering::SeqCst), 0, "receiving frames must not consume wire-seq numbers");
 }
 
+/// Pre-handshake, the server must refuse a frame whose declared payload
+/// exceeds the small unverified cap WITHOUT reading the body: the client
+/// sends only the header, and the server must disconnect (with the cap, the
+/// body never arrives, so a server that tried to read it would hang until
+/// this test times out).
+#[tokio::test]
+async fn pre_handshake_oversize_payload_is_refused_without_reading_the_body() {
+    let repo = Arc::new(InMemoryScopeRepository::default());
+    let state: SharedScopeState =
+        agent::app::builder::load_scope_state(repo.as_ref()).await.unwrap();
+    let pipe = test_pipe("oversize");
+    let adapter = Arc::new(
+        IpcServerAdapter::with_sddl(
+            state,
+            Arc::new(UserActorConfig::default()),
+            "oversize-nonce".to_owned(),
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)".to_owned(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .with_pipe_name(pipe.clone())
+        .with_handshake_timeout(Duration::from_millis(500)),
+    );
+    let run_handle = {
+        let adapter = Arc::clone(&adapter);
+        let inlet: Arc<dyn EventInletPort<SandboxEvent>> = Arc::new(RecordingInlet::default());
+        tokio::spawn(async move { adapter.run(inlet).await })
+    };
+
+    let mut client = TestClient::open(&pipe).await.unwrap();
+    // Header only: 1 MiB declared, body never sent.
+    let header =
+        FrameHeader { payload_len: 1024 * 1024, message_type: message_type::HELLO, flags: 0 };
+    client.0.write_all(&header.to_bytes()).await.unwrap();
+    client.0.flush().await.unwrap();
+    client.expect_disconnect().await;
+
+    adapter.stop();
+    let result = tokio::time::timeout(Duration::from_secs(5), run_handle).await;
+    assert!(result.is_ok(), "server task must end after stop");
+}
+
+/// Concurrent unverified connections are capped: each one parks up to the
+/// handshake deadline, and unbounded stacking would be memory amplification
+/// against the session-0 agent (the DACL admits the console user).
+#[tokio::test]
+async fn client_cap_drops_surplus_connections() {
+    let repo = Arc::new(InMemoryScopeRepository::default());
+    let state: SharedScopeState =
+        agent::app::builder::load_scope_state(repo.as_ref()).await.unwrap();
+    let pipe = test_pipe("cap");
+    let adapter = Arc::new(
+        IpcServerAdapter::with_sddl(
+            state,
+            Arc::new(UserActorConfig::default()),
+            "cap-nonce".to_owned(),
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)".to_owned(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .with_pipe_name(pipe.clone())
+        .with_max_clients(2)
+        .with_handshake_timeout(Duration::from_millis(500)),
+    );
+    let run_handle = {
+        let adapter = Arc::clone(&adapter);
+        let inlet: Arc<dyn EventInletPort<SandboxEvent>> = Arc::new(RecordingInlet::default());
+        tokio::spawn(async move { adapter.run(inlet).await })
+    };
+
+    // Two slots taken by silent clients; the third is dropped on connect.
+    let first = TestClient::open(&pipe).await.unwrap();
+    let second = TestClient::open(&pipe).await.unwrap();
+    let mut third = TestClient::open(&pipe).await.unwrap();
+    third.expect_disconnect().await;
+
+    // The cap is per-connection, not a leak: the silent clients are evicted
+    // at their handshake deadline (500 ms here), which frees the slots — a
+    // new client then completes a full handshake. Retry across the eviction
+    // window; bounded.
+    let mut welcomed = false;
+    for _ in 0..50 {
+        let Ok(mut client) = TestClient::open(&pipe).await else {
+            sleep(Duration::from_millis(20)).await;
+            continue;
+        };
+        // A connection opened before a slot freed gets dropped by the cap —
+        // the write fails with a broken pipe. Treat every failure as "still
+        // capped" and retry until the eviction frees a slot.
+        let payload = hello_payload("cap-nonce");
+        let header = FrameHeader {
+            payload_len: u32::try_from(payload.len()).unwrap(),
+            message_type: message_type::HELLO,
+            flags: 0,
+        };
+        if client.0.write_all(&header.to_bytes()).await.is_err()
+            || client.0.write_all(&payload).await.is_err()
+            || client.0.flush().await.is_err()
+        {
+            sleep(Duration::from_millis(20)).await;
+            continue;
+        }
+        match client.read_frame().await {
+            Ok((frame, _)) if frame.message_type == message_type::WELCOME => {
+                welcomed = true;
+                break;
+            }
+            _ => sleep(Duration::from_millis(20)).await, // still capped; retry
+        }
+    }
+    assert!(welcomed, "a slot must free once the silent clients are evicted");
+    drop(first);
+    drop(second);
+
+    adapter.stop();
+    let result = tokio::time::timeout(Duration::from_secs(5), run_handle).await;
+    assert!(result.is_ok(), "server task must end after stop");
+}
+
 /// A peer dying mid-frame (header sent, payload never arrives — or the
 /// reverse) must hand the server back to the accept loop unharmed: the next
 /// client gets a full handshake.

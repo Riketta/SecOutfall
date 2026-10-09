@@ -79,6 +79,14 @@ pub mod windows_shifter {
     }
 
     fn set_blocking(unix_ms: i64) -> Result<(), ClockShiftError> {
+        // LocalSystem holds the clock-set privilege present-but-disabled;
+        // without enabling it SetSystemTime fails with ERROR_PRIVILEGE_NOT_HELD
+        // and the study silently runs on real time.
+        if !crate::adapters::driven::privileges::enable("SeSystemtimePrivilege") {
+            tracing::warn!(
+                "SeSystemtimePrivilege could not be enabled; the clock set will likely fail"
+            );
+        }
         let target = split_filetime(unix_ms_to_filetime(unix_ms)?)?;
         let mut system_time = SYSTEMTIME::default();
         // SAFETY: all pointers reference initialized locals owned by this call.
