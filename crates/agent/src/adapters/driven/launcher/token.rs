@@ -35,6 +35,40 @@ fn wide_null(s: &str) -> Vec<u16> {
     std::ffi::OsStr::new(s).encode_wide().chain(Some(0)).collect()
 }
 
+/// Quote one argv element with the MSVCRT rules the child's command-line
+/// parser applies: backslash runs before a quote double up, a trailing
+/// backslash run before the closing quote doubles. Values without specials
+/// pass through unquoted. (Same rules as the user-actor's app launcher and
+/// the schedtask action line — keep the three in sync.)
+fn quote(arg: &str) -> String {
+    let needs_quotes =
+        arg.is_empty() || arg.chars().any(|ch| matches!(ch, ' ' | '\t' | '\n' | '"'));
+    if !needs_quotes {
+        return arg.to_owned();
+    }
+    let mut quoted = String::with_capacity(arg.len() + 3);
+    quoted.push('"');
+    let mut backslashes = 0_usize;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            other => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes));
+                backslashes = 0;
+                quoted.push(other);
+            }
+        }
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
 /// Blocking implementation; errors already mapped to [`LaunchError`].
 #[allow(clippy::too_many_lines)] // one FFI sequence, kept linear on purpose
 fn launch_blocking(spec: &LaunchSpec) -> Result<LaunchOutcome, LaunchError> {
@@ -109,11 +143,18 @@ fn launch_blocking(spec: &LaunchSpec) -> Result<LaunchOutcome, LaunchError> {
     let _ = unsafe { CloseHandle(token) };
     duplicated.map_err(|error| LaunchError::Token(error.to_string()))?;
 
-    // Mutable command line: "path\0arg1\0arg2\0\0" (CreateProcessAsUserW contract).
-    let mut cmdline: Vec<u16> = wide_null(&spec.path);
+    // The command line is ONE space-joined, NUL-terminated string — the
+    // child's parser reads `lpCommandLine` up to the first NUL, so every
+    // element must be present there. (The historical NUL-joined buffer — the
+    // environment-block format — silently dropped every argument after the
+    // program.) `lpApplicationName` is set, so the program itself is exact;
+    // the first command-line element is its quoting for the child's argv[0].
+    let mut cmdline_text = quote(&spec.path);
     for arg in &spec.args {
-        cmdline.extend(wide_null(arg));
+        cmdline_text.push(' ');
+        cmdline_text.push_str(&quote(arg));
     }
+    let mut cmdline = wide_null(&cmdline_text);
     cmdline.push(0);
 
     let si = STARTUPINFOW {
@@ -169,5 +210,105 @@ impl ProcessLauncherPort for TokenProcessLauncher {
         tokio::task::spawn_blocking(move || launch_blocking(&spec))
             .await
             .map_err(|error| LaunchError::Spawn(error.to_string()))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::quote;
+
+    /// Test-only MSVCRT argv splitter — the inverse of [`quote`], i.e. what
+    /// the launched child's parser sees (same helper as the app launcher's
+    /// round-trip test).
+    fn split(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut current = String::new();
+        let mut in_quotes = false;
+        let mut backslashes = 0_usize;
+        let mut started = false;
+        for ch in line.chars() {
+            match ch {
+                '\\' => backslashes += 1,
+                '"' => {
+                    current.extend(std::iter::repeat_n('\\', backslashes / 2));
+                    if backslashes % 2 == 1 {
+                        current.push('"');
+                    } else {
+                        in_quotes = !in_quotes;
+                    }
+                    backslashes = 0;
+                    started = true;
+                }
+                ' ' | '\t' if !in_quotes => {
+                    current.extend(std::iter::repeat_n('\\', backslashes));
+                    backslashes = 0;
+                    if started || !current.is_empty() {
+                        out.push(std::mem::take(&mut current));
+                    }
+                    started = false;
+                }
+                other => {
+                    current.extend(std::iter::repeat_n('\\', backslashes));
+                    backslashes = 0;
+                    current.push(other);
+                    started = true;
+                }
+            }
+        }
+        current.extend(std::iter::repeat_n('\\', backslashes));
+        if started || !current.is_empty() {
+            out.push(current);
+        }
+        out
+    }
+
+    /// Build the command line exactly like `launch_blocking` does.
+    fn build_line(path: &str, args: &[String]) -> String {
+        let mut line = quote(path);
+        for arg in args {
+            line.push(' ');
+            line.push_str(&quote(arg));
+        }
+        line
+    }
+
+    #[test]
+    fn command_line_round_trips_through_child_parser_rules() {
+        // The built command line must split back into exactly the elements
+        // meant: the historical NUL-joined buffer dropped every argument after
+        // the program (CreateProcessAsUserW reads up to the first NUL), which
+        // voided non-exe targets and starved the user actor of its nonce.
+        let cases: Vec<(String, Vec<String>)> = vec![
+            ("C:\\Tools\\secoutfall-user-actor.exe".to_owned(), vec![]),
+            (
+                // The user-actor launch: nonce args must survive.
+                "C:\\Tools\\secoutfall-user-actor.exe".to_owned(),
+                vec!["--nonce".to_owned(), "0123abcd".to_owned()],
+            ),
+            (
+                // The shell-association shape: interpreter + document + flag.
+                "C:\\Windows\\System32\\wscript.exe".to_owned(),
+                vec!["C:\\Users\\v\\sample.js".to_owned(), "-q".to_owned()],
+            ),
+            (
+                "C:\\Program Files\\App\\run as.exe".to_owned(),
+                vec![
+                    "--flag".to_owned(),
+                    "v 1".to_owned(),
+                    "a\"b".to_owned(),
+                    "C:\\dir\\".to_owned(),
+                ],
+            ),
+            ("notepad.exe".to_owned(), vec![]),
+        ];
+        for (program, args) in cases {
+            let line = build_line(&program, &args);
+            assert!(!line.contains('\0'), "embedded NUL would truncate: {line}");
+            let mut expected = vec![program];
+            expected.extend(args);
+            assert_eq!(split(&line), expected, "line: {line}");
+        }
     }
 }

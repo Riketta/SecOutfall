@@ -184,10 +184,7 @@ pub fn install(
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path,
-        launch_arguments: vec![
-            std::ffi::OsString::from("--config"),
-            config_path.as_os_str().to_owned(),
-        ],
+        launch_arguments: service_launch_arguments(config_path),
         dependencies: Vec::new(),
         account_name: None, // None = LocalSystem
         account_password: None,
@@ -265,4 +262,37 @@ fn wait_until_stopped(service: &windows_service::service::Service, deadline: Dur
 /// Match a Win32 error code carried in [`windows_service::Error::Winapi`].
 fn raw_is(error: &windows_service::Error, code: i32) -> bool {
     matches!(error, windows_service::Error::Winapi(io) if io.raw_os_error() == Some(code))
+}
+
+/// The SCM `ImagePath` arguments for the installed service. The `service`
+/// positional is load-bearing: `main` dispatches on it, and SCM hands the
+/// `ImagePath` arguments (exe path excluded) to `ServiceMain` verbatim —
+/// without it the started process falls into console mode, never calls the
+/// service dispatcher, and the SCM start times out (error 1053).
+fn service_launch_arguments(config_path: &std::path::Path) -> Vec<std::ffi::OsString> {
+    vec![
+        std::ffi::OsString::from("service"),
+        std::ffi::OsString::from("--config"),
+        config_path.as_os_str().to_owned(),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn launch_arguments_select_service_mode_and_config() {
+        let args = service_launch_arguments(std::path::Path::new("C:\\Agent.toml"));
+        assert_eq!(
+            args,
+            vec![
+                std::ffi::OsString::from("service"),
+                std::ffi::OsString::from("--config"),
+                std::ffi::OsString::from("C:\\Agent.toml"),
+            ]
+        );
+    }
 }

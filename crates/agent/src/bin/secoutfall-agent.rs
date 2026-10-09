@@ -485,11 +485,7 @@ async fn console(args: &Args) -> anyhow::Result<()> {
         let _ = ctrl_c_tx.send(SandboxEvent::ServiceStop).await;
     });
 
-    #[cfg(all(windows, feature = "etw"))]
-    attach_etw(&session).await;
-
-    #[cfg(not(all(windows, feature = "etw")))]
-    println!("ETW disabled (build with --features etw)");
+    attach_event_source(&session).await;
 
     drop(stop_tx);
     session.run_until_stop(stop_rx).await?;
@@ -582,13 +578,7 @@ async fn local(args: &Args) -> anyhow::Result<()> {
         let _ = ctrl_c_tx.send(SandboxEvent::ServiceStop).await;
     });
 
-    #[cfg(all(windows, feature = "etw"))]
-    attach_etw(&session).await;
-
-    #[cfg(not(all(windows, feature = "etw")))]
-    println!(
-        "no event source: build with --features etw and run elevated, or\n         nothing will be observed and the run will idle"
-    );
+    attach_event_source(&session).await;
 
     drop(stop_tx);
     session.run_until_stop(stop_rx).await?;
@@ -610,6 +600,26 @@ async fn attach_etw(session: &agent::app::runtime::RunningSession) {
         }
     });
     println!("ETW kernel trace attached");
+}
+
+/// Attach THE event source for this build. Shared by every host mode
+/// (console / local / service) so the wiring cannot diverge — the service is
+/// the production deployment and must observe exactly like console (the
+/// historical bug: service mode attached nothing and observed silently). The
+/// driver-track `DriverEventSourceAdapter` replaces this call site.
+#[allow(clippy::unused_async)] // signature parity across the etw feature lanes
+async fn attach_event_source(session: &agent::app::runtime::RunningSession) {
+    #[cfg(all(windows, feature = "etw"))]
+    attach_etw(session).await;
+
+    #[cfg(not(all(windows, feature = "etw")))]
+    {
+        let _ = session;
+        println!(
+            "no event source: build with --features etw (and run elevated) — \
+             nothing will be observed and the run will idle"
+        );
+    }
 }
 
 /// Attach the user-actor IPC server (feature `ipc`): per-boot nonce,
@@ -803,6 +813,7 @@ async fn run_service_body(args: Vec<std::ffi::OsString>) -> anyhow::Result<()> {
 
     let (session, stop_tx, stop_rx) = agent::app::runtime::RunningSession::start(deps).await?;
     attach_ipc(&session, &ipc_config, ipc_broker, ipc_clock, &nonce, ipc_pid_gate).await;
+    attach_event_source(&session).await;
 
     // SCM handler (sync thread) → runtime stop channel (async).
     let (scm_tx, scm_rx) = std::sync::mpsc::channel::<SandboxEvent>();
@@ -858,5 +869,16 @@ mod tests {
         assert_eq!(args.mode.as_deref(), Some("local"));
         assert_eq!(args.target.as_deref(), Some("C:\\t.exe"));
         assert_eq!(args.config_path, PathBuf::from("D:\\cfg.toml"));
+    }
+
+    /// What `ServiceMain` receives for the installed `ImagePath` (exe path
+    /// excluded): the `service` positional MUST dispatch to the service
+    /// runtime — without it the SCM-started process falls into console mode
+    /// and the SCM start times out (error 1053).
+    #[test]
+    fn scm_image_path_arguments_select_service_mode() {
+        let args = Args::parse_from(["service".into(), "--config".into(), "C:\\Agent.toml".into()]);
+        assert_eq!(args.mode.as_deref(), Some("service"));
+        assert_eq!(args.config_path, PathBuf::from("C:\\Agent.toml"));
     }
 }

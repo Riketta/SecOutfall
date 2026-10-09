@@ -85,7 +85,7 @@ pub const PIPE_NAME: &str = "\\\\.\\pipe\\secoutfall\\user-actor-v1";
 
 /// Default SDDL: protected DACL, `GENERIC_ALL` for SYSTEM and Administrators.
 /// The user-actor launcher (phase 8) builds a variant that also grants the
-/// launching interactive user (`(A;;GA;;;<user-sid>)`), because the client
+/// launching interactive user (`(A;;GA;;;user-sid)`), because the client
 /// process runs under that user's token.
 pub const DEFAULT_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)";
 
@@ -461,7 +461,10 @@ impl ClientSession {
                 message_type::SCREENSHOT => {
                     let (seq, jpeg) = decode_screenshot(&payload)?;
                     tracing::debug!(seq, bytes = jpeg.len(), "screenshot frame received");
-                    self.seq.fetch_add(1, Ordering::Relaxed);
+                    // NOTE: never touch `self.seq` here — it is the per-boot
+                    // wire-sequence counter; an increment without a published
+                    // envelope shows up as a phantom gap on the wire. Frame
+                    // counting lives in `SessionStatistics::screenshots`.
                     inlet
                         .accept(SandboxEvent::ScreenshotReceived(ScreenshotFrame {
                             seq,
@@ -804,6 +807,15 @@ pub async fn console_user_pipe_sddl() -> Option<String> {
 }
 
 /// Blocking SID resolution for [`console_user_pipe_sddl`].
+/// The pipe DACL granting generic access to one account SID string
+/// (`S-1-...`). SDDL ACEs take the BARE SID string — angle brackets are
+/// documentation meta-syntax, and `ConvertStringSecurityDescriptor-
+/// ToSecurityDescriptorW` rejects them (the historical bug made the pipe
+/// setup fail whenever a console user existed).
+fn pipe_sddl_for_account(sid: &str) -> String {
+    format!("{DEFAULT_PIPE_SDDL}(A;;GA;;;{sid})")
+}
+
 fn console_user_pipe_sddl_blocking() -> Option<String> {
     use windows::{
         Win32::{
@@ -881,5 +893,32 @@ fn console_user_pipe_sddl_blocking() -> Option<String> {
     unsafe { LocalFree(HLOCAL(sid_string.0.cast())) };
     let sid = sid?;
 
-    Some(format!("{DEFAULT_PIPE_SDDL}(A;;GA;;;<{sid}>)"))
+    Some(pipe_sddl_for_account(&sid))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    /// The generated console-user DACL must parse through the REAL Win32
+    /// converter — the production conversion path (`PipeSecurity::from_sddl`).
+    /// The historical bug appended `(A;;GA;;;<S-1-...>)`: angle brackets are
+    /// documentation meta-syntax, the conversion rejected the whole string,
+    /// and the pipe never came up whenever a console user existed. Tests that
+    /// inject hand-written SDDLs could not see it.
+    #[test]
+    fn console_user_dacl_is_valid_sddl() {
+        for sid in ["S-1-5-18", "S-1-5-21-3623811015-3361044348-30300820-1013"] {
+            let sddl = pipe_sddl_for_account(sid);
+            assert!(
+                sddl.contains(&format!("(A;;GA;;;{sid})")),
+                "ACE must carry the bare SID string: {sddl}"
+            );
+            PipeSecurity::from_sddl(&sddl).unwrap_or_else(|error| {
+                panic!("Win32 rejected generated SDDL {sddl:?}: {error:?}")
+            });
+        }
+    }
 }

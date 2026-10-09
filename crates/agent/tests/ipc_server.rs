@@ -23,10 +23,7 @@ use std::{
 
 use agent::{
     adapters::{
-        driven::{
-            clock::fake::FakeClock,
-            scope_store::memory::InMemoryScopeRepository,
-        },
+        driven::scope_store::memory::InMemoryScopeRepository,
         driving::ipc_server::IpcServerAdapter,
     },
     app::event::{
@@ -45,7 +42,6 @@ use protocol::{
         messages::{
             Hello,
             Welcome,
-            decode_screenshot,
             encode_screenshot,
         },
     },
@@ -260,14 +256,14 @@ async fn ipc_server_handshake_config_and_screenshots() {
     assert_eq!(frames.first().unwrap().seq, 7);
     assert_eq!(frames.first().unwrap().jpeg, jpeg.to_vec());
 
-    // 5. Clean shutdown: stop() ends the server task.
+    // 5. Clean shutdown: stop() ends the server task. Received frames must
+    // NOT burn wire-seq numbers: the counter is the per-boot envelope
+    // sequence — an unpaired increment per screenshot showed up as a
+    // permanent phantom gap on the Controller.
     adapter.stop();
     let result = tokio::time::timeout(Duration::from_secs(5), run_handle).await;
     assert!(result.is_ok(), "server task must end after stop");
-    assert!(seq.load(Ordering::SeqCst) >= 1, "frames are counted");
-    // decode_screenshot reference keeps the import honest on both code paths.
-    let _ = decode_screenshot(&encode_screenshot(0, &[]));
-    let _ = FakeClock::new(0);
+    assert_eq!(seq.load(Ordering::SeqCst), 0, "receiving frames must not consume wire-seq numbers");
 }
 
 /// A peer dying mid-frame (header sent, payload never arrives — or the
