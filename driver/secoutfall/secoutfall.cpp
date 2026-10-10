@@ -63,11 +63,63 @@ const FLT_OPERATION_REGISTRATION FileCallbacks[] = {
 	{ IRP_MJ_OPERATION_END }
 };
 
+// Per-stream drop state: CopyPending = armed at first write, link failed (or
+// not attempted yet) → cleanup copies final content; Linked = tombstone in
+// place; CopyDone/CopyFailed = cleanup ran.
+struct DropStreamContext {
+	volatile LONG State;
+	UNICODE_STRING StoredName;        // points into Buffer
+	WCHAR Buffer[64];                 // "drop-<8 hex><ext>" — bounded
+};
+
+constexpr LONG DROP_COPY_PENDING = 0;
+constexpr LONG DROP_LINKED = 1;
+constexpr LONG DROP_COPY_DONE = 2;
+constexpr LONG DROP_COPY_FAILED = 3;
+
+// "drop-<8 hex><ext>" — no CRT: hex loop, wide chars directly. The extension
+// (with the dot) is the path's last-dot suffix, capped by the buffer bound.
+void GenerateStoredName(_Out_ DropStreamContext* context, _In_ PCUNICODE_STRING path) {
+	auto counter = InterlockedIncrement64(&g_Data.DropCounter) & 0xFFFFFFFF;
+	USHORT i = 0;
+	for (auto c : L"drop-") {
+		if (c != L'\0' && i < 64)
+			context->Buffer[i++] = c;
+	}
+	const WCHAR hex[] = L"0123456789abcdef";
+	for (int shift = 28; shift >= 0; shift -= 4) {
+		if (i < 64)
+			context->Buffer[i++] = hex[(counter >> shift) & 0xF];
+	}
+	LONG dot = -1;
+	auto pathWchars = static_cast<LONG>(path->Length / sizeof(WCHAR));
+	for (LONG k = pathWchars - 1; k >= 0; --k) {
+		if (path->Buffer[k] == L'.') {
+			dot = k;
+			break;
+		}
+	}
+	if (dot >= 0) {
+		for (LONG k = dot; k < pathWchars && i < 64; ++k)
+			context->Buffer[i++] = path->Buffer[k];
+	}
+	context->StoredName.Buffer = context->Buffer;
+	context->StoredName.Length = static_cast<USHORT>(i * sizeof(WCHAR));
+	context->StoredName.MaximumLength = context->StoredName.Length;
+}
+
+const FLT_CONTEXT_REGISTRATION DropContextRegistration[] = {
+	// Per-stream drop state: first matching write tombstones the file, later
+	// writes and the cleanup check the same context.
+	{ FLT_STREAM_CONTEXT, 0, nullptr, sizeof(DropStreamContext), DRIVER_TAG },
+	{ FLT_CONTEXT_END }
+};
+
 const FLT_REGISTRATION FilterRegistration = {
 	sizeof(FLT_REGISTRATION),   // Size
 	FLT_REGISTRATION_VERSION,   // Version
 	0,                          // Flags
-	nullptr,                    // Context
+	DropContextRegistration,
 	FileCallbacks,
 	nullptr,                    // FilterUnload: DriverUnload calls FltUnregisterFilter
 	nullptr,                    // InstanceSetup (attachment via registry instance key)
@@ -130,6 +182,254 @@ void PushRecord(_Inout_ ItemFull<RecordHeader>* item, _In_ bool fileClass = fals
 	(fileClass ? g_Data.Files : g_Data.Items)->Push(item);
 }
 
+// Pushes a drops-class record: stop-collect on overflow — existing evidence
+// is never evicted, refusal is counted.
+void PushDropRecord(_Inout_ ItemFull<RecordHeader>* item) {
+	if (!g_Data.Drops->TryPush(item))
+		InterlockedIncrement64(&g_Data.DropsStopped);
+}
+
+// Drop-capture target directory, copied out under the lock.
+USHORT DropsDir(_Out_ WCHAR* out, _In_ USHORT capBytes) {
+	return g_Data.Target->Get(out, capBytes);
+}
+
+// Creates a hard link `storedName` inside the drops directory pointing at
+// `sourcePath` (FileLinkInformation on a directory handle). Same-volume
+// only — cross-volume returns failure and the cleanup copies instead.
+bool CreateHardLinkInDrops(_In_ PFLT_INSTANCE instance, _In_ PCUNICODE_STRING sourcePath,
+	_In_ PCUNICODE_STRING storedName) {
+// FileLinkInformation semantics: open the EXISTING (source) file, then pass
+// the NEW link's full path (drops dir + stored name) in FileName.
+	WCHAR dirBuf[MaxFilePathBytes / sizeof(WCHAR)];
+	auto dirBytes = DropsDir(dirBuf, sizeof(dirBuf));
+	if (dirBytes == 0)
+		return false;
+	USHORT dirWchars = dirBytes / sizeof(WCHAR);
+	if (dirWchars + 1 + storedName->Length / sizeof(WCHAR) > MaxFilePathBytes / sizeof(WCHAR))
+		return false;
+
+	WCHAR destBuf[MaxFilePathBytes / sizeof(WCHAR)];
+	::memcpy(destBuf, dirBuf, dirBytes);
+	destBuf[dirWchars] = L'\\';
+	::memcpy(destBuf + dirWchars + 1, storedName->Buffer, storedName->Length);
+	UNICODE_STRING dest;
+	dest.Buffer = destBuf;
+	dest.Length = static_cast<USHORT>((dirWchars + 1 + storedName->Length / sizeof(WCHAR)) * sizeof(WCHAR));
+	dest.MaximumLength = dest.Length;
+
+	OBJECT_ATTRIBUTES srcOa;
+	InitializeObjectAttributes(&srcOa, const_cast<PUNICODE_STRING>(sourcePath),
+		OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+	HANDLE srcHandle = nullptr;
+	IO_STATUS_BLOCK iosb = {};
+	auto status = ::FltCreateFileEx2(g_Data.Filter, instance, &srcHandle, nullptr,
+		FILE_READ_ATTRIBUTES | SYNCHRONIZE, &srcOa, &iosb, nullptr, FILE_ATTRIBUTE_NORMAL,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
+		FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, nullptr, 0, 0, nullptr);
+	if (!NT_SUCCESS(status))
+		return false;
+
+	auto bufferSize = sizeof(FILE_LINK_INFORMATION) + dest.Length;
+	auto link = (FILE_LINK_INFORMATION*)::ExAllocatePool2(POOL_FLAG_PAGED, bufferSize, DRIVER_TAG);
+	if (link == nullptr) {
+		::ZwClose(srcHandle);
+		InterlockedIncrement64(&g_Data.AllocFailures);
+		return false;
+	}
+	link->ReplaceIfExists = FALSE;
+	link->FileNameLength = dest.Length;
+	::memcpy(link->FileName, dest.Buffer, dest.Length);
+	status = ::ZwSetInformationFile(srcHandle, &iosb, link, static_cast<ULONG>(bufferSize), FileLinkInformation);
+	ExFreePool(link);
+	::ZwClose(srcHandle);
+	return NT_SUCCESS(status);
+}
+
+// Full-content stream copy into the drops directory (cleanup-time fallback:
+// final content, cross-volume safe). 64 KiB chunks, opened through our own
+// instance so the copies never call back into this filter.
+bool CopyFileToDrops(_In_ PFLT_INSTANCE instance, _In_ PCUNICODE_STRING sourcePath,
+	_In_ PCUNICODE_STRING storedName) {
+	WCHAR dirBuf[MaxFilePathBytes / sizeof(WCHAR)];
+	auto dirBytes = DropsDir(dirBuf, sizeof(dirBuf));
+	if (dirBytes == 0)
+		return false;
+
+	// destination full path: dir + L'\' + storedName
+	WCHAR destBuf[MaxFilePathBytes / sizeof(WCHAR)];
+	USHORT destWchars = dirBytes / sizeof(WCHAR);
+	if (destWchars + 1 + storedName->Length / sizeof(WCHAR) > MaxFilePathBytes / sizeof(WCHAR))
+		return false;
+	::memcpy(destBuf, dirBuf, dirBytes);
+	destBuf[destWchars] = L'\\';
+	::memcpy(destBuf + destWchars + 1, storedName->Buffer, storedName->Length);
+	destWchars += 1 + storedName->Length / sizeof(WCHAR);
+	UNICODE_STRING dest;
+	dest.Buffer = destBuf;
+	dest.Length = static_cast<USHORT>(destWchars * sizeof(WCHAR));
+	dest.MaximumLength = dest.Length;
+
+	OBJECT_ATTRIBUTES srcOa;
+	InitializeObjectAttributes(&srcOa, const_cast<PUNICODE_STRING>(sourcePath),
+		OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+	HANDLE srcHandle = nullptr;
+	PFILE_OBJECT srcObject = nullptr;
+	IO_STATUS_BLOCK iosb = {};
+	auto status = ::FltCreateFileEx2(g_Data.Filter, instance, &srcHandle, &srcObject,
+		FILE_GENERIC_READ, &srcOa, &iosb, nullptr, FILE_ATTRIBUTE_NORMAL,
+		FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN,
+		FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, nullptr, 0, 0, nullptr);
+	if (!NT_SUCCESS(status))
+		return false;
+
+	OBJECT_ATTRIBUTES dstOa;
+	InitializeObjectAttributes(&dstOa, &dest, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+	HANDLE dstHandle = nullptr;
+	status = ::FltCreateFileEx2(g_Data.Filter, instance, &dstHandle, nullptr,
+		FILE_GENERIC_WRITE, &dstOa, &iosb, nullptr, FILE_ATTRIBUTE_NORMAL,
+		FILE_SHARE_READ, FILE_SUPERSEDE, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+		nullptr, 0, 0, nullptr);
+	if (!NT_SUCCESS(status)) {
+		::FltClose(srcHandle);
+		if (srcObject)
+			::FltObjectDereference(srcObject);
+		return false;
+	}
+
+	auto chunk = (PUCHAR)::ExAllocatePool2(POOL_FLAG_PAGED, 65536, DRIVER_TAG);
+	auto ok = chunk != nullptr;
+	LARGE_INTEGER offset {};
+	while (ok) {
+		ULONG bytesRead = 0;
+		auto readStatus = ::FltReadFile(instance, srcObject, &offset, 65536, chunk, 0,
+			&bytesRead, nullptr, nullptr);
+		if (readStatus == STATUS_END_OF_FILE)
+			break;
+		if (!NT_SUCCESS(readStatus)) {
+			ok = false;
+			break;
+		}
+		if (bytesRead == 0)
+			break;
+		auto writeStatus = ::ZwWriteFile(dstHandle, nullptr, nullptr, nullptr, &iosb,
+			chunk, bytesRead, &offset, nullptr);
+		if (!NT_SUCCESS(writeStatus)) {
+			ok = false;
+			break;
+		}
+		offset.QuadPart += bytesRead;
+	}
+	if (chunk)
+		ExFreePool(chunk);
+	::ZwClose(dstHandle);
+	::FltClose(srcHandle);
+	if (srcObject)
+		::FltObjectDereference(srcObject);
+	return ok;
+}
+
+// Emits the drop-evidence record (drops-class queue, stop-collect).
+void EmitDropCaptured(_In_ PCUNICODE_STRING path, _In_ PCUNICODE_STRING storedName,
+	_In_ ULONG method, _In_ ULONG pid) {
+	bool pathTruncated = false;
+	WCHAR pathScratch[MaxFilePathBytes / sizeof(WCHAR)];
+	auto pathBytes = CopyNameW(pathScratch, path, MaxFilePathBytes, pathTruncated);
+	bool storedTruncated = false;
+	WCHAR storedScratch[64];
+	auto storedBytes = CopyNameW(storedScratch, storedName, sizeof(storedScratch), storedTruncated);
+
+	auto header = AllocRecord(DropCapturedFixed + pathBytes + storedBytes, DropCaptured, pid,
+		g_Data.Identities->Lookup(pid));
+	if (header == nullptr)
+		return;
+	if (pathTruncated)
+		header->TruncFlags |= TRUNC_FILE_PATH;
+	if (storedTruncated)
+		header->TruncFlags |= TRUNC_NEW_PATH; // second-path flag reused
+
+	auto record = reinterpret_cast<DropCapturedRecord*>(header);
+	record->PathOffset = DropCapturedFixed;
+	record->PathBytes = pathBytes;
+	record->StoredOffset = static_cast<USHORT>(record->PathOffset + pathBytes);
+	record->StoredBytes = storedBytes;
+	record->Method = method;
+	auto body = reinterpret_cast<UCHAR*>(header);
+	::memcpy(body + record->PathOffset, pathScratch, pathBytes);
+	::memcpy(body + record->StoredOffset, storedScratch, storedBytes);
+
+	PushDropRecord(CONTAINING_RECORD(header, ItemFull<RecordHeader>, Item));
+}
+
+// First matching write: mark the stream (context dedup), generate the stored
+// name, try the hard link. CopyPending survives to cleanup on link failure.
+void TryCaptureDrop(_In_ PFLT_INSTANCE instance, _In_ PFLT_CALLBACK_DATA data,
+	_In_ PCUNICODE_STRING path, _In_ ULONG pid) {
+	if (!g_Data.DropWatch->Matches(path))
+		return;
+	// FltCreateFileEx2 is PASSIVE-max: rare busy completions are counted, the
+	// cleanup fallback still covers the stream.
+	if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+		InterlockedIncrement64(&g_Data.DropsMissedBusy);
+		return;
+	}
+
+	DropStreamContext* context = nullptr;
+	auto status = ::FltAllocateContext(g_Data.Filter, FLT_STREAM_CONTEXT,
+		sizeof(DropStreamContext), NonPagedPool,
+		reinterpret_cast<PFLT_CONTEXT*>(&context));
+	if (!NT_SUCCESS(status)) {
+		InterlockedIncrement64(&g_Data.AllocFailures);
+		return;
+	}
+	context->State = DROP_COPY_PENDING;
+	GenerateStoredName(context, path);
+	status = ::FltSetStreamContext(instance, data->Iopb->TargetFileObject,
+		FLT_SET_CONTEXT_KEEP_IF_EXISTS, context, nullptr);
+	if (status == STATUS_FLT_CONTEXT_ALREADY_DEFINED) {
+		::FltReleaseContext(context);
+		return; // another write of the same stream is capturing
+	}
+	if (!NT_SUCCESS(status)) {
+		::FltReleaseContext(context);
+		InterlockedIncrement64(&g_Data.AllocFailures);
+		return;
+	}
+
+	if (CreateHardLinkInDrops(instance, path, &context->StoredName)) {
+		InterlockedExchange(&context->State, DROP_LINKED);
+		EmitDropCaptured(path, &context->StoredName, DROP_METHOD_HARDLINK, pid);
+	} else {
+		InterlockedIncrement64(&g_Data.DropsLinkFailed);
+		// state stays CopyPending: the cleanup callback copies final content
+	}
+	::FltReleaseContext(context);
+}
+
+// Cleanup-time fallback for streams whose hard link failed: copy final
+// content. State transitions make this exactly-once per stream.
+void TryCleanupCopy(_In_ PFLT_INSTANCE instance, _In_ PFLT_CALLBACK_DATA data,
+	_In_ PCUNICODE_STRING path, _In_ ULONG pid) {
+	DropStreamContext* context = nullptr;
+	if (!NT_SUCCESS(::FltGetStreamContext(instance, data->Iopb->TargetFileObject,
+		reinterpret_cast<PFLT_CONTEXT*>(&context))))
+		return; // never a drop candidate
+	auto state = InterlockedExchange(&context->State, DROP_COPY_DONE);
+	::FltReleaseContext(context);
+	if (state != DROP_COPY_PENDING)
+		return; // linked at first write, or a duplicate cleanup
+	if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+		InterlockedExchange(&context->State, DROP_COPY_PENDING);
+		InterlockedIncrement64(&g_Data.DropsMissedBusy);
+		return;
+	}
+	if (CopyFileToDrops(instance, path, &context->StoredName))
+		EmitDropCaptured(path, &context->StoredName, DROP_METHOD_COPY, pid);
+	else
+		InterlockedIncrement64(&g_Data.DropsCopyFailed);
+}
+
+
 // Normalized full path for a file-system callback, or nullptr on failure
 // (counted — a skipped record is honest loss, not silence). Above APC_LEVEL
 // only the name cache may be queried; post-write from DPC land degrades to
@@ -172,6 +472,7 @@ void EmitFileRecord(_In_ RecordType type, _In_ PCUNICODE_STRING path, _In_ ULONG
 struct RenameContext {
 	UNICODE_STRING OldPath; // Buffer follows the struct, nonpaged
 };
+
 
 void EmitFileRenamed(_In_opt_ const RenameContext* context, _In_ PCUNICODE_STRING newPath, _In_ ULONG pid) {
 	bool oldTruncated = false, newTruncated = false;
@@ -288,6 +589,7 @@ void EmitRegistrySetValue(_In_ PCUNICODE_STRING keyPath, _In_ PCUNICODE_STRING v
 
 } // namespace
 
+
 extern "C"
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 	KdPrint((DRIVER_PREFIX "DriverEntry entered\n"));
@@ -320,6 +622,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 		g_Data.Identities->Init();
 		g_Data.Watch = new (PagedPool) FileWatch;
 		g_Data.Watch->Init();
+		g_Data.Target = new (PagedPool) DropTarget;
+		g_Data.Target->Init();
+		g_Data.DropWatch = new (PagedPool) FileWatch;
+		g_Data.DropWatch->Init();
+		g_Data.Drops = new (PagedPool) Queue<FastMutex>(512);
 		g_Data.Items = new (PagedPool) Queue<FastMutex>(256, &g_Data.QueueOverwritten);
 		// Flood class gets its own bounded list: a write storm must not evict
 		// process evidence. Same drain, per-class overflow counters.
@@ -413,6 +720,20 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 			delete g_Data.Watch;
 			g_Data.Watch = nullptr;
 		}
+		if (g_Data.Target) {
+			g_Data.Target->Init();
+			delete g_Data.Target;
+			g_Data.Target = nullptr;
+		}
+		if (g_Data.DropWatch) {
+			delete g_Data.DropWatch;
+			g_Data.DropWatch = nullptr;
+		}
+		if (g_Data.Drops) {
+			g_Data.Drops->FreeAll<ItemFull<RecordHeader>>();
+			delete g_Data.Drops;
+			g_Data.Drops = nullptr;
+		}
 		if (g_Data.Files) {
 			g_Data.Files->FreeAll<ItemFull<RecordHeader>>();
 			delete g_Data.Files;
@@ -452,8 +773,14 @@ void SecOutfallUnload(PDRIVER_OBJECT DriverObject) {
 	delete g_Data.Items;
 	g_Data.Files->FreeAll<ItemFull<RecordHeader>>();
 	delete g_Data.Files;
+	g_Data.Drops->FreeAll<ItemFull<RecordHeader>>();
+	delete g_Data.Drops;
 	if (g_Data.Watch)
 		delete g_Data.Watch;
+	if (g_Data.DropWatch)
+		delete g_Data.DropWatch;
+	if (g_Data.Target)
+		delete g_Data.Target;
 	g_Data.Identities->Clear();
 	delete g_Data.Identities;
 
@@ -489,10 +816,11 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
 				break;
 			}
 			auto count = 0UL;
-			// Merged drain over both rate-class queues, ordered by the global
-			// sequence: pop the globally-older head that fits; a head that can
-			// never fit this client is skipped + counted; heads that would fit
-			// a bigger batch stop this one.
+			// Merged drain over all three rate-class queues, ordered by the
+			// global sequence: pop the globally-older head that fits; a head
+			// that can never fit this client is skipped + counted; heads that
+			// would fit a bigger batch stop this one.
+			Queue<FastMutex>* queues[] = { g_Data.Items, g_Data.Files, g_Data.Drops };
 			auto tryPop = [&](Queue<FastMutex>* queue) -> int {
 				auto item = queue->PopIfFits<ItemFull<RecordHeader>>(size - count);
 				if (item != nullptr) {
@@ -514,17 +842,32 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
 				return 0; // needs a bigger batch
 			};
 			while (true) {
-				auto seqControl = g_Data.Items->HeadSeq<ItemFull<RecordHeader>>();
-				auto seqFiles = g_Data.Files->HeadSeq<ItemFull<RecordHeader>>();
-				if (seqControl == MAXULONGLONG && seqFiles == MAXULONGLONG)
-					break;
-				auto first = (seqFiles < seqControl) ? g_Data.Files : g_Data.Items;
-				auto second = (first == g_Data.Files) ? g_Data.Items : g_Data.Files;
-				if (tryPop(first) == 1)
-					continue;
-				if (tryPop(second) == 1)
-					continue;
-				break; // both heads need a bigger buffer
+				Queue<FastMutex>* oldest = nullptr;
+				auto oldestSeq = MAXULONGLONG;
+				for (auto queue : queues) {
+					auto seq = queue->HeadSeq<ItemFull<RecordHeader>>();
+					if (seq < oldestSeq) {
+						oldestSeq = seq;
+						oldest = queue;
+					}
+				}
+				if (oldest == nullptr)
+					break; // all empty
+				auto progressed = false;
+				if (tryPop(oldest) == 1) {
+					progressed = true;
+				} else {
+					for (auto queue : queues) {
+						if (queue == oldest)
+							continue;
+						if (tryPop(queue) == 1) {
+							progressed = true;
+							break;
+						}
+					}
+				}
+				if (!progressed)
+					break; // every head needs a bigger buffer
 			}
 			len = count;
 			break;
@@ -555,6 +898,12 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
 			stats->FilesOverwritten = g_Data.FilesOverwritten;
 			stats->FileNameQueriesFailed = g_Data.FileNameQueriesFailed;
 			stats->NoiseWritesSkipped = g_Data.NoiseWritesSkipped;
+			stats->DropsQueueDepth = static_cast<ULONG>(g_Data.Drops->GetCount());
+			stats->DropsQueueCapacity = static_cast<ULONG>(g_Data.Drops->GetCapacity());
+			stats->DropsStopped = g_Data.DropsStopped;
+			stats->DropsMissedBusy = g_Data.DropsMissedBusy;
+			stats->DropsLinkFailed = g_Data.DropsLinkFailed;
+			stats->DropsCopyFailed = g_Data.DropsCopyFailed;
 			len = sizeof(DriverStats);
 			break;
 		}
@@ -628,6 +977,96 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
 				break;
 			}
 			g_Data.Watch->Apply(true, exts, count, blob, blobBytes);
+			break;
+		}
+
+		case IOCTL_SECOUTFALL_SET_DROP_POLICY:
+		{
+			auto inputLength = stack->Parameters.DeviceIoControl.InputBufferLength;
+			auto input = (DropPolicy*)Irp->AssociatedIrp.SystemBuffer;
+			if (input == nullptr || inputLength < sizeof(DropPolicy) || input->Enabled > 1) {
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			auto extBytes = input->ExtensionsBytes;
+			auto dirBytes = input->DirBytes;
+			if (extBytes > FileWatch::MaxBlobBytes || extBytes % 2 != 0
+				|| input->ExtensionsCount > FileWatch::MaxExtensions
+				|| dirBytes == 0 || dirBytes > DropTarget::MaxDirBytes || dirBytes % 2 != 0
+				|| inputLength != sizeof(DropPolicy) + extBytes + dirBytes) {
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+
+			if (!input->Enabled) {
+				g_Data.DropWatch->Apply(false, nullptr, 0, nullptr, 0);
+				break;
+			}
+
+			auto payload = reinterpret_cast<UCHAR*>(input) + sizeof(DropPolicy);
+			auto dirBlob = reinterpret_cast<PWCHAR>(payload + extBytes);
+
+			// Validate the directory terminator before allocating anything.
+			if (dirBlob[dirBytes / sizeof(WCHAR) - 1] != L'\0') {
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			UNICODE_STRING dir;
+			dir.Buffer = dirBlob;
+			dir.Length = static_cast<USHORT>(dirBytes - sizeof(WCHAR)); // minus NUL
+			dir.MaximumLength = dir.Length;
+			if (!g_Data.Target->Apply(&dir)) {
+				status = STATUS_INSUFFICIENT_RESOURCES;
+				break;
+			}
+
+			// Extension list, same shape as SET_FILE_WATCH (NUL-terminated).
+			auto exts = (PUNICODE_STRING*)::ExAllocatePool2(POOL_FLAG_NON_PAGED,
+				sizeof(PUNICODE_STRING) * input->ExtensionsCount, DRIVER_TAG);
+			auto extBlob = (PWCHAR)::ExAllocatePool2(POOL_FLAG_NON_PAGED,
+				extBytes ? extBytes : 2, DRIVER_TAG);
+			if (exts == nullptr || extBlob == nullptr) {
+				if (exts) ExFreePool(exts);
+				if (extBlob) ExFreePool(extBlob);
+				status = STATUS_INSUFFICIENT_RESOURCES;
+				break;
+			}
+			if (extBytes > 0)
+				::memcpy(extBlob, payload, extBytes);
+			ULONG count = 0;
+			auto cursor = extBlob;
+			auto end = extBlob + extBytes / sizeof(WCHAR);
+			auto parseOk = true;
+			while (cursor < end && count < input->ExtensionsCount) {
+				ULONG nameLen = 0;
+				while (cursor + nameLen < end && cursor[nameLen] != L'\0')
+					++nameLen;
+				if (nameLen == 0 || cursor + nameLen >= end) {
+					parseOk = false;
+					break;
+				}
+				auto entry = (PUNICODE_STRING)::ExAllocatePool2(POOL_FLAG_NON_PAGED,
+					sizeof(UNICODE_STRING), DRIVER_TAG);
+				if (entry == nullptr) {
+					parseOk = false;
+					break;
+				}
+				entry->Buffer = cursor;
+				entry->Length = static_cast<USHORT>(nameLen * sizeof(WCHAR));
+				entry->MaximumLength = entry->Length;
+				exts[count] = entry;
+				++count;
+				cursor += nameLen + 1;
+			}
+			if (!parseOk || count != input->ExtensionsCount) {
+				for (ULONG i = 0; i < count; ++i)
+					ExFreePool(exts[i]);
+				ExFreePool(exts);
+				ExFreePool(extBlob);
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			g_Data.DropWatch->Apply(true, exts, count, extBlob, extBytes);
 			break;
 		}
 
@@ -927,30 +1366,31 @@ FLT_POSTOP_CALLBACK_STATUS FLTAPI SecOutfallPostWrite(_Inout_ PFLT_CALLBACK_DATA
 	auto name = QueryFileName(Data);
 	if (name == nullptr)
 		return FLT_POSTOP_FINISHED_PROCESSING;
-	if (!g_Data.Watch->Matches(&name->Name)) {
-		::FltReleaseFileNameInformation(name);
-		return FLT_POSTOP_FINISHED_PROCESSING;
+	auto pid = HandleToULong(PsGetCurrentProcessId());
+	if (g_Data.Watch->Matches(&name->Name)) {
+		bool truncated = false;
+		WCHAR scratch[MaxFilePathBytes / sizeof(WCHAR)];
+		auto pathBytes = CopyNameW(scratch, &name->Name, MaxFilePathBytes, truncated);
+		auto header = AllocRecord(FileWrittenFixed + pathBytes, FileWritten, pid,
+			g_Data.Identities->Lookup(pid));
+		if (header != nullptr) {
+			if (truncated)
+				header->TruncFlags |= TRUNC_FILE_PATH;
+			auto record = reinterpret_cast<FileWrittenRecord*>(header);
+			record->ByteOffset = static_cast<ULONG64>(offset);
+			record->BytesCount = length;
+			record->PathOffset = FileWrittenFixed;
+			record->PathBytes = pathBytes;
+			::memcpy(reinterpret_cast<UCHAR*>(header) + record->PathOffset, scratch, pathBytes);
+			PushRecord(CONTAINING_RECORD(header, ItemFull<RecordHeader>, Item), true);
+		}
 	}
 
-	bool truncated = false;
-	WCHAR scratch[MaxFilePathBytes / sizeof(WCHAR)];
-	auto pathBytes = CopyNameW(scratch, &name->Name, MaxFilePathBytes, truncated);
-	::FltReleaseFileNameInformation(name);
+	// Drop capture (D2b): same name, its own extension policy, exactly-once
+	// per stream via the context.
+	TryCaptureDrop(FltObjects->Instance, Data, &name->Name, pid);
 
-	auto pid = HandleToULong(PsGetCurrentProcessId());
-	auto header = AllocRecord(FileWrittenFixed + pathBytes, FileWritten, pid,
-		g_Data.Identities->Lookup(pid));
-	if (header == nullptr)
-		return FLT_POSTOP_FINISHED_PROCESSING;
-	if (truncated)
-		header->TruncFlags |= TRUNC_FILE_PATH;
-	auto record = reinterpret_cast<FileWrittenRecord*>(header);
-	record->ByteOffset = static_cast<ULONG64>(offset);
-	record->BytesCount = length;
-	record->PathOffset = FileWrittenFixed;
-	record->PathBytes = pathBytes;
-	::memcpy(reinterpret_cast<UCHAR*>(header) + record->PathOffset, scratch, pathBytes);
-	PushRecord(CONTAINING_RECORD(header, ItemFull<RecordHeader>, Item), true);
+	::FltReleaseFileNameInformation(name);
 	return FLT_POSTOP_FINISHED_PROCESSING;
 }
 
@@ -969,8 +1409,10 @@ FLT_POSTOP_CALLBACK_STATUS FLTAPI SecOutfallPostCleanup(_Inout_ PFLT_CALLBACK_DA
 	auto name = QueryFileName(Data);
 	if (name == nullptr)
 		return FLT_POSTOP_FINISHED_PROCESSING;
+	auto pid = HandleToULong(PsGetCurrentProcessId());
 	if (g_Data.Watch->Matches(&name->Name))
-		EmitFileRecord(FileCleanedUp, &name->Name, HandleToULong(PsGetCurrentProcessId()));
+		EmitFileRecord(FileCleanedUp, &name->Name, pid);
+	TryCleanupCopy(FltObjects->Instance, Data, &name->Name, pid);
 	::FltReleaseFileNameInformation(name);
 	return FLT_POSTOP_FINISHED_PROCESSING;
 }

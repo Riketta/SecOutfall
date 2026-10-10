@@ -153,6 +153,29 @@ void BuildFileWritten() {
 	AppendWstr(path);
 }
 
+void BuildDropCaptured() {
+	ULONG pid = 1004;
+	bool pathTruncated = false;
+	auto path = Clamp(L"\\Device\\HarddiskVolume2\\Users\\user\\AppData\\payload.dll",
+		MaxFilePathBytes, pathTruncated);
+	// Stored names are driver-GENERATED ("drop-<8 hex><ext>") — bounded by
+	// construction, never truncated.
+	std::wstring stored = L"drop-00000001.dll";
+
+	DropCapturedRecord record {};
+	record.Header = MakeHeader(DropCaptured, pid, IdentityBase + pid,
+		pathTruncated ? TRUNC_FILE_PATH : TRUNC_NONE,
+		DropCapturedFixed + static_cast<ULONG>((path.size() + stored.size()) * sizeof(WCHAR)));
+	record.PathOffset = DropCapturedFixed;
+	record.PathBytes = static_cast<USHORT>(path.size() * sizeof(WCHAR));
+	record.StoredOffset = static_cast<USHORT>(record.PathOffset + record.PathBytes);
+	record.StoredBytes = static_cast<USHORT>(stored.size() * sizeof(WCHAR));
+	record.Method = DROP_METHOD_HARDLINK;
+	AppendRaw(&record, DropCapturedFixed);
+	AppendWstr(path);
+	AppendWstr(stored);
+}
+
 void BuildFileRenamed() {
 	bool truncated = false;
 	auto oldPath = Clamp(L"\\Device\\HarddiskVolume2\\Users\\user\\Documents\\draft.txt",
@@ -256,7 +279,7 @@ bool WalkFixture(const std::vector<BYTE>& bytes) {
 		offset += header->Size;
 	}
 	printf("fixture walks clean: %d records, %zu bytes\n", count, bytes.size());
-	return count == 13;
+	return count == 14;
 }
 
 } // namespace
@@ -287,6 +310,7 @@ int main(int argc, char** argv) {
 	BuildFileRecord(FileDeleted, 1004,
 		L"\\Device\\HarddiskVolume2\\Users\\user\\AppData\\log.tmp"); // 12
 	BuildFileRenamed(); // 13
+	BuildDropCaptured(); // 14
 	auto fixture = g_out;
 
 	if (!WalkFixture(fixture)) {

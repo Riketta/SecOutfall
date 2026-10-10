@@ -67,6 +67,11 @@ pub const MAX_VALUE_DATA_BYTES: usize = 128;
 
 /// `REG_SZ`, the only value type the fixture pins explicitly.
 pub const REG_SZ: u32 = 1;
+/// Drop captured via a hard-link tombstone (same volume).
+pub const DROP_METHOD_HARDLINK: u32 = 0;
+/// Drop captured via a full-content stream copy at cleanup (cross-volume or
+/// link failure).
+pub const DROP_METHOD_COPY: u32 = 1;
 
 /// Record type discriminator (wire values are stable).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +102,8 @@ pub enum RecordKind {
     FileDeleted,
     /// A file was renamed.
     FileRenamed,
+    /// Drop evidence was preserved into the drops directory.
+    DropCaptured,
 }
 
 impl RecordKind {
@@ -115,6 +122,7 @@ impl RecordKind {
             11 => Some(Self::FileCleanedUp),
             12 => Some(Self::FileDeleted),
             13 => Some(Self::FileRenamed),
+            14 => Some(Self::DropCaptured),
             _ => None,
         }
     }
@@ -250,6 +258,16 @@ pub enum Payload {
         old_path: String,
         /// Post-rename path, lossy-decoded.
         new_path: String,
+    },
+    /// Drop evidence was preserved into the drops directory.
+    DropCaptured {
+        /// Original file path, lossy-decoded.
+        path: String,
+        /// Stored name inside the drops directory (driver-generated,
+        /// `drop-<8 hex><ext>`).
+        stored_name: String,
+        /// [`DROP_METHOD_HARDLINK`] or [`DROP_METHOD_COPY`].
+        method: u32,
     },
 }
 
@@ -415,6 +433,7 @@ fn min_size(kind: RecordKind) -> usize {
         | RecordKind::FileCleanedUp
         | RecordKind::FileDeleted => 52,
         RecordKind::ImageLoaded | RecordKind::RegistrySetValue | RecordKind::FileWritten => 64,
+        RecordKind::DropCaptured => 60,
     }
 }
 
@@ -510,6 +529,16 @@ fn payload_of(
             let new_path = string_at(record, new_offset, new_bytes)?;
             Payload::FileRenamed { old_path, new_path }
         }
+        RecordKind::DropCaptured => {
+            let path_offset = u16_at(record, 48)? as usize;
+            let path_bytes = u16_at(record, 50)? as usize;
+            let stored_offset = u16_at(record, 52)? as usize;
+            let stored_bytes = u16_at(record, 54)? as usize;
+            let method = u32_at(record, 56)?;
+            let path = string_at(record, path_offset, path_bytes)?;
+            let stored_name = string_at(record, stored_offset, stored_bytes)?;
+            Payload::DropCaptured { path, stored_name, method }
+        }
     };
     Ok(payload)
 }
@@ -579,7 +608,7 @@ mod tests {
             .expect("committed fixture must exist — regenerate with wiretest --generate");
         let records = decode_all(&bytes).expect("fixture must decode");
 
-        assert_eq!(records.len(), 13);
+        assert_eq!(records.len(), 14);
         for (index, record) in records.iter().enumerate() {
             assert_eq!(record.sequence(), index as u64 + 1, "per-boot seq is gap-free");
             assert_eq!(record.time(), TIME_BASE + record.sequence());
@@ -688,6 +717,16 @@ mod tests {
         };
         assert_eq!(old_path, "\\Device\\HarddiskVolume2\\Users\\user\\Documents\\draft.txt");
         assert_eq!(new_path, "\\Device\\HarddiskVolume2\\Users\\user\\Documents\\final.txt");
+
+        // 14: drop captured via hard link (stored name is driver-generated).
+        assert_eq!(records[13].kind(), RecordKind::DropCaptured);
+        assert_eq!(records[13].trunc_flags(), TRUNC_NONE);
+        let Payload::DropCaptured { path, stored_name, method } = records[13].payload() else {
+            panic!("payload kind mismatch")
+        };
+        assert_eq!(path, "\\Device\\HarddiskVolume2\\Users\\user\\AppData\\payload.dll");
+        assert_eq!(stored_name, "drop-00000001.dll");
+        assert_eq!(*method, DROP_METHOD_HARDLINK);
     }
 
     #[test]

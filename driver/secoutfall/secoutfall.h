@@ -45,6 +45,20 @@ struct Globals {
 	volatile LONG64 FileNameQueriesFailed;
 	volatile LONG64 NoiseWritesSkipped;
 
+	//
+	// Drops class (D2b): captured evidence. Stop-collect on overflow —
+	// existing evidence is never evicted, refusal is counted.
+	//
+	Queue<FastMutex>* Drops;
+	volatile LONG64 DropsStopped;
+	volatile LONG64 DropsMissedBusy;
+	volatile LONG64 DropsLinkFailed;
+	volatile LONG64 DropsCopyFailed;
+	// Drop extension matcher + target directory (heap-built: FastMutex).
+	FileWatch* DropWatch;
+	DropTarget* Target;
+	volatile LONG64 DropCounter; // stored-name generator, per boot
+
 	// File telemetry stays OFF until a client (agent/dumper) sends
 	// SET_FILE_WATCH — a driver that observes nothing cannot flood anything.
 	volatile LONG64 FileWatchEnabled;

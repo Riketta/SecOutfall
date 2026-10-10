@@ -28,6 +28,19 @@ public:
 		_size++;
 	}
 
+	// Stop-collect variant for the drops class: when full, the NEW record is
+	// refused (never evicts existing evidence) and the caller counts it.
+	// Returns false when the record did not fit.
+	template<typename T>
+	bool TryPush(T* entry) {
+		AutoLock<TLock> locker(_lock);
+		if (_size == _maxItems)
+			return false;
+		InsertTailList(&_head, &entry->Entry);
+		_size++;
+		return true;
+	}
+
 	template<typename T>
 	T* Pop() {
 		AutoLock<TLock> locker(_lock);

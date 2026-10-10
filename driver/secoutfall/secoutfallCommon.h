@@ -39,6 +39,7 @@ enum RecordType : USHORT {
 	FileCleanedUp = 11,
 	FileDeleted = 12,
 	FileRenamed = 13,
+	DropCaptured = 14,
 };
 
 // Truncation flags (header TruncFlags): which variable-length field hit its
@@ -155,6 +156,24 @@ struct FileRenamedRecord {
 	// WCHAR NewPath[] at NewPathOffset
 };
 
+// Drop evidence preserved into the drops directory. StoredName is driver-
+// generated ("drop-<counter><ext>"), so its truncation flag (TRUNC_NEW_PATH,
+// reused as the generic second-path flag here) never fires in practice —
+// only the ORIGINAL path can hit a cap (TRUNC_FILE_PATH).
+struct DropCapturedRecord {
+	RecordHeader Header;       // +0
+	USHORT PathOffset;         // +48 original file path
+	USHORT PathBytes;          // +50 whole WCHARs
+	USHORT StoredOffset;       // +52 stored name inside the drops directory
+	USHORT StoredBytes;        // +54 whole WCHARs
+	ULONG Method;              // +56 DROP_METHOD_*
+	// WCHAR Path[] at PathOffset
+	// WCHAR StoredName[] at StoredOffset
+};
+
+const ULONG DROP_METHOD_HARDLINK = 0;
+const ULONG DROP_METHOD_COPY = 1;
+
 // Kernel-side loss/diagnostic counters (also the wire shape of
 // IOCTL_SECOUTFALL_GET_STATS: magic + version prefixed, stats only — the
 // client checks them the same way as records).
@@ -166,6 +185,8 @@ struct DriverStats {
 	ULONG QueueCapacity;
 	ULONG FileQueueDepth;
 	ULONG FileQueueCapacity;
+	ULONG DropsQueueDepth;
+	ULONG DropsQueueCapacity;
 	ULONG64 Sequence;          // last assigned sequence == records emitted
 	ULONG64 QueueOverwritten;  // drop-oldest events, control class
 	ULONG64 AllocFailures;     // pool allocation failures in callbacks
@@ -174,6 +195,10 @@ struct DriverStats {
 	ULONG64 FilesOverwritten;  // drop-oldest events, file class
 	ULONG64 FileNameQueriesFailed; // name query failures (skipped records)
 	ULONG64 NoiseWritesSkipped;    // write-noise heuristic skips
+	ULONG64 DropsStopped;      // drops-class stop-collect events (queue full)
+	ULONG64 DropsMissedBusy;   // capture attempts above APC_LEVEL (rare)
+	ULONG64 DropsLinkFailed;   // hard-link failures that fell back to copy
+	ULONG64 DropsCopyFailed;   // stream-copy failures at cleanup
 };
 
 // Fixed payload extents ON THE WIRE: header + payload FIELDS, excluding any
@@ -189,6 +214,7 @@ const ULONG RegistrySetValueFixed = sizeof(RegistrySetValueRecord); // 64
 const ULONG FileFixed = 52;
 const ULONG FileWrittenFixed = sizeof(FileWrittenRecord);           // 64
 const ULONG FileRenamedFixed = sizeof(FileRenamedRecord);           // 56
+const ULONG DropCapturedFixed = 60;
 static_assert(offsetof(ThreadRecord, ThreadId) + sizeof(ULONG) == ThreadFixed, "wire layout pinned");
 static_assert(offsetof(RegistryKeyRecord, PathBytes) + sizeof(USHORT) == RegistryKeyFixed, "wire layout pinned");
 static_assert(offsetof(FileRecord, PathBytes) + sizeof(USHORT) == FileFixed, "wire layout pinned");
@@ -208,6 +234,11 @@ static_assert(offsetof(FileRecord, PathBytes) + sizeof(USHORT) == FileFixed, "wi
 // without a minifilter storm. SYSTEM/Admins only via the device SDDL.
 #define IOCTL_SECOUTFALL_SELFTEST_FLOOD \
 	CTL_CODE(0x8000u, 0x803u, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+// Arms drop capture: extensions (same NUL-terminated blob form as
+// SET_FILE_WATCH) + the drops DIRECTORY in normalized NT form
+// (e.g. \Device\HarddiskVolume2\Drops). Directory is created on first use.
+#define IOCTL_SECOUTFALL_SET_DROP_POLICY \
+	CTL_CODE(0x8000u, 0x804u, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
 // Input blob for IOCTL_SECOUTFALL_SET_FILE_WATCH: ExtensionsCount UTF-16
 // names (with the dot, e.g. L".exe"), each NUL-terminated, concatenated after
@@ -226,6 +257,18 @@ struct FileWatchPolicy {
 struct SelftestFloodRequest {
 	ULONG Class;
 	ULONG Count;
+};
+
+// Input blob for IOCTL_SECOUTFALL_SET_DROP_POLICY: extension names
+// (NUL-terminated UTF-16, same form as SET_FILE_WATCH) followed by the drops
+// directory (NUL-terminated UTF-16, normalized NT form).
+struct DropPolicy {
+	UCHAR Enabled;
+	UCHAR Reserved[3];
+	ULONG ExtensionsCount;
+	ULONG ExtensionsBytes; // total extension blob bytes, terminators included
+	ULONG DirBytes;        // directory blob bytes, terminator included
+	// WCHAR extensions[] then WCHAR directory[]
 };
 
 static_assert(sizeof(RecordHeader) == 48, "wire header layout pinned");
@@ -265,3 +308,8 @@ static_assert(offsetof(FileRenamedRecord, OldPathOffset) == 48, "wire layout pin
 static_assert(offsetof(FileRenamedRecord, OldPathBytes) == 50, "wire layout pinned");
 static_assert(offsetof(FileRenamedRecord, NewPathOffset) == 52, "wire layout pinned");
 static_assert(offsetof(FileRenamedRecord, NewPathBytes) == 54, "wire layout pinned");
+static_assert(offsetof(DropCapturedRecord, PathOffset) == 48, "wire layout pinned");
+static_assert(offsetof(DropCapturedRecord, PathBytes) == 50, "wire layout pinned");
+static_assert(offsetof(DropCapturedRecord, StoredOffset) == 52, "wire layout pinned");
+static_assert(offsetof(DropCapturedRecord, StoredBytes) == 54, "wire layout pinned");
+static_assert(offsetof(DropCapturedRecord, Method) == 56, "wire layout pinned");

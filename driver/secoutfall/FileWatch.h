@@ -92,3 +92,51 @@ private:
 	PWCHAR _blob;
 	ULONG _blobBytes;
 };
+
+// Drop-capture target directory (normalized NT form), pushed from user mode
+// with SET_DROP_POLICY. Get copies out under the lock so a concurrent policy
+// swap can never free the string a capture is reading. Heap-built in
+// DriverEntry alongside the FileWatch (same static-init reasoning).
+class DropTarget {
+public:
+	static const ULONG MaxDirBytes = 1024;
+
+	void Init() {
+		_dir.Buffer = nullptr;
+		_dir.Length = 0;
+		_dir.MaximumLength = 0;
+	}
+
+	bool Apply(_In_ PCUNICODE_STRING dir) {
+		auto bytes = static_cast<USHORT>(min(dir->Length, MaxDirBytes));
+		bytes &= static_cast<USHORT>(~1);
+		if (bytes == 0)
+			return false;
+		auto buffer = (PWCHAR)::ExAllocatePool2(POOL_FLAG_NON_PAGED, bytes, DRIVER_TAG);
+		if (buffer == nullptr)
+			return false;
+		::memcpy(buffer, dir->Buffer, bytes);
+		AutoLock<FastMutex> locker(_lock);
+		if (_dir.Buffer)
+			ExFreePool(_dir.Buffer);
+		_dir.Buffer = buffer;
+		_dir.Length = bytes;
+		_dir.MaximumLength = bytes;
+		return true;
+	}
+
+	// Copies the directory into `out` (cap bytes, whole WCHARs). Returns the
+	// byte length, or 0 when no directory is configured.
+	USHORT Get(_Out_ WCHAR* out, _In_ USHORT capBytes) {
+		AutoLock<FastMutex> locker(_lock);
+		auto bytes = static_cast<USHORT>(min(_dir.Length, capBytes));
+		bytes &= static_cast<USHORT>(~1);
+		if (bytes > 0)
+			::memcpy(out, _dir.Buffer, bytes);
+		return bytes;
+	}
+
+private:
+	FastMutex _lock;
+	UNICODE_STRING _dir; // heap buffer, nonpaged
+};
