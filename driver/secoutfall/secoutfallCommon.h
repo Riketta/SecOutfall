@@ -196,9 +196,13 @@ struct DriverStats {
 	ULONG64 FileNameQueriesFailed; // name query failures (skipped records)
 	ULONG64 NoiseWritesSkipped;    // write-noise heuristic skips
 	ULONG64 DropsStopped;      // drops-class stop-collect events (queue full)
-	ULONG64 DropsMissedBusy;   // capture attempts above APC_LEVEL (rare)
+	ULONG64 DropsMissedBusy;   // capture attempts above PASSIVE_LEVEL (rare)
 	ULONG64 DropsLinkFailed;   // hard-link failures that fell back to copy
 	ULONG64 DropsCopyFailed;   // stream-copy failures at cleanup
+	ULONG64 InjectionsQueued;  // APCs queued onto first threads
+	ULONG64 InjectionsFailed;  // allocation / thread-gone / queue failures
+	ULONG64 SensorsRegistered; // nonce echoes accepted
+	ULONG64 SensorsRejected;   // challenge/register denials
 };
 
 // Fixed payload extents ON THE WIRE: header + payload FIELDS, excluding any
@@ -239,6 +243,17 @@ static_assert(offsetof(FileRecord, PathBytes) + sizeof(USHORT) == FileFixed, "wi
 // (e.g. \Device\HarddiskVolume2\Drops). Directory is created on first use.
 #define IOCTL_SECOUTFALL_SET_DROP_POLICY \
 	CTL_CODE(0x8000u, 0x804u, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+// D3 injection policy: enabled + sensor DLL path + extra exclusion names.
+#define IOCTL_SECOUTFALL_SET_INJECTION_POLICY \
+	CTL_CODE(0x8000u, 0x805u, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+// Sensor handshake (ledger-gated): challenge returns the nonce for the
+// CALLER's pid — only injected, not-yet-registered pids are answered.
+#define IOCTL_SECOUTFALL_SENSOR_CHALLENGE \
+	CTL_CODE(0x8000u, 0x806u, METHOD_BUFFERED, FILE_READ_ACCESS)
+// Sensor handshake: echoes the nonce; one-shot, then the ledger marks the
+// pid registered and further challenges are denied.
+#define IOCTL_SECOUTFALL_SENSOR_REGISTER \
+	CTL_CODE(0x8000u, 0x807u, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
 // Input blob for IOCTL_SECOUTFALL_SET_FILE_WATCH: ExtensionsCount UTF-16
 // names (with the dot, e.g. L".exe"), each NUL-terminated, concatenated after
@@ -257,6 +272,30 @@ struct FileWatchPolicy {
 struct SelftestFloodRequest {
 	ULONG Class;
 	ULONG Count;
+};
+
+// Input blob for IOCTL_SECOUTFALL_SET_INJECTION_POLICY: sensor DLL path
+// (NUL-terminated UTF-16, verbatim to LdrLoadDll — NT form recommended)
+// followed by extra exclusion names (NUL-terminated UTF-16, same form as
+// the file-watch lists). The compiled blocklist always applies on top.
+struct InjectionPolicy {
+	UCHAR Enabled;
+	UCHAR Reserved[3];
+	ULONG DllPathBytes;    // incl. terminator
+	ULONG ExclusionsBytes; // incl. terminators; 0 = none
+	// WCHAR dllPath[]; WCHAR exclusions[]
+};
+
+// Output of IOCTL_SECOUTFALL_SENSOR_CHALLENGE.
+struct SensorChallenge {
+	ULONG64 Nonce;
+};
+
+// Input of IOCTL_SECOUTFALL_SENSOR_REGISTER.
+struct SensorRegister {
+	ULONG64 Nonce;
+	ULONG Version;
+	UCHAR Reserved[4];
 };
 
 // Input blob for IOCTL_SECOUTFALL_SET_DROP_POLICY: extension names

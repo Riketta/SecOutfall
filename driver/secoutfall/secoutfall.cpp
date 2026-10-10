@@ -14,6 +14,7 @@
 
 #include "pch.h"
 #include "secoutfallCommon.h"
+#include "Injection.h"
 #include "secoutfall.h"
 #include "Memory.h"
 
@@ -626,6 +627,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 		g_Data.Target->Init();
 		g_Data.DropWatch = new (PagedPool) FileWatch;
 		g_Data.DropWatch->Init();
+		InjectionInit();
 		g_Data.Drops = new (PagedPool) Queue<FastMutex>(512);
 		g_Data.Items = new (PagedPool) Queue<FastMutex>(256, &g_Data.QueueOverwritten);
 		// Flood class gets its own bounded list: a write storm must not evict
@@ -762,6 +764,7 @@ NTSTATUS CompleteRequest(PIRP Irp, NTSTATUS status = STATUS_SUCCESS, ULONG_PTR I
 void SecOutfallUnload(PDRIVER_OBJECT DriverObject) {
 	// Removals quiesce in-flight callbacks before returning; FltUnregisterFilter
 	// likewise waits for file-system activity to drain before we free queues.
+	InjectionCleanup();
 	::CmUnRegisterCallback(g_Data.RegistryCookie);
 	::PsRemoveLoadImageNotifyRoutine(OnImageLoadNotify);
 	::PsRemoveCreateThreadNotifyRoutine(OnThreadNotify);
@@ -1070,6 +1073,74 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
 			break;
 		}
 
+		case IOCTL_SECOUTFALL_SET_INJECTION_POLICY:
+		{
+			auto inputLength = stack->Parameters.DeviceIoControl.InputBufferLength;
+			auto input = (InjectionPolicy*)Irp->AssociatedIrp.SystemBuffer;
+			if (input == nullptr || inputLength < sizeof(InjectionPolicy)
+				|| input->Enabled > 1) {
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			auto pathBytes = input->DllPathBytes;
+			auto exclBytes = input->ExclusionsBytes;
+			if (pathBytes < 2 * sizeof(WCHAR) || pathBytes % 2 != 0
+				|| exclBytes % 2 != 0
+				|| inputLength != sizeof(InjectionPolicy) + pathBytes + exclBytes) {
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			auto payload = reinterpret_cast<UCHAR*>(input) + sizeof(InjectionPolicy);
+			UNICODE_STRING dllPath;
+			dllPath.Buffer = reinterpret_cast<PWCH>(payload);
+			dllPath.Length = static_cast<USHORT>(pathBytes - sizeof(WCHAR)); // minus NUL
+			dllPath.MaximumLength = dllPath.Length;
+			UNICODE_STRING exclusions;
+			exclusions.Buffer = reinterpret_cast<PWCH>(payload + pathBytes);
+			exclusions.Length = static_cast<USHORT>(exclBytes);
+			exclusions.MaximumLength = exclusions.Length;
+			if (!InjectionSetPolicy(input->Enabled != 0, &dllPath,
+				exclBytes > 0 ? &exclusions : nullptr)) {
+				status = STATUS_INSUFFICIENT_RESOURCES;
+				break;
+			}
+			break;
+		}
+
+		case IOCTL_SECOUTFALL_SENSOR_CHALLENGE:
+		{
+			auto outLength = stack->Parameters.DeviceIoControl.OutputBufferLength;
+			if (outLength != sizeof(SensorChallenge)) {
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			auto challenge = (SensorChallenge*)Irp->AssociatedIrp.SystemBuffer;
+			if (!InjectionSensorChallenge(HandleToULong(PsGetCurrentProcessId()),
+				&challenge->Nonce)) {
+				status = STATUS_ACCESS_DENIED;
+				len = 0;
+				break;
+			}
+			len = sizeof(SensorChallenge);
+			break;
+		}
+
+		case IOCTL_SECOUTFALL_SENSOR_REGISTER:
+		{
+			auto inputLength = stack->Parameters.DeviceIoControl.InputBufferLength;
+			auto input = (SensorRegister*)Irp->AssociatedIrp.SystemBuffer;
+			if (input == nullptr || inputLength != sizeof(SensorRegister)) {
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			if (!InjectionSensorRegister(HandleToULong(PsGetCurrentProcessId()),
+				input->Nonce, input->Version)) {
+				status = STATUS_ACCESS_DENIED;
+				break;
+			}
+			break;
+		}
+
 		case IOCTL_SECOUTFALL_SELFTEST_FLOOD:
 		{
 			auto inputLength = stack->Parameters.DeviceIoControl.InputBufferLength;
@@ -1150,6 +1221,9 @@ void OnProcessNotify(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _Inout_op
 			NextIdentityMiss();
 
 		PushRecord(CONTAINING_RECORD(header, ItemFull<RecordHeader>, Item));
+
+		// D3: universal sensor injection (engine applies its own blocklist).
+		InjectionOnProcessCreate(pid, createTime, CreateInfo->ImageFileName);
 	}
 	else {
 		//
@@ -1160,6 +1234,7 @@ void OnProcessNotify(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _Inout_op
 		if (createTime == 0)
 			NextIdentityMiss();
 		g_Data.Identities->Remove(pid);
+		InjectionOnProcessExit(pid);
 
 		auto header = AllocRecord(ProcessExitedFixed, ProcessExited, pid, createTime);
 		if (header == nullptr)
@@ -1180,6 +1255,17 @@ void OnThreadNotify(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _In_ BOOLEAN Cr
 	record->ThreadId = HandleToULong(ThreadId);
 
 	PushRecord(CONTAINING_RECORD(header, ItemFull<RecordHeader>, Item));
+
+	// D3: the FIRST thread of a process is the injection target (an APC
+	// queued before it runs is delivered during loader init, before any
+	// user code). Later threads are irrelevant to the engine.
+	if (Create) {
+		PETHREAD thread = nullptr;
+		if (NT_SUCCESS(::PsLookupThreadByThreadId(ThreadId, &thread))) {
+			InjectionOnFirstThread(pid, thread);
+			ObDereferenceObject(thread);
+		}
+	}
 }
 
 void OnImageLoadNotify(_In_ PUNICODE_STRING FullImageName, _In_ HANDLE ProcessId, _In_ PIMAGE_INFO ImageInfo) {
@@ -1187,6 +1273,9 @@ void OnImageLoadNotify(_In_ PUNICODE_STRING FullImageName, _In_ HANDLE ProcessId
 	// the sandbox analyzes user-mode behavior.
 	if (ImageInfo->SystemModeImage)
 		return;
+
+	// D3: ntdll base capture + LdrLoadDll RVA resolution + injection trigger.
+	InjectionOnImageLoad(HandleToULong(ProcessId), ImageInfo->ImageBase, FullImageName);
 
 	bool nameTruncated = false;
 	WCHAR nameScratch[MaxImageNameBytes / sizeof(WCHAR)];

@@ -59,6 +59,23 @@ struct Globals {
 	DropTarget* Target;
 	volatile LONG64 DropCounter; // stored-name generator, per boot
 
+	//
+	// D3 injection engine (all heap-built: FastMutex/ctor traps).
+	//
+	bool InjectionEnabled;
+	UNICODE_STRING SensorDllPath;   // heap buffer, verbatim to LdrLoadDll
+	FileWatch* InjectionBlocklist;  // compiled defaults, always on
+	FileWatch* InjectionExtraBlocklist; // policy extras, usually empty
+	LIST_ENTRY InjectionLedger;
+	FastMutex* InjectionLedgerLock;
+	ULONG InjectionLedgerCount;
+	ULONG LdrLoadDllRva;            // resolved from the first ntdll load
+	bool LdrLoadDllRvaResolved;
+	volatile LONG64 InjectionsQueued;
+	volatile LONG64 InjectionsFailed;
+	volatile LONG64 SensorsRegistered;
+	volatile LONG64 SensorsRejected;
+
 	// File telemetry stays OFF until a client (agent/dumper) sends
 	// SET_FILE_WATCH — a driver that observes nothing cannot flood anything.
 	volatile LONG64 FileWatchEnabled;
@@ -75,3 +92,6 @@ struct Globals {
 	// File-telemetry policy (heap-built: see FileWatch.h).
 	FileWatch* Watch;
 };
+
+// The single engine state; defined in secoutfall.cpp.
+extern Globals g_Data;
