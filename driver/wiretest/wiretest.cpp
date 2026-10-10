@@ -176,6 +176,18 @@ void BuildDropCaptured() {
 	AppendWstr(stored);
 }
 
+void BuildProtectionEvent() {
+	ULONG pid = 4242; // the OPENER (unprotected caller)
+	ProtectionEventRecord record {};
+	record.Header = MakeHeader(ProtectionEvent, pid, 0, TRUNC_NONE, ProtectionEventFixed);
+	record.ProtectedPid = 1004;
+	record.TargetIsThread = 0;
+	record.ProtectedCreateTime = IdentityBase + 1004;
+	record.OriginalDesiredAccess = 0x1FFFFF; // PROCESS_ALL_ACCESS
+	record.StrippedAccess = 0x0001 | 0x0002 | 0x0008 | 0x0010 | 0x0020 | 0x0040;
+	AppendRaw(&record, ProtectionEventFixed);
+}
+
 void BuildBehaviorCall() {
 	ULONG pid = 1004;
 	BehaviorCallRecord record {};
@@ -293,7 +305,7 @@ bool WalkFixture(const std::vector<BYTE>& bytes) {
 		offset += header->Size;
 	}
 	printf("fixture walks clean: %d records, %zu bytes\n", count, bytes.size());
-	return count == 15;
+	return count == 16;
 }
 
 } // namespace
@@ -326,6 +338,7 @@ int main(int argc, char** argv) {
 	BuildFileRenamed(); // 13
 	BuildDropCaptured(); // 14
 	BuildBehaviorCall(); // 15
+	BuildProtectionEvent(); // 16
 	auto fixture = g_out;
 
 	if (!WalkFixture(fixture)) {

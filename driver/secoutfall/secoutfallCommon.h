@@ -41,6 +41,7 @@ enum RecordType : USHORT {
 	FileRenamed = 13,
 	DropCaptured = 14,
 	BehaviorCall = 15,
+	ProtectionEvent = 16,
 };
 
 // Behavior APIs reported by the sensor (wire values, stable). The v1 hook
@@ -195,6 +196,20 @@ struct BehaviorCallRecord {
 	ULONG64 Arg3;              // +80
 };                             // fixed 88
 
+// Handle access to a PROTECTED process was stripped by ObCallbacks. The
+// header pid/identity identify the OPENER (the acting process); the record
+// carries the protected target and what was removed. Rare, security-grade
+// evidence: control-class queue.
+struct ProtectionEventRecord {
+	RecordHeader Header;           // +0 (pid = opener)
+	ULONG ProtectedPid;            // +48
+	UCHAR TargetIsThread;          // +52 handle was to a thread of the target
+	UCHAR Reserved[3];
+	ULONG64 ProtectedCreateTime;   // +56 target identity
+	ULONG64 OriginalDesiredAccess; // +64 requested access
+	ULONG64 StrippedAccess;        // +72 access bits removed
+};                                 // fixed 80
+
 const ULONG DROP_METHOD_HARDLINK = 0;
 const ULONG DROP_METHOD_COPY = 1;
 
@@ -227,6 +242,8 @@ struct DriverStats {
 	ULONG64 InjectionsFailed;  // allocation / thread-gone / queue failures
 	ULONG64 SensorsRegistered; // nonce echoes accepted
 	ULONG64 SensorsRejected;   // challenge/register denials
+	ULONG64 ProtectionsStripped;   // handle-open attempts stripped
+	ULONG64 ProtectionTrusted;     // attempts allowed (trusted caller)
 	ULONG64 SensorEventsDrained;   // ring slots promoted to records
 	ULONG64 SensorEventsDropped;   // slots skipped: torn, stale or garbage
 	ULONG64 SensorRingsActive;     // currently registered sensors with rings
@@ -247,6 +264,7 @@ const ULONG FileWrittenFixed = sizeof(FileWrittenRecord);           // 64
 const ULONG FileRenamedFixed = sizeof(FileRenamedRecord);           // 56
 const ULONG DropCapturedFixed = 60;
 const ULONG BehaviorCallFixed = sizeof(BehaviorCallRecord);         // 88
+const ULONG ProtectionEventFixed = sizeof(ProtectionEventRecord);   // 80
 static_assert(offsetof(ThreadRecord, ThreadId) + sizeof(ULONG) == ThreadFixed, "wire layout pinned");
 static_assert(offsetof(RegistryKeyRecord, PathBytes) + sizeof(USHORT) == RegistryKeyFixed, "wire layout pinned");
 static_assert(offsetof(FileRecord, PathBytes) + sizeof(USHORT) == FileFixed, "wire layout pinned");
@@ -271,6 +289,17 @@ static_assert(offsetof(FileRecord, PathBytes) + sizeof(USHORT) == FileFixed, "wi
 // (e.g. \Device\HarddiskVolume2\Drops). Directory is created on first use.
 #define IOCTL_SECOUTFALL_SET_DROP_POLICY \
 	CTL_CODE(0x8000u, 0x804u, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+// Protects processes BY NAME (same NUL-terminated blob form): matching
+// processes get ObCallbacks handle-stripping (terminate/VM-write/VM-read/
+// create-thread removed for unprotected callers). Cleared by Enabled=FALSE.
+#define IOCTL_SECOUTFALL_SET_PROTECTED \
+	CTL_CODE(0x8000u, 0x808u, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+// Replaces the DEVICE object's DACL with a caller-built self-relative
+// security descriptor (raw SD bytes) — the D5 agent pushes a console-user
+// ACE so the injected sensor can reach the control device from a
+// non-elevated target.
+#define IOCTL_SECOUTFALL_SET_DEVICE_SECURITY \
+	CTL_CODE(0x8000u, 0x809u, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 // D3 injection policy: enabled + sensor DLL path + extra exclusion names.
 #define IOCTL_SECOUTFALL_SET_INJECTION_POLICY \
 	CTL_CODE(0x8000u, 0x805u, METHOD_BUFFERED, FILE_WRITE_ACCESS)
@@ -302,6 +331,26 @@ struct FileWatchPolicy {
 struct SelftestFloodRequest {
 	ULONG Class;
 	ULONG Count;
+};
+
+// Input blob for IOCTL_SECOUTFALL_SET_PROTECTED: protected process image
+// names (NUL-terminated UTF-16, with the extension, e.g. L"agent.exe"),
+// case-insensitive suffix match. Enabled=FALSE clears protection.
+struct ProtectionPolicy {
+	UCHAR Enabled;
+	UCHAR Reserved[3];
+	ULONG NamesBytes;
+	// WCHAR names[]: name L"x.exe" L"\0" ...
+};
+
+// Input blob for IOCTL_SECOUTFALL_SET_DEVICE_SECURITY: a self-relative
+// SECURITY_DESCRIPTOR in raw bytes (built user-side; SDDL conversion is a
+// user-mode facility).
+struct DeviceSecurityBlob {
+	UCHAR Enabled;
+	UCHAR Reserved[3];
+	ULONG SdBytes;
+	// UCHAR securityDescriptor[]
 };
 
 // Input blob for IOCTL_SECOUTFALL_SET_INJECTION_POLICY: sensor DLL path
@@ -421,3 +470,8 @@ static_assert(offsetof(BehaviorCallRecord, Arg0) == 56, "wire layout pinned");
 static_assert(offsetof(BehaviorCallRecord, Arg1) == 64, "wire layout pinned");
 static_assert(offsetof(BehaviorCallRecord, Arg2) == 72, "wire layout pinned");
 static_assert(offsetof(BehaviorCallRecord, Arg3) == 80, "wire layout pinned");
+static_assert(offsetof(ProtectionEventRecord, ProtectedPid) == 48, "wire layout pinned");
+static_assert(offsetof(ProtectionEventRecord, TargetIsThread) == 52, "wire layout pinned");
+static_assert(offsetof(ProtectionEventRecord, ProtectedCreateTime) == 56, "wire layout pinned");
+static_assert(offsetof(ProtectionEventRecord, OriginalDesiredAccess) == 64, "wire layout pinned");
+static_assert(offsetof(ProtectionEventRecord, StrippedAccess) == 72, "wire layout pinned");

@@ -77,6 +77,9 @@ struct Globals {
 	volatile LONG64 InjectionsFailed;
 	volatile LONG64 SensorsRegistered;
 	volatile LONG64 SensorsRejected;
+	volatile LONG64 ProtectionsStripped; // handle-open attempts stripped
+	volatile LONG64 ProtectionTrusted;   // attempts allowed (trusted caller)
+	PVOID ObRegistration;                // ObCallbacks handle (D4)
 
 	// File telemetry stays OFF until a client (agent/dumper) sends
 	// SET_FILE_WATCH — a driver that observes nothing cannot flood anything.

@@ -94,6 +94,7 @@
     </ClCompile>
     <ClCompile Include="secoutfall.cpp" />
     <ClCompile Include="Injection.cpp" />
+    <ClCompile Include="Protection.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

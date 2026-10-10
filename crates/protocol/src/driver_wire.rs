@@ -120,6 +120,8 @@ pub enum RecordKind {
     DropCaptured,
     /// A hooked-API call was reported by the sensor ring.
     BehaviorCall,
+    /// Handle access to a protected process was stripped (D4).
+    ProtectionEvent,
 }
 
 impl RecordKind {
@@ -140,6 +142,7 @@ impl RecordKind {
             13 => Some(Self::FileRenamed),
             14 => Some(Self::DropCaptured),
             15 => Some(Self::BehaviorCall),
+            16 => Some(Self::ProtectionEvent),
             _ => None,
         }
     }
@@ -302,6 +305,20 @@ pub enum Payload {
         arg2: u64,
         /// Raw fourth argument.
         arg3: u64,
+    },
+    /// Handle access to a protected process was stripped. The header
+    /// pid/identity identify the OPENER (the acting process).
+    ProtectionEvent {
+        /// The protected process whose handle was opened.
+        protected_pid: u32,
+        /// The protected process's creation time (identity).
+        protected_create_time: u64,
+        /// True when the handle was to a thread of the target.
+        target_is_thread: bool,
+        /// Access the opener originally requested.
+        original_access: u64,
+        /// Access bits actually removed.
+        stripped_access: u64,
     },
 }
 
@@ -469,6 +486,7 @@ fn min_size(kind: RecordKind) -> usize {
         RecordKind::ImageLoaded | RecordKind::RegistrySetValue | RecordKind::FileWritten => 64,
         RecordKind::DropCaptured => 60,
         RecordKind::BehaviorCall => 88,
+        RecordKind::ProtectionEvent => 80,
     }
 }
 
@@ -548,6 +566,7 @@ fn payload_of(
         }
         RecordKind::DropCaptured => parse_drop_captured(record)?,
         RecordKind::BehaviorCall => parse_behavior_call(record)?,
+        RecordKind::ProtectionEvent => parse_protection_event(record)?,
     };
     Ok(payload)
 }
@@ -581,6 +600,21 @@ fn parse_drop_captured(record: &[u8]) -> Result<Payload, DecodeError> {
     let path = string_at(record, path_offset, path_bytes)?;
     let stored_name = string_at(record, stored_offset, stored_bytes)?;
     Ok(Payload::DropCaptured { path, stored_name, method })
+}
+
+fn parse_protection_event(record: &[u8]) -> Result<Payload, DecodeError> {
+    let protected_pid = u32_at(record, 48)?;
+    let target_is_thread = u8_at(record, 52)? != 0;
+    let protected_create_time = u64_at(record, 56)?;
+    let original_access = u64_at(record, 64)?;
+    let stripped_access = u64_at(record, 72)?;
+    Ok(Payload::ProtectionEvent {
+        protected_pid,
+        protected_create_time,
+        target_is_thread,
+        original_access,
+        stripped_access,
+    })
 }
 
 fn parse_behavior_call(record: &[u8]) -> Result<Payload, DecodeError> {
@@ -661,7 +695,10 @@ mod tests {
             .expect("committed fixture must exist — regenerate with wiretest --generate");
         let records = decode_all(&bytes).expect("fixture must decode");
 
-        assert_eq!(records.len(), 15);
+        // This test pins the CANONICAL (control-class) half of the fixture;
+        // records 9-16 (file/drop/behavior/protection) are covered by
+        // golden_fixture_file_and_behavior_records_decode below.
+        assert_eq!(records.len(), 16);
         for (index, record) in records.iter().enumerate() {
             assert_eq!(record.sequence(), index as u64 + 1, "per-boot seq is gap-free");
             assert_eq!(record.time(), TIME_BASE + record.sequence());
@@ -737,9 +774,10 @@ mod tests {
         let bytes = std::fs::read(golden_fixture_path())
             .expect("committed fixture must exist — regenerate with wiretest --generate");
         let records = decode_all(&bytes).expect("fixture must decode");
-        assert_eq!(records.len(), 15);
+        assert_eq!(records.len(), 16);
         for (index, record) in records.iter().enumerate() {
             assert_eq!(record.sequence(), index as u64 + 1, "per-boot seq is gap-free");
+            assert_eq!(record.time(), TIME_BASE + record.sequence());
         }
         // 9: file created.
         assert_eq!(records[8].kind(), RecordKind::FileCreated);
@@ -805,6 +843,36 @@ mod tests {
         assert_eq!(*arg1, 0x1234);
         assert_eq!(*arg2, 0x5678);
         assert_eq!(*arg3, 0x9ABC);
+    }
+
+    #[test]
+    fn golden_fixture_protection_record_decodes() {
+        let bytes = std::fs::read(golden_fixture_path())
+            .expect("committed fixture must exist — regenerate with wiretest --generate");
+        let records = decode_all(&bytes).expect("fixture must decode");
+        assert_eq!(records.len(), 16);
+
+        // 16: protection event (opener identity in the header, target in the
+        // payload, stripped access bits preserved).
+        assert_eq!(records[15].kind(), RecordKind::ProtectionEvent);
+        assert_eq!(records[15].pid(), 4242); // the opener
+        assert_eq!(records[15].process_create_time(), 0); // opener pre-dates us
+        assert_eq!(records[15].trunc_flags(), TRUNC_NONE);
+        let Payload::ProtectionEvent {
+            protected_pid,
+            protected_create_time,
+            target_is_thread,
+            original_access,
+            stripped_access,
+        } = records[15].payload()
+        else {
+            panic!("payload kind mismatch")
+        };
+        assert_eq!(*protected_pid, 1004);
+        assert_eq!(*protected_create_time, IDENTITY_BASE + 1004);
+        assert!(!*target_is_thread);
+        assert_eq!(*original_access, 0x1F_FFFF);
+        assert_eq!(*stripped_access, 0x7B); // 0x1|0x2|0x8|0x10|0x20|0x40
     }
 
     #[test]

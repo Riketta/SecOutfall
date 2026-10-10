@@ -15,6 +15,7 @@
 #include "pch.h"
 #include "secoutfallCommon.h"
 #include "Injection.h"
+#include "Protection.h"
 #include "secoutfall.h"
 #include "Memory.h"
 
@@ -613,6 +614,23 @@ void InjectionEmitBehaviorCall(_In_ ULONG pid, _In_ ULONG64 createTime, _In_ ULO
 	EmitBehaviorCallInternal(pid, createTime, threadId, api, arg0, arg1, arg2, arg3);
 }
 
+// Protection attribution (Protection.cpp): one stripped handle-open becomes
+// a control-class record naming the opener and what was removed.
+void ProtectionEmitStrippedEvent(_In_ ULONG openerPid, _In_ ULONG64 openerIdentity,
+	_In_ ULONG protectedPid, _In_ ULONG64 protectedCreateTime, _In_ UCHAR targetIsThread,
+	_In_ ULONG64 originalAccess, _In_ ULONG64 strippedAccess) {
+	auto header = AllocRecord(ProtectionEventFixed, ProtectionEvent, openerPid, openerIdentity);
+	if (header == nullptr)
+		return;
+	auto record = reinterpret_cast<ProtectionEventRecord*>(header);
+	record->ProtectedPid = protectedPid;
+	record->TargetIsThread = targetIsThread;
+	record->ProtectedCreateTime = protectedCreateTime;
+	record->OriginalDesiredAccess = originalAccess;
+	record->StrippedAccess = strippedAccess;
+	PushRecord(CONTAINING_RECORD(header, ItemFull<RecordHeader>, Item));
+}
+
 
 extern "C"
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
@@ -622,6 +640,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 	PDEVICE_OBJECT DeviceObject = nullptr;
 	bool processCallbacks = false, threadCallbacks = false, imageCallbacks = false, registryCallbacks = false;
 	bool filterRegistered = false;
+	bool obRegistered = false;
 
 	// The malware is a user of this device: SYSTEM + Administrators only.
 	UNICODE_STRING sddl = RTL_CONSTANT_STRING(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
@@ -651,6 +670,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 		g_Data.DropWatch = new (PagedPool) FileWatch;
 		g_Data.DropWatch->Init();
 		InjectionInit();
+		ProtectionInit();
 		g_Data.Drops = new (PagedPool) Queue<FastMutex>(512);
 		g_Data.Items = new (PagedPool) Queue<FastMutex>(256, &g_Data.QueueOverwritten);
 		// Flood class gets its own bounded list: a write storm must not evict
@@ -703,6 +723,14 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 		}
 		filterRegistered = true;
 
+		// D4: ObCallbacks self-protection registration.
+		status = ProtectionRegisterCallbacks(DriverObject);
+		if (!NT_SUCCESS(status)) {
+			KdPrint((DRIVER_PREFIX "failed to register ob callbacks (status=%08X)\n", status));
+			break;
+		}
+		obRegistered = true;
+
 		// Starts attachment to the instances configured at install time
 		// (Services\secoutfall\Instances — see driver/install.ps1).
 		status = ::FltStartFiltering(g_Data.Filter);
@@ -717,6 +745,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 	} while (false);
 
 	if (!NT_SUCCESS(status)) {
+		if (obRegistered)
+			ProtectionUnregisterCallbacks();
 		if (filterRegistered)
 			::FltUnregisterFilter(g_Data.Filter);
 		if (registryCallbacks)
@@ -787,6 +817,8 @@ NTSTATUS CompleteRequest(PIRP Irp, NTSTATUS status = STATUS_SUCCESS, ULONG_PTR I
 void SecOutfallUnload(PDRIVER_OBJECT DriverObject) {
 	// Removals quiesce in-flight callbacks before returning; FltUnregisterFilter
 	// likewise waits for file-system activity to drain before we free queues.
+	ProtectionUnregisterCallbacks();
+	ProtectionCleanup();
 	InjectionCleanup();
 	::CmUnRegisterCallback(g_Data.RegistryCookie);
 	::PsRemoveLoadImageNotifyRoutine(OnImageLoadNotify);
@@ -819,7 +851,7 @@ NTSTATUS SecOutfallCreateClose(PDEVICE_OBJECT, PIRP Irp) {
 	return CompleteRequest(Irp);
 }
 
-NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
+NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 	NTSTATUS status = STATUS_SUCCESS;
 	auto stack = IoGetCurrentIrpStackLocation(Irp);
 	ULONG_PTR len = 0;
@@ -1112,6 +1144,62 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
 			break;
 		}
 
+		case IOCTL_SECOUTFALL_SET_PROTECTED:
+		{
+			auto inputLength = stack->Parameters.DeviceIoControl.InputBufferLength;
+			auto input = (ProtectionPolicy*)Irp->AssociatedIrp.SystemBuffer;
+			if (input == nullptr || inputLength < sizeof(ProtectionPolicy)
+				|| input->Enabled > 1) {
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			auto namesBytes = input->NamesBytes;
+			if (namesBytes > 4096 || namesBytes % 2 != 0
+				|| inputLength != sizeof(ProtectionPolicy) + namesBytes) {
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			if (!input->Enabled) {
+				ProtectionSetPolicy(false, nullptr);
+				break;
+			}
+			UNICODE_STRING names;
+			names.Buffer = reinterpret_cast<PWCH>(
+				reinterpret_cast<UCHAR*>(input) + sizeof(ProtectionPolicy));
+			names.Length = static_cast<USHORT>(namesBytes);
+			names.MaximumLength = names.Length;
+			if (!ProtectionSetPolicy(true, &names))
+				status = STATUS_INSUFFICIENT_RESOURCES;
+			break;
+		}
+
+		case IOCTL_SECOUTFALL_SET_DEVICE_SECURITY:
+		{
+			auto inputLength = stack->Parameters.DeviceIoControl.InputBufferLength;
+			auto input = (DeviceSecurityBlob*)Irp->AssociatedIrp.SystemBuffer;
+			if (input == nullptr || inputLength < sizeof(DeviceSecurityBlob)
+				|| input->Enabled > 1) {
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			auto sdBytes = input->SdBytes;
+			if (sdBytes == 0 || sdBytes > 4096
+				|| inputLength != sizeof(DeviceSecurityBlob) + sdBytes) {
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			if (!input->Enabled) {
+				// Disabling re-applies the compiled SDDL by recreating the
+				// security descriptor: simplest honest v1 is to reject the
+				// disable (the agent simply never sends it).
+				status = STATUS_NOT_SUPPORTED;
+				break;
+			}
+			status = ProtectionSetDeviceSecurity(DeviceObject,
+				reinterpret_cast<UCHAR*>(input) + sizeof(DeviceSecurityBlob), sdBytes);
+			break;
+		}
+
 		case IOCTL_SECOUTFALL_SET_INJECTION_POLICY:
 		{
 			auto inputLength = stack->Parameters.DeviceIoControl.InputBufferLength;
@@ -1270,6 +1358,9 @@ void OnProcessNotify(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _Inout_op
 
 		// D3: universal sensor injection (engine applies its own blocklist).
 		InjectionOnProcessCreate(pid, createTime, CreateInfo->ImageFileName);
+
+		// D4: protect our own processes (name policy + ObCallbacks table).
+		ProtectionOnProcessCreate(pid, createTime, CreateInfo->ImageFileName);
 	}
 	else {
 		//
@@ -1281,6 +1372,7 @@ void OnProcessNotify(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _Inout_op
 			NextIdentityMiss();
 		g_Data.Identities->Remove(pid);
 		InjectionOnProcessExit(pid);
+		ProtectionOnProcessExit(pid);
 
 		auto header = AllocRecord(ProcessExitedFixed, ProcessExited, pid, createTime);
 		if (header == nullptr)
