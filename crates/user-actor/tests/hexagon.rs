@@ -146,7 +146,7 @@ async fn screencapture_disabled_means_zero_captures() {
     harness.kernel.accept(focus(7, "doc.txt")).await;
     drain().await;
     assert_eq!(harness.capture.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-    assert!(harness.sink.frames().is_empty());
+    assert_eq!(harness.sink.frames().len(), 0);
     harness.kernel.shutdown().await;
 }
 
@@ -156,7 +156,7 @@ async fn sink_failure_does_not_consume_quota_sequence() {
     harness.sink.fail_sends.store(true, std::sync::atomic::Ordering::SeqCst);
     harness.kernel.accept(focus(1, "a")).await;
     drain().await;
-    assert!(harness.sink.frames().is_empty());
+    assert_eq!(harness.sink.frames().len(), 0);
 
     // Transport heals: the next frame keeps sequence 0 (the failed one is gone).
     harness.sink.fail_sends.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -191,7 +191,7 @@ async fn capture_failure_does_not_consume_quota() {
     kernel.accept(focus(3, "c")).await;
     drain().await;
     assert_eq!(failing.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
-    assert!(sink.frames().is_empty());
+    assert_eq!(sink.frames().len(), 0);
     kernel.shutdown().await;
 }
 

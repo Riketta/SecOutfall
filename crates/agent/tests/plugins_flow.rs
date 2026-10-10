@@ -357,7 +357,7 @@ async fn oversized_drops_are_refused_not_uploaded() {
         "over-cap drop must not be copied"
     );
     assert!(std::fs::read_dir(&drops_dir).unwrap().next().is_none(), "no part litter");
-    assert!(harness.uploader.uploads().is_empty());
+    assert_eq!(harness.uploader.uploads().len(), 0);
 
     harness.shutdown().await;
     let _ = std::fs::remove_dir_all(&drops_dir);
@@ -422,7 +422,7 @@ async fn screenshots_are_refused_when_capture_is_disabled() {
         !harness.broker.event_sequence().contains(&EventType::ScreenshotReceived),
         "no wire traffic for refused frames"
     );
-    assert!(harness.uploader.uploads().is_empty());
+    assert_eq!(harness.uploader.uploads().len(), 0);
     harness.shutdown().await;
 }
 

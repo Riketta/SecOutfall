@@ -1,55 +1,184 @@
 #pragma once
 
+#include <stddef.h> // offsetof — freestanding, safe in kernel mode
+
+// secoutfall driver <-> user-mode wire format, v2 (D1).
+//
+// v1 inherited the WKP SysMon base layout: no magic/version, `short` sizes,
+// fixed name buffers with unchecked copies. v2 is the hardened contract:
+//   - magic + version in every record header,
+//   - total record size as u32; per-string lengths u16 capped well below
+//     that, with per-field truncation flags in the header,
+//   - process identity = (pid, creation time) — never pid alone (recycling),
+//   - a per-boot monotonic sequence for ordering,
+//   - loss counters and stats surfaced via a dedicated IOCTL.
+//
+// The canonical fixture for BOTH sides lives in driver/tests/golden_v2.bin:
+// the `wiretest` host tool generates/verifies it (C side), and
+// crates/protocol/src/driver_wire.rs decodes it (Rust side). Changing this
+// file without regenerating the fixture and the Rust mirror breaks the
+// golden tests — by design.
+
 #define SECOUTFALL_NAME L"secoutfall"
 
-enum ItemType : short {
-	ProcessCreated,
-	ProcessExited,
-	ThreadCreated,
-	ThreadExited,
-	RegistrySetValue
+#define SECOUTFALL_WIRE_MAGIC 0x5346   // 'SF'
+#define SECOUTFALL_WIRE_VERSION 2
+
+// Record types (wire enum, stable values).
+enum RecordType : USHORT {
+	ProcessCreated = 1,
+	ProcessExited = 2,
+	ThreadCreated = 3,
+	ThreadExited = 4,
+	ImageLoaded = 5,
+	RegistryKeyCreated = 6,
+	RegistryKeyDeleted = 7,
+	RegistrySetValue = 8,
 };
 
-// D0 wire format: inherited from the WKP SysMon base, kept byte-compatible
-// with its client. D1 replaces this with the versioned schema (magic +
-// version + u32 sizes + caps + truncation flags) mirrored into `protocol`.
-struct ItemHeader {
-	ItemType Type;
-	short Size;
-	LARGE_INTEGER Time;
-};
+// Truncation flags (header TruncFlags): which variable-length field hit its
+// cap. A consumer must treat flagged strings as PREFIXES of the truth.
+const UCHAR TRUNC_NONE = 0x00;
+const UCHAR TRUNC_CMDLINE = 0x01;
+const UCHAR TRUNC_KEY_PATH = 0x02;
+const UCHAR TRUNC_VALUE_NAME = 0x04;
+const UCHAR TRUNC_DATA = 0x08;
+const UCHAR TRUNC_IMAGE_NAME = 0x10;
 
-struct ProcessCreateInfo : ItemHeader {
-	ULONG ProcessId;
-	ULONG ParentProcessId;
-	short CommandLineOffset;
-	short CommandLineLength;
-};
-
-struct ProcessExitInfo : ItemHeader {
-	ULONG ProcessId;
-};
-
-struct ThreadCreateExitInfo : ItemHeader {
-	ULONG ThreadId;
-	ULONG ProcessId;
-};
-
-struct RegistrySetValueInfo : ItemHeader {
-	ULONG ProcessId;
-	WCHAR KeyName[256];
-	WCHAR ValueName[64];
-	ULONG DataType;
-	UCHAR Data[128];
-	ULONG DataSize;
-};
-
-// Command-line capture cap in bytes (whole WCHARs). The base captured the
-// full ~64 KB command line, overflowing the `short Size` field; capped here
-// until the D1 wire rework.
+// String caps in BYTES (whole WCHARs on the wire). All fit u16 lengths.
 const USHORT MaxCommandLineBytes = 8192;
+const USHORT MaxKeyPathBytes = 1024;
+const USHORT MaxValueNameBytes = 512;
+const USHORT MaxImageNameBytes = 1024;
+const ULONG MaxValueDataBytes = 128;
 
-// Unsigned literals: 0x8000 << 16 would overflow int (UB) and the value
-// would stop being a constant expression (unusable as a case label).
+//
+// Record layout: RecordHeader followed by the type-specific fixed payload
+// and variable-length WCHAR data. All offsets are from the record start.
+// Natural x64 alignment, little-endian; no #pragma pack — the static_asserts
+// pin every offset and the total header size.
+//
+struct RecordHeader {
+	USHORT Magic;              // +0  SECOUTFALL_WIRE_MAGIC
+	UCHAR Version;             // +2  SECOUTFALL_WIRE_VERSION
+	UCHAR TruncFlags;          // +3  TRUNC_*
+	USHORT Type;               // +4  RecordType
+	USHORT HeaderSize;         // +6  sizeof(RecordHeader)
+	ULONG ProcessId;           // +8
+	ULONG64 Sequence;          // +16 per-boot monotonic
+	ULONG64 Time;              // +24 system time at the event
+	ULONG64 ProcessCreateTime; // +32 identity token; 0 = pre-load process
+	ULONG Size;                // +40 total record bytes (header included)
+};                             // sizeof = 48
+
+struct ProcessCreatedRecord {
+	RecordHeader Header;       // +0
+	ULONG ParentProcessId;     // +48
+	USHORT CommandLineOffset;  // +52 from record start; 0 = absent
+	USHORT CommandLineBytes;   // +54 whole WCHARs
+	// WCHAR CommandLine[] at CommandLineOffset (when non-zero)
+};
+
+struct ProcessExitedRecord {
+	RecordHeader Header;       // +0
+	// exit status intentionally omitted: our taxonomy models liveness, not
+	// exit codes; add behind a version bump if scoring ever needs it.
+};
+
+struct ThreadRecord {
+	RecordHeader Header;       // +0
+	ULONG ThreadId;            // +48
+};
+
+struct ImageLoadedRecord {
+	RecordHeader Header;       // +0
+	ULONG64 ImageBase;         // +48
+	ULONG ImageSize;           // +56
+	USHORT NameOffset;         // +60 from record start
+	USHORT NameBytes;          // +62 whole WCHARs
+	// WCHAR Name[] at NameOffset
+};
+
+struct RegistryKeyRecord {
+	RecordHeader Header;       // +0
+	USHORT PathOffset;         // +48 from record start
+	USHORT PathBytes;          // +50 whole WCHARs
+	// WCHAR Path[] at PathOffset
+};
+
+struct RegistrySetValueRecord {
+	RecordHeader Header;       // +0
+	USHORT KeyPathOffset;      // +48 from record start
+	USHORT KeyPathBytes;       // +50 whole WCHARs
+	USHORT ValueNameOffset;    // +52 from record start
+	USHORT ValueNameBytes;     // +54 whole WCHARs
+	ULONG DataType;            // +56 REG_* value type
+	ULONG DataBytes;           // +60 bytes actually copied (<= MaxValueDataBytes)
+	// WCHAR KeyPath[] at KeyPathOffset
+	// WCHAR ValueName[] at ValueNameOffset
+	// UCHAR Data[] at the end (after ValueName)
+};
+
+// Kernel-side loss/diagnostic counters (also the wire shape of
+// IOCTL_SECOUTFALL_GET_STATS: magic + version prefixed, stats only — the
+// client checks them the same way as records).
+struct DriverStats {
+	USHORT Magic;
+	UCHAR Version;
+	UCHAR Reserved;
+	ULONG QueueDepth;
+	ULONG QueueCapacity;
+	ULONG64 Sequence;          // last assigned sequence == records emitted
+	ULONG64 QueueOverwritten;  // drop-oldest events
+	ULONG64 AllocFailures;     // pool allocation failures in callbacks
+	ULONG64 OversizedSkipped;  // drain-side skip+count
+	ULONG64 IdentityMisses;    // identity lookups for unknown pids
+};
+
+// Fixed payload extents ON THE WIRE: header + payload FIELDS, excluding any
+// struct tail padding (records are byte-packed — the next record starts at
+// `Size`, so sizeof(ThreadRecord)'s 56-byte tail-padded form never goes on
+// the wire). static_asserts keep the constants honest against the structs.
+const ULONG ProcessExitedFixed = sizeof(ProcessExitedRecord);       // 48
+const ULONG ProcessCreatedFixed = sizeof(ProcessCreatedRecord);     // 56
+const ULONG ThreadFixed = 52;
+const ULONG ImageLoadedFixed = sizeof(ImageLoadedRecord);           // 64
+const ULONG RegistryKeyFixed = 52;
+const ULONG RegistrySetValueFixed = sizeof(RegistrySetValueRecord); // 64
+static_assert(offsetof(ThreadRecord, ThreadId) + sizeof(ULONG) == ThreadFixed, "wire layout pinned");
+static_assert(offsetof(RegistryKeyRecord, PathBytes) + sizeof(USHORT) == RegistryKeyFixed, "wire layout pinned");
+
+// IOCTLs. Unsigned literals: 0x8000 << 16 would overflow int (UB) and the
+// value would stop being a constant expression (unusable as a case label).
 #define IOCTL_SECOUTFALL_GET_DATA \
 	CTL_CODE(0x8000u, 0x800u, METHOD_OUT_DIRECT, FILE_READ_ACCESS)
+#define IOCTL_SECOUTFALL_GET_STATS \
+	CTL_CODE(0x8000u, 0x801u, METHOD_BUFFERED, FILE_READ_ACCESS)
+
+static_assert(sizeof(RecordHeader) == 48, "wire header layout pinned");
+static_assert(offsetof(RecordHeader, Magic) == 0, "wire header layout pinned");
+static_assert(offsetof(RecordHeader, Version) == 2, "wire header layout pinned");
+static_assert(offsetof(RecordHeader, TruncFlags) == 3, "wire header layout pinned");
+static_assert(offsetof(RecordHeader, Type) == 4, "wire header layout pinned");
+static_assert(offsetof(RecordHeader, HeaderSize) == 6, "wire header layout pinned");
+static_assert(offsetof(RecordHeader, ProcessId) == 8, "wire header layout pinned");
+static_assert(offsetof(RecordHeader, Sequence) == 16, "wire header layout pinned");
+static_assert(offsetof(RecordHeader, Time) == 24, "wire header layout pinned");
+static_assert(offsetof(RecordHeader, ProcessCreateTime) == 32, "wire header layout pinned");
+static_assert(offsetof(RecordHeader, Size) == 40, "wire header layout pinned");
+static_assert(offsetof(ProcessCreatedRecord, ParentProcessId) == 48, "wire layout pinned");
+static_assert(offsetof(ProcessCreatedRecord, CommandLineOffset) == 52, "wire layout pinned");
+static_assert(offsetof(ProcessCreatedRecord, CommandLineBytes) == 54, "wire layout pinned");
+static_assert(offsetof(ThreadRecord, ThreadId) == 48, "wire layout pinned");
+static_assert(offsetof(ImageLoadedRecord, ImageBase) == 48, "wire layout pinned");
+static_assert(offsetof(ImageLoadedRecord, ImageSize) == 56, "wire layout pinned");
+static_assert(offsetof(ImageLoadedRecord, NameOffset) == 60, "wire layout pinned");
+static_assert(offsetof(ImageLoadedRecord, NameBytes) == 62, "wire layout pinned");
+static_assert(offsetof(RegistryKeyRecord, PathOffset) == 48, "wire layout pinned");
+static_assert(offsetof(RegistryKeyRecord, PathBytes) == 50, "wire layout pinned");
+static_assert(offsetof(RegistrySetValueRecord, KeyPathOffset) == 48, "wire layout pinned");
+static_assert(offsetof(RegistrySetValueRecord, KeyPathBytes) == 50, "wire layout pinned");
+static_assert(offsetof(RegistrySetValueRecord, ValueNameOffset) == 52, "wire layout pinned");
+static_assert(offsetof(RegistrySetValueRecord, ValueNameBytes) == 54, "wire layout pinned");
+static_assert(offsetof(RegistrySetValueRecord, DataType) == 56, "wire layout pinned");
+static_assert(offsetof(RegistrySetValueRecord, DataBytes) == 60, "wire layout pinned");

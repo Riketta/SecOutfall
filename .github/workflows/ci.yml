@@ -112,6 +112,14 @@ jobs:
           winget install --id Microsoft.WindowsSDK.10.0.26100 --exact --silent --accept-package-agreements --accept-source-agreements
           winget install --id Microsoft.WindowsWDK.10.0.26100 --exact --silent --accept-package-agreements --accept-source-agreements
 
-      - name: Build driver + dumper
+      - name: Build driver + dumper + wiretest
         shell: pwsh
         run: ./driver/build.ps1 -Configuration Release
+
+      # Wire contract: the committed fixture is byte-compared against the
+      # schema by the C tool; the Rust mirror decodes the same bytes in the
+      # protocol crate's golden test. Either side drifting fails one of the
+      # two lanes.
+      - name: Verify wire golden fixture (C side)
+        shell: pwsh
+        run: ./driver/wiretest/x64/Release/wiretest.exe --verify driver/tests/golden_v2.bin

@@ -319,7 +319,7 @@ proptest! {
         hostile in "(?s).{0,40}",
     ) {
         let sanitized = sanitize_extension(&hostile);
-        prop_assert!(!sanitized.is_empty());
+        prop_assert_ne!(sanitized.len(), 0);
         prop_assert!(sanitized.len() <= 16);
         prop_assert!(
             sanitized.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')),

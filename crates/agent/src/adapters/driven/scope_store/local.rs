@@ -59,7 +59,8 @@ mod tests {
 
         // First "run": fresh load, save a session.
         let fresh = repo.load().await.unwrap();
-        assert!(fresh.study_id.is_nil() && fresh.sessions.is_empty());
+        assert!(fresh.study_id.is_nil());
+        assert_eq!(fresh.sessions.len(), 0);
         let with_session = ScopeState {
             study_id: Uuid::from_u128(11),
             sessions: vec![crate::domain::scope::SessionRecord {
@@ -79,7 +80,7 @@ mod tests {
         assert!(raw.contains("\"abandoned\""), "full snapshot written");
         // … but the next run still loads fresh (no repeat-run session trap).
         let second_run = repo.load().await.unwrap();
-        assert!(second_run.sessions.is_empty());
+        assert_eq!(second_run.sessions.len(), 0);
 
         let _ = std::fs::remove_file(&path);
     }

@@ -6,6 +6,8 @@
 //!
 //! - [`events`] — canonical, source-agnostic event taxonomy (ETW today, driver later).
 //! - [`payload`] — typed `data` payload schemas, one per taxonomy member.
+//! - [`driver_wire`] — kernel driver ↔ user-mode record schema (v2), golden-pinned
+//!   to the C-side `wiretest` fixture.
 //! - [`nats`] — NATS envelope (protocol v3) for `control_channel` / `event_channel`.
 //! - [`ipc`] — agent↔user-actor named-pipe frame schema (IPC v1).
 //! - [`upload`] — HTTP collector `meta` multipart-part schema (drops, screenshots).
@@ -13,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod driver_wire;
 pub mod events;
 pub mod ipc;
 pub mod nats;

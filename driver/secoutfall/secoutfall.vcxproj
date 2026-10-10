@@ -15,6 +15,15 @@
     <TemplateGuid>{dd38f7fc-d7bd-488b-9242-7d8754cde80d}</TemplateGuid>
     <TargetFrameworkVersion>v4.5</TargetFrameworkVersion>
     <MinimumVisualStudioVersion>12.0</MinimumVisualStudioVersion>
+    <!-- Must live in Globals: the WDK's ImportBefore props derive
+         WDKBuildFolder from this value BEFORE Configuration groups are
+         read. Set later (or defaulted to the literal "10.0"), the WDK
+         props chain silently no-ops and the build dies on C1083 ntddk.h.
+         LITERAL, not "latest SDK": this box also registers a newer SDK
+         (28000, via VS 18) whose build\<ver> WDK folder does not exist —
+         "latest" resolution then breaks the WDK props chain. Pinned to the
+         installed WDK (26100), which CI's winget lane matches exactly. -->
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
     <Configuration>Debug</Configuration>
     <Platform Condition="'$(Platform)' == ''">x64</Platform>
     <RootNamespace>secoutfall</RootNamespace>

@@ -94,7 +94,7 @@ mod tests {
         let repo = JsonScopeRepository::new(temp_path("missing"));
         let state = repo.load().await.unwrap();
         assert!(state.study_id.is_nil());
-        assert!(state.sessions.is_empty());
+        assert_eq!(state.sessions.len(), 0);
     }
 
     #[tokio::test]

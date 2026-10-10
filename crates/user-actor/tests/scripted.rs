@@ -160,7 +160,7 @@ async fn notepad_activity_runs_script_steps_in_order() {
 
     let launch_log: Vec<RecordedLaunch> = launcher.launches();
     assert_eq!(launch_log.first().unwrap().program, "notepad.exe");
-    assert!(launch_log.first().unwrap().args.is_empty());
+    assert_eq!(launch_log.first().unwrap().args.len(), 0);
 
     let recorded = input.actions();
     assert!(
@@ -294,7 +294,7 @@ async fn launch_failure_aborts_the_pass_but_the_loop_survives() {
     for _ in 0..3 {
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
-    assert!(launcher.launches().is_empty());
+    assert_eq!(launcher.launches().len(), 0);
     assert!(input.actions().is_empty(), "no typing without the app");
 
     // The transport heals: the next pass launches and types.

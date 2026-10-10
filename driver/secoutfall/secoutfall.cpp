@@ -1,14 +1,16 @@
-// secoutfall — D0 process/thread/registry telemetry skeleton, adapted from
-// the WKP SysMon base (Pavel Yosifovich, Windows Kernel Programming).
+// secoutfall — process/thread/image/registry telemetry driver (WDM), adapted
+// from the WKP SysMon base (Pavel Yosifovich, Windows Kernel Programming).
 //
-// D0 deltas vs the base: renamed, secure device creation (SDDL: SYSTEM +
-// Administrators only), ExAllocatePool2 allocations, clamped command-line
-// capture (the base could overflow `short Size`), clamped registry name
-// copies (the base memcpied attacker-controlled lengths into fixed buffers),
-// atomic pop-if-fits drain (the base peeked and popped under separate locks),
-// validated IOCTL buffers (the base asserted instead of checking), and a
-// failure path that unwinds every resource. The full hardening list and
-// phase plan live in the repo AGENTS.md.
+// D1 state: wire format v2 (magic + version + u32 sizes + truncation flags +
+// per-boot sequence + pid/creation-time identity), image-load telemetry,
+// registry create/delete/set-value, loss counters surfaced via GET_STATS,
+// skip+count oversized-item drain policy. The full hardening list and phase
+// plan live in KERNEL.md at the repo root.
+//
+// Security posture: the device is SDDL-restricted (SYSTEM + Administrators),
+// every IOCTL buffer is validated, and every string captured from callbacks
+// is length-clamped with truncation flagged on the wire. The malware is a
+// user of this device.
 
 #include "pch.h"
 #include "secoutfallCommon.h"
@@ -21,6 +23,7 @@ DRIVER_DISPATCH SecOutfallDeviceControl;
 
 void OnProcessNotify(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo);
 void OnThreadNotify(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _In_ BOOLEAN Create);
+void OnImageLoadNotify(_In_ PUNICODE_STRING FullImageName, _In_ HANDLE ProcessId, _In_ PIMAGE_INFO ImageInfo);
 NTSTATUS OnRegistryNotify(_In_ PVOID CallbackContext, _In_opt_ PVOID Argument1, _In_opt_ PVOID Argument2);
 
 Globals g_Data;
@@ -30,13 +33,147 @@ const GUID GUID_DEVICECLASS_SECOUTFALL = {
 	0xb7a9e2d1, 0x4c3f, 0x4e8b, { 0x9a, 0x6d, 0x15, 0xf2, 0xc8, 0xe7, 0xb4, 0xa0 }
 };
 
+namespace {
+
+// Copies up to `capBytes` (whole WCHARs) from a counted string. Returns the
+// bytes copied; `truncated` reports that the source did not fit — surfaced
+// on the wire as a truncation flag, because a flagged string is a PREFIX of
+// the truth, never a different string.
+USHORT CopyNameW(_Out_ WCHAR* dest, _In_ PCUNICODE_STRING src, _In_ USHORT capBytes, _Out_ bool& truncated) {
+	truncated = false;
+	USHORT bytes = 0;
+	if (src && src->Buffer && src->Length > 0) {
+		bytes = static_cast<USHORT>(min(src->Length, capBytes));
+		bytes &= static_cast<USHORT>(~1); // whole WCHARs only
+		::memcpy(dest, src->Buffer, bytes);
+		truncated = bytes < src->Length;
+	}
+	return bytes;
+}
+
+ULONG64 NextIdentityMiss() {
+	return InterlockedIncrement64(&g_Data.IdentityMisses);
+}
+
+// Allocates a queue item and fills the v2 record header. Returns the WIRE
+// record (the ItemFull wrapper header is invisible on the wire). `totalSize`
+// is the full wire record size, header included.
+RecordHeader* AllocRecord(_In_ ULONG totalSize, _In_ RecordType type, _In_ ULONG pid, _In_opt_ ULONG64 processCreateTime) {
+	auto item = (ItemFull<RecordHeader>*)::ExAllocatePool2(POOL_FLAG_PAGED,
+		sizeof(ItemFull<RecordHeader>) + totalSize, DRIVER_TAG);
+	if (item == nullptr) {
+		InterlockedIncrement64(&g_Data.AllocFailures);
+		return nullptr;
+	}
+
+	auto header = &item->Item;
+	header->Magic = SECOUTFALL_WIRE_MAGIC;
+	header->Version = SECOUTFALL_WIRE_VERSION;
+	header->TruncFlags = TRUNC_NONE;
+	header->Type = static_cast<USHORT>(type);
+	header->HeaderSize = sizeof(RecordHeader);
+	header->ProcessId = pid;
+	header->Sequence = InterlockedIncrement64(&g_Data.NextSequence);
+	::KeQuerySystemTimePrecise(reinterpret_cast<PLARGE_INTEGER>(&header->Time));
+	header->ProcessCreateTime = processCreateTime;
+	header->Size = totalSize;
+	return header;
+}
+
+void PushRecord(_Inout_ ItemFull<RecordHeader>* item) {
+	g_Data.Items->Push(item);
+}
+
+// \REGISTRY\MACHINE prefix match that rejects longer accidental prefixes
+// (\REGISTRY\MACHINEXYZ must not match). Registry paths are case-insensitive.
+bool IsMachineKey(_In_ PCUNICODE_STRING name) {
+	static const UNICODE_STRING machine = RTL_CONSTANT_STRING(L"\\REGISTRY\\MACHINE");
+	if (!::RtlPrefixUnicodeString(&machine, name, TRUE))
+		return false;
+	if (name->Length > machine.Length) {
+		auto next = name->Buffer[machine.Length / sizeof(WCHAR)];
+		if (next != L'\\')
+			return false;
+	}
+	return true;
+}
+
+// Full key path for a registry-callback object. Returns nullptr on failure —
+// the caller skips the record rather than emit a nameless one.
+PCUNICODE_STRING GetKeyPath(_In_ PVOID Object) {
+	PCUNICODE_STRING name = nullptr;
+	if (!NT_SUCCESS(::CmCallbackGetKeyObjectIDEx(&g_Data.RegistryCookie, Object, nullptr, &name, 0)))
+		return nullptr;
+	return name;
+}
+
+void EmitRegistryKeyRecord(_In_ RecordType type, _In_ PCUNICODE_STRING path) {
+	bool truncated = false;
+	WCHAR pathScratch[MaxKeyPathBytes / sizeof(WCHAR)];
+	auto pathBytes = CopyNameW(pathScratch, path, MaxKeyPathBytes, truncated);
+
+	auto header = AllocRecord(RegistryKeyFixed + pathBytes, type,
+		HandleToULong(PsGetCurrentProcessId()), g_Data.Identities->Lookup(HandleToULong(PsGetCurrentProcessId())));
+	if (header == nullptr)
+		return;
+	if (truncated)
+		header->TruncFlags |= TRUNC_KEY_PATH;
+
+	auto record = reinterpret_cast<RegistryKeyRecord*>(header);
+	record->PathOffset = RegistryKeyFixed;
+	record->PathBytes = pathBytes;
+	::memcpy(reinterpret_cast<UCHAR*>(header) + record->PathOffset, pathScratch, pathBytes);
+
+	PushRecord(CONTAINING_RECORD(header, ItemFull<RecordHeader>, Item));
+}
+
+void EmitRegistrySetValue(_In_ PCUNICODE_STRING keyPath, _In_ PCUNICODE_STRING valueName,
+	_In_ ULONG dataType, _In_reads_bytes_(dataLength) PVOID data, _In_ ULONG dataLength) {
+	bool keyTruncated = false, valueTruncated = false, dataTruncated = false;
+	WCHAR keyScratch[MaxKeyPathBytes / sizeof(WCHAR)];
+	WCHAR valueScratch[MaxValueNameBytes / sizeof(WCHAR)];
+	auto keyBytes = CopyNameW(keyScratch, keyPath, MaxKeyPathBytes, keyTruncated);
+	auto valueBytes = CopyNameW(valueScratch, valueName, MaxValueNameBytes, valueTruncated);
+	auto copiedDataBytes = static_cast<ULONG>(min(dataLength, MaxValueDataBytes));
+
+	auto pid = HandleToULong(PsGetCurrentProcessId());
+	auto header = AllocRecord(RegistrySetValueFixed + keyBytes + valueBytes + copiedDataBytes,
+		RegistrySetValue, pid, g_Data.Identities->Lookup(pid));
+	if (header == nullptr)
+		return;
+	if (keyTruncated)
+		header->TruncFlags |= TRUNC_KEY_PATH;
+	if (valueTruncated)
+		header->TruncFlags |= TRUNC_VALUE_NAME;
+	if (dataTruncated || dataLength > MaxValueDataBytes)
+		header->TruncFlags |= TRUNC_DATA;
+
+	auto record = reinterpret_cast<RegistrySetValueRecord*>(header);
+	record->KeyPathOffset = RegistrySetValueFixed;
+	record->KeyPathBytes = keyBytes;
+	record->ValueNameOffset = record->KeyPathOffset + keyBytes;
+	record->ValueNameBytes = valueBytes;
+	record->DataType = dataType;
+	record->DataBytes = copiedDataBytes;
+
+	auto body = reinterpret_cast<UCHAR*>(header);
+	::memcpy(body + record->KeyPathOffset, keyScratch, keyBytes);
+	::memcpy(body + record->ValueNameOffset, valueScratch, valueBytes);
+	if (copiedDataBytes > 0 && data)
+		::memcpy(body + record->ValueNameOffset + valueBytes, data, copiedDataBytes);
+
+	PushRecord(CONTAINING_RECORD(header, ItemFull<RecordHeader>, Item));
+}
+
+} // namespace
+
 extern "C"
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 	KdPrint((DRIVER_PREFIX "DriverEntry entered\n"));
 
 	auto status = STATUS_SUCCESS;
 	PDEVICE_OBJECT DeviceObject = nullptr;
-	bool processCallbacks = false, threadCallbacks = false, registryCallbacks = false;
+	bool processCallbacks = false, threadCallbacks = false, imageCallbacks = false, registryCallbacks = false;
 
 	// The malware is a user of this device: SYSTEM + Administrators only.
 	UNICODE_STRING sddl = RTL_CONSTANT_STRING(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
@@ -57,10 +194,12 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 			break;
 		}
 
-		g_Data.Items = new (PagedPool) Queue<FastMutex>(256);
+		g_Data.Identities = new (PagedPool) IdentityTable;
+		g_Data.Identities->Init();
+		g_Data.Items = new (PagedPool) Queue<FastMutex>(256, &g_Data.QueueOverwritten);
 
 		//
-		// setup process and thread callbacks
+		// setup process, thread and image callbacks
 		//
 		status = ::PsSetCreateProcessNotifyRoutineEx(OnProcessNotify, FALSE);
 		if (!NT_SUCCESS(status)) {
@@ -76,6 +215,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 		}
 		threadCallbacks = true;
 
+		status = ::PsSetLoadImageNotifyRoutine(OnImageLoadNotify);
+		if (!NT_SUCCESS(status)) {
+			KdPrint((DRIVER_PREFIX "failed to set image callbacks (status=%08X)\n", status));
+			break;
+		}
+		imageCallbacks = true;
+
 		//
 		// setup registry callbacks
 		//
@@ -84,10 +230,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 			&g_Data.RegistryCookie, nullptr);
 		if (!NT_SUCCESS(status)) {
 			KdPrint((DRIVER_PREFIX "failed to register registry callbacks (status=%08X)\n", status));
+			break;
 		}
-		else {
-			registryCallbacks = true;
-		}
+		registryCallbacks = true;
 
 		DriverObject->DriverUnload = SecOutfallUnload;
 		DriverObject->MajorFunction[IRP_MJ_CREATE] = DriverObject->MajorFunction[IRP_MJ_CLOSE] = SecOutfallCreateClose;
@@ -97,17 +242,25 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 	if (!NT_SUCCESS(status)) {
 		if (registryCallbacks)
 			::CmUnRegisterCallback(g_Data.RegistryCookie);
+		if (imageCallbacks)
+			::PsRemoveLoadImageNotifyRoutine(OnImageLoadNotify);
 		if (threadCallbacks)
 			::PsRemoveCreateThreadNotifyRoutine(OnThreadNotify);
 		if (processCallbacks)
 			::PsSetCreateProcessNotifyRoutineEx(OnProcessNotify, TRUE);
 
-		// A failed DriverEntry does not reclaim driver-tagged pool: the queue
-		// and the symbolic link must be unwound here, not just at unload.
+		// A failed DriverEntry does not reclaim driver-tagged pool: the queue,
+		// the identity table and the symbolic link must be unwound here, not
+		// just at unload.
 		if (g_Data.Items) {
-			g_Data.Items->FreeAll<ItemFull<ItemHeader>>();
+			g_Data.Items->FreeAll<ItemFull<RecordHeader>>();
 			delete g_Data.Items;
 			g_Data.Items = nullptr;
+		}
+		if (g_Data.Identities) {
+			g_Data.Identities->Clear();
+			delete g_Data.Identities;
+			g_Data.Identities = nullptr;
 		}
 		UNICODE_STRING symName = RTL_CONSTANT_STRING(L"\\??\\" SECOUTFALL_NAME);
 		::IoDeleteSymbolicLink(&symName);
@@ -130,12 +283,20 @@ NTSTATUS CompleteRequest(PIRP Irp, NTSTATUS status = STATUS_SUCCESS, ULONG_PTR I
 }
 
 void SecOutfallUnload(PDRIVER_OBJECT DriverObject) {
+	// Removals quiesce in-flight callbacks before returning, so the queue and
+	// the identity table are producer-free below.
 	::CmUnRegisterCallback(g_Data.RegistryCookie);
+	::PsRemoveLoadImageNotifyRoutine(OnImageLoadNotify);
 	::PsRemoveCreateThreadNotifyRoutine(OnThreadNotify);
 	::PsSetCreateProcessNotifyRoutineEx(OnProcessNotify, TRUE);
 
-	g_Data.Items->FreeAll<ItemFull<ItemHeader>>();
+	g_Data.Items->FreeAll<ItemFull<RecordHeader>>();
 	delete g_Data.Items;
+	if (g_Data.Identities) {
+		g_Data.Identities->Clear();
+		delete g_Data.Identities;
+		g_Data.Identities = nullptr;
+	}
 
 	UNICODE_STRING symName = RTL_CONSTANT_STRING(L"\\??\\" SECOUTFALL_NAME);
 	::IoDeleteSymbolicLink(&symName);
@@ -173,18 +334,55 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
 				// Check-and-pop under one lock: peeking and popping separately
 				// let two concurrent drains validate one item and pop another
 				// (size from X, bytes from Y — a pool over-read and a corrupt
-				// record stream). A head that does not fit stays queued.
-				auto item = g_Data.Items->PopIfFits<ItemFull<ItemHeader>>(size - count);
-				if (item == nullptr)
-					break;
-				auto nextSize = (ULONG)item->Item.Size;
-				::memcpy(buffer + count, &item->Item, nextSize);
-				count += nextSize;
+				// record stream). A head that fits goes out; one that does not
+				// fit the REMAINING space stops this batch; one that cannot fit
+				// ANY buffer this client ever sends is skipped and counted — a
+				// wedged queue is a worse fate than a lost oversized record.
+				auto item = g_Data.Items->PopIfFits<ItemFull<RecordHeader>>(size - count);
+				if (item != nullptr) {
+					auto recordSize = item->Item.Size;
+					::memcpy(buffer + count, &item->Item, recordSize);
+					count += recordSize;
+					ExFreePool(item);
+					continue;
+				}
 
-				// free the item, it's no longer needed
-				ExFreePool(item);
+				auto headSize = g_Data.Items->HeadSize<ItemFull<RecordHeader>>();
+				if (headSize == 0)
+					break; // drained empty
+				if (headSize > size) {
+					item = g_Data.Items->Pop<ItemFull<RecordHeader>>();
+					ExFreePool(item);
+					InterlockedIncrement64(&g_Data.OversizedSkipped);
+					continue;
+				}
+				break; // head needs a bigger buffer; leave it queued
 			}
 			len = count;
+			break;
+		}
+
+		case IOCTL_SECOUTFALL_GET_STATS:
+		{
+			auto size = stack->Parameters.DeviceIoControl.OutputBufferLength;
+			// METHOD_BUFFERED: the payload arrives on the IRP, not the stack
+			// location; length validated (hostile input).
+			if (size < sizeof(DriverStats)) {
+				status = STATUS_BUFFER_TOO_SMALL;
+				break;
+			}
+			auto stats = (DriverStats*)Irp->AssociatedIrp.SystemBuffer;
+			stats->Magic = SECOUTFALL_WIRE_MAGIC;
+			stats->Version = SECOUTFALL_WIRE_VERSION;
+			stats->Reserved = 0;
+			stats->QueueDepth = static_cast<ULONG>(g_Data.Items->GetCount());
+			stats->QueueCapacity = static_cast<ULONG>(g_Data.Items->GetCapacity());
+			stats->Sequence = g_Data.NextSequence;
+			stats->QueueOverwritten = g_Data.QueueOverwritten;
+			stats->AllocFailures = g_Data.AllocFailures;
+			stats->OversizedSkipped = g_Data.OversizedSkipped;
+			stats->IdentityMisses = g_Data.IdentityMisses;
+			len = sizeof(DriverStats);
 			break;
 		}
 
@@ -201,128 +399,143 @@ void OnProcessNotify(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _Inout_op
 
 	if (CreateInfo) {
 		//
-		// process created
+		// process created: the witnessed creation time doubles as the
+		// identity token, so it is assigned here and tracked until exit.
 		//
-		USHORT cmdBytes = 0;
-		if (CreateInfo->CommandLine) {
-			cmdBytes = static_cast<USHORT>(CreateInfo->CommandLine->Length);
-			if (cmdBytes > MaxCommandLineBytes)
-				cmdBytes = MaxCommandLineBytes;
-			cmdBytes &= static_cast<USHORT>(~1); // whole WCHARs only
-		}
+		bool cmdTruncated = false;
+		WCHAR cmdScratch[MaxCommandLineBytes / sizeof(WCHAR)];
+		auto cmdBytes = CopyNameW(cmdScratch, CreateInfo->CommandLine, MaxCommandLineBytes, cmdTruncated);
 
-		auto info = (ItemFull<ProcessCreateInfo>*)::ExAllocatePool2(POOL_FLAG_PAGED,
-			sizeof(ItemFull<ProcessCreateInfo>) + cmdBytes, DRIVER_TAG);
-		if (info == nullptr) {
-			KdPrint((DRIVER_PREFIX "Failed to allocate memory\n"));
+		auto pid = HandleToULong(ProcessId);
+		auto header = AllocRecord(ProcessCreatedFixed + cmdBytes, ProcessCreated, pid, 0);
+		if (header == nullptr)
 			return;
-		}
+		auto createTime = header->Time;
+		if (cmdTruncated)
+			header->TruncFlags |= TRUNC_CMDLINE;
 
-		ProcessCreateInfo& item = info->Item;
-		::KeQuerySystemTimePrecise(&item.Time);
-		item.Type = ItemType::ProcessCreated;
-		item.ProcessId = HandleToULong(ProcessId);
-		item.ParentProcessId = HandleToULong(CreateInfo->ParentProcessId);
-		item.CommandLineOffset = (short)sizeof(ProcessCreateInfo);
-		item.CommandLineLength = (short)(cmdBytes / sizeof(WCHAR));
+		auto record = reinterpret_cast<ProcessCreatedRecord*>(header);
+		record->ParentProcessId = HandleToULong(CreateInfo->ParentProcessId);
+		record->CommandLineOffset = cmdBytes > 0 ? ProcessCreatedFixed : 0;
+		record->CommandLineBytes = cmdBytes;
 		if (cmdBytes > 0)
-			::memcpy((UCHAR*)&item + sizeof(item), CreateInfo->CommandLine->Buffer, cmdBytes);
-		item.Size = (short)(sizeof(ProcessCreateInfo) + cmdBytes);
-		g_Data.Items->Push(info);
+			::memcpy(reinterpret_cast<UCHAR*>(header) + record->CommandLineOffset, cmdScratch, cmdBytes);
+
+		// Track identity regardless of queue pressure: scope correctness
+		// outweighs telemetry completeness.
+		if (!g_Data.Identities->Insert(pid, createTime))
+			NextIdentityMiss();
+
+		PushRecord(CONTAINING_RECORD(header, ItemFull<RecordHeader>, Item));
 	}
 	else {
 		//
-		// process destroyed
+		// process destroyed: carry the identity out before removing it.
 		//
-		auto info = (ItemFull<ProcessExitInfo>*)::ExAllocatePool2(POOL_FLAG_PAGED,
-			sizeof(ItemFull<ProcessExitInfo>), DRIVER_TAG);
-		if (info == nullptr) {
-			KdPrint((DRIVER_PREFIX "Failed to allocate memory\n"));
-			return;
-		}
+		auto pid = HandleToULong(ProcessId);
+		auto createTime = g_Data.Identities->Lookup(pid);
+		if (createTime == 0)
+			NextIdentityMiss();
+		g_Data.Identities->Remove(pid);
 
-		auto& item = info->Item;
-		::KeQuerySystemTimePrecise(&item.Time);
-		item.Size = (short)sizeof(item);
-		item.Type = ItemType::ProcessExited;
-		item.ProcessId = HandleToULong(ProcessId);
-		g_Data.Items->Push(info);
+		auto header = AllocRecord(ProcessExitedFixed, ProcessExited, pid, createTime);
+		if (header == nullptr)
+			return;
+
+		PushRecord(CONTAINING_RECORD(header, ItemFull<RecordHeader>, Item));
 	}
 }
 
 void OnThreadNotify(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _In_ BOOLEAN Create) {
-	auto info = (ItemFull<ThreadCreateExitInfo>*)::ExAllocatePool2(POOL_FLAG_PAGED,
-		sizeof(ItemFull<ThreadCreateExitInfo>), DRIVER_TAG);
-	if (info == nullptr) {
-		KdPrint((DRIVER_PREFIX "Failed to allocate memory\n"));
+	auto pid = HandleToULong(ProcessId);
+	auto header = AllocRecord(ThreadFixed, Create ? ThreadCreated : ThreadExited,
+		pid, g_Data.Identities->Lookup(pid));
+	if (header == nullptr)
 		return;
-	}
-	auto& item = info->Item;
-	::KeQuerySystemTimePrecise(&item.Time);
-	item.Size = (short)sizeof(item);
-	item.Type = Create ? ItemType::ThreadCreated : ItemType::ThreadExited;
-	item.ProcessId = HandleToULong(ProcessId);
-	item.ThreadId = HandleToULong(ThreadId);
 
-	g_Data.Items->Push(info);
+	auto record = reinterpret_cast<ThreadRecord*>(header);
+	record->ThreadId = HandleToULong(ThreadId);
+
+	PushRecord(CONTAINING_RECORD(header, ItemFull<RecordHeader>, Item));
 }
 
-void OnRegistryNotify(_In_ PVOID CallbackContext, _In_opt_ PVOID Argument1, _In_opt_ PVOID Argument2) {
-	UNREFERENCED_PARAMETER(CallbackContext);
+void OnImageLoadNotify(_In_ PUNICODE_STRING FullImageName, _In_ HANDLE ProcessId, _In_ PIMAGE_INFO ImageInfo) {
+	// Kernel-mode images (drivers, including ours) are telemetry noise here —
+	// the sandbox analyzes user-mode behavior.
+	if (ImageInfo->SystemModeImage)
+		return;
 
-	// Counted string, not guaranteed NUL-terminated: prefix-compare instead of
-	// wcsncmp (which would read past name->Length). Registry paths are
-	// case-insensitive.
-	static const UNICODE_STRING machine = RTL_CONSTANT_STRING(L"\\REGISTRY\\MACHINE");
+	bool nameTruncated = false;
+	WCHAR nameScratch[MaxImageNameBytes / sizeof(WCHAR)];
+	auto nameBytes = CopyNameW(nameScratch, FullImageName, MaxImageNameBytes, nameTruncated);
+
+	auto pid = HandleToULong(ProcessId);
+	auto header = AllocRecord(ImageLoadedFixed + nameBytes, ImageLoaded,
+		pid, g_Data.Identities->Lookup(pid));
+	if (header == nullptr)
+		return;
+	if (nameTruncated)
+		header->TruncFlags |= TRUNC_IMAGE_NAME;
+
+	auto record = reinterpret_cast<ImageLoadedRecord*>(header);
+	record->ImageBase = reinterpret_cast<ULONG64>(ImageInfo->ImageBase);
+	// The 26100 WDK widens IMAGE_INFO.ImageSize to SIZE_T; the wire field is
+	// ULONG by design (per-image sizes are far below 4 GiB).
+	record->ImageSize = static_cast<ULONG>(ImageInfo->ImageSize);
+	record->NameOffset = ImageLoadedFixed;
+	record->NameBytes = nameBytes;
+	if (nameBytes > 0)
+		::memcpy(reinterpret_cast<UCHAR*>(header) + record->NameOffset, nameScratch, nameBytes);
+
+	PushRecord(CONTAINING_RECORD(header, ItemFull<RecordHeader>, Item));
+}
+
+NTSTATUS OnRegistryNotify(_In_ PVOID CallbackContext, _In_opt_ PVOID Argument1, _In_opt_ PVOID Argument2) {
+	UNREFERENCED_PARAMETER(CallbackContext);
 
 	switch ((REG_NOTIFY_CLASS)(ULONG_PTR)Argument1) {
 		case RegNtPostSetValueKey:
 		{
 			auto args = static_cast<REG_POST_OPERATION_INFORMATION*>(Argument2);
-			PCUNICODE_STRING name = nullptr;
-			if (!NT_SUCCESS(::CmCallbackGetKeyObjectIDEx(&g_Data.RegistryCookie, args->Object, nullptr, &name, 0)))
+			if (!NT_SUCCESS(args->Status))
 				break;
-
-			// filter out non-HKLM writes
-			if (::RtlPrefixUnicodeString(&machine, name, TRUE)) {
-				auto preInfo = (REG_SET_VALUE_KEY_INFORMATION*)args->PreInformation;
-				if (preInfo && preInfo->ValueName && preInfo->Data) {
-					auto info = (ItemFull<RegistrySetValueInfo>*)::ExAllocatePool2(POOL_FLAG_PAGED,
-						sizeof(ItemFull<RegistrySetValueInfo>), DRIVER_TAG);
-					if (info != nullptr) {
-						RtlZeroMemory(info, sizeof(ItemFull<RegistrySetValueInfo>));
-						auto& item = info->Item;
-						::KeQuerySystemTimePrecise(&item.Time);
-						item.Size = (short)sizeof(item);
-						item.Type = ItemType::RegistrySetValue;
-						// attacker-controlled lengths: clamp to the fixed buffers,
-						// always leaving one WCHAR for the terminator (the zeroed
-						// remainder keeps the names NUL-terminated even at the clamp
-						// boundary), whole WCHARs only
-						auto keyBytes = (USHORT)min(name->Length,
-							sizeof(item.KeyName) - sizeof(WCHAR));
-						keyBytes &= (USHORT)~1;
-						::memcpy(item.KeyName, name->Buffer, keyBytes);
-						auto valueBytes = (USHORT)min(preInfo->ValueName->Length,
-							sizeof(item.ValueName) - sizeof(WCHAR));
-						valueBytes &= (USHORT)~1;
-						::memcpy(item.ValueName, preInfo->ValueName->Buffer, valueBytes);
-						item.DataType = preInfo->Type;
-						item.DataSize = (ULONG)preInfo->DataSize;
-						item.ProcessId = HandleToULong(PsGetCurrentProcessId());
-						// Bound the reported size by what was actually copied — a
-						// consumer must never read past the record on Data. (The D1
-						// wire schema replaces this with explicit truncation flags.)
-						auto dataBytes = (ULONG)min(item.DataSize, sizeof(item.Data));
-						::memcpy(item.Data, preInfo->Data, dataBytes);
-						item.DataSize = dataBytes;
-
-						g_Data.Items->Push(info);
-					}
+			if (auto path = GetKeyPath(args->Object)) {
+				if (IsMachineKey(path)) {
+					auto preInfo = static_cast<REG_SET_VALUE_KEY_INFORMATION*>(args->PreInformation);
+					if (preInfo && preInfo->ValueName && preInfo->Data)
+						EmitRegistrySetValue(path, preInfo->ValueName, preInfo->Type,
+							preInfo->Data, static_cast<ULONG>(preInfo->DataSize));
 				}
+				::CmCallbackReleaseKeyObjectIDEx(path);
 			}
+			break;
+		}
 
-			::CmCallbackReleaseKeyObjectIDEx(name);
+		case RegNtPostCreateKeyEx:
+		{
+			auto args = static_cast<REG_POST_CREATE_KEY_INFORMATION*>(Argument2);
+			if (!NT_SUCCESS(args->Status))
+				break;
+			if (auto path = GetKeyPath(args->Object)) {
+				if (IsMachineKey(path))
+					EmitRegistryKeyRecord(RegistryKeyCreated, path);
+				::CmCallbackReleaseKeyObjectIDEx(path);
+			}
+			break;
+		}
+
+		case RegNtPostDeleteKey:
+		{
+			auto args = static_cast<REG_POST_OPERATION_INFORMATION*>(Argument2);
+			if (!NT_SUCCESS(args->Status))
+				break;
+			// The object is mid-teardown in the post callback; a failed name
+			// lookup skips the record rather than emit a nameless one.
+			if (auto path = GetKeyPath(args->Object)) {
+				if (IsMachineKey(path))
+					EmitRegistryKeyRecord(RegistryKeyDeleted, path);
+				::CmCallbackReleaseKeyObjectIDEx(path);
+			}
 			break;
 		}
 

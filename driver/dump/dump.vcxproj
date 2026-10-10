@@ -13,7 +13,10 @@
   <PropertyGroup Label="Globals">
     <ProjectGuid>{E7B2C4A9-3F8D-4A6E-91C5-2D8A7E6B41F3}</ProjectGuid>
     <RootNamespace>dump</RootNamespace>
-    <WindowsTargetPlatformVersion>$([Microsoft.Build.Utilities.ToolLocationHelper]::GetLatestSDKTargetPlatformVersion('Windows', '10.0'))</WindowsTargetPlatformVersion>
+    <!-- Literal, not "latest SDK": a newer registered SDK (28000, via VS 18)
+         has no WDK/build folder; the secoutfall.vcxproj comment explains the
+         failure mode. Pinned to the installed WDK (26100), which CI matches. -->
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
