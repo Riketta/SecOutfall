@@ -8,13 +8,8 @@
 use std::{ffi::CString, iter};
 
 use anyhow::bail;
-use windows::{
-    Win32::{
-        Foundation::GetLastError,
-        System::LibraryLoader::{GetModuleHandleW, GetProcAddress},
-    },
-    core::{PCSTR, PCWSTR},
-};
+
+use crate::ntapis::{GetLastError, GetModuleHandleW, GetProcAddress};
 
 /// Resolves the address of an exported symbol in `module`, or in any loaded
 /// module when `module` is `None`.
@@ -31,17 +26,22 @@ pub(crate) fn get_module_symbol_address(
 
     let symbol = CString::new(symbol)?;
     unsafe {
-        let handle = GetModuleHandleW(PCWSTR(
-            module.as_ref().map_or(std::ptr::null(), Vec::as_ptr),
-        ))?;
-        Ok(
-            GetProcAddress(handle, PCSTR(symbol.as_ptr().cast::<u8>())).ok_or(
-                anyhow::Error::msg(format!(
-                    "Failed to get {symbol:?} function address: {}.",
-                    GetLastError().0
-                )),
-            )? as usize,
-        )
+        let handle = GetModuleHandleW(module.as_ref().map_or(std::ptr::null(), Vec::as_ptr));
+        if handle.is_null() {
+            return Err(anyhow::Error::msg(format!(
+                "Failed to get module handle for {symbol:?}: {}.",
+                GetLastError()
+            )));
+        }
+        let address = GetProcAddress(handle, symbol.as_ptr().cast());
+        if address.is_null() {
+            Err(anyhow::Error::msg(format!(
+                "Failed to get {symbol:?} function address: {}.",
+                GetLastError()
+            )))
+        } else {
+            Ok(address as usize)
+        }
     }
 }
 

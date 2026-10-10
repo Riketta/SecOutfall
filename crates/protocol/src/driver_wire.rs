@@ -73,6 +73,20 @@ pub const DROP_METHOD_HARDLINK: u32 = 0;
 /// link failure).
 pub const DROP_METHOD_COPY: u32 = 1;
 
+/// Behavior APIs reported by the sensor (wire values, stable — mirrored from
+/// `secoutfallCommon.h`'s `BehaviorApi`).
+pub mod behavior_api {
+    /// `NtDelayExecution` — evasion-timing signal.
+    pub const NT_DELAY_EXECUTION: u32 = 1;
+    /// `NtCreateFile` — file open/create.
+    pub const NT_CREATE_FILE: u32 = 2;
+    /// `NtWriteFile` — file write.
+    pub const NT_WRITE_FILE: u32 = 3;
+    /// `NtCreateThreadEx` — thread creation (cross-process = injection
+    /// candidate for chain scoring).
+    pub const NT_CREATE_THREAD_EX: u32 = 4;
+}
+
 /// Record type discriminator (wire values are stable).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordKind {
@@ -104,6 +118,8 @@ pub enum RecordKind {
     FileRenamed,
     /// Drop evidence was preserved into the drops directory.
     DropCaptured,
+    /// A hooked-API call was reported by the sensor ring.
+    BehaviorCall,
 }
 
 impl RecordKind {
@@ -123,6 +139,7 @@ impl RecordKind {
             12 => Some(Self::FileDeleted),
             13 => Some(Self::FileRenamed),
             14 => Some(Self::DropCaptured),
+            15 => Some(Self::BehaviorCall),
             _ => None,
         }
     }
@@ -268,6 +285,23 @@ pub enum Payload {
         stored_name: String,
         /// [`DROP_METHOD_HARDLINK`] or [`DROP_METHOD_COPY`].
         method: u32,
+    },
+    /// A hooked-API call from the sensor ring (kernel-stamped identity and
+    /// timing; argument VALUES are raw host pointers/handles — interpret per
+    /// `behavior_api` and never dereference).
+    BehaviorCall {
+        /// Reporting thread id within the record's process.
+        thread_id: u32,
+        /// Behavior API id (see [`behavior_api`]).
+        api: u32,
+        /// Raw first argument.
+        arg0: u64,
+        /// Raw second argument.
+        arg1: u64,
+        /// Raw third argument.
+        arg2: u64,
+        /// Raw fourth argument.
+        arg3: u64,
     },
 }
 
@@ -434,6 +468,7 @@ fn min_size(kind: RecordKind) -> usize {
         | RecordKind::FileDeleted => 52,
         RecordKind::ImageLoaded | RecordKind::RegistrySetValue | RecordKind::FileWritten => 64,
         RecordKind::DropCaptured => 60,
+        RecordKind::BehaviorCall => 88,
     }
 }
 
@@ -483,25 +518,7 @@ fn payload_of(
                 _ => Payload::RegistryKeyDeleted { path },
             }
         }
-        RecordKind::RegistrySetValue => {
-            let key_offset = u16_at(record, 48)? as usize;
-            let key_bytes = u16_at(record, 50)? as usize;
-            let value_offset = u16_at(record, 52)? as usize;
-            let value_bytes = u16_at(record, 54)? as usize;
-            let data_type = u32_at(record, 56)?;
-            let data_bytes = u32_at(record, 60)? as usize;
-            let key_path = string_at(record, key_offset, key_bytes)?;
-            let value_name = string_at(record, value_offset, value_bytes)?;
-            let data = record
-                .get(value_offset + value_bytes..value_offset + value_bytes + data_bytes)
-                .ok_or(DecodeError::BadString {
-                    offset: value_offset + value_bytes,
-                    bytes: data_bytes,
-                    record_size: size,
-                })?
-                .to_vec();
-            Payload::RegistrySetValue { key_path, value_name, data_type, data }
-        }
+        RecordKind::RegistrySetValue => parse_registry_set_value(record, size)?,
         RecordKind::FileCreated | RecordKind::FileCleanedUp | RecordKind::FileDeleted => {
             let path_offset = u16_at(record, 48)? as usize;
             let path_bytes = u16_at(record, 50)? as usize;
@@ -529,18 +546,54 @@ fn payload_of(
             let new_path = string_at(record, new_offset, new_bytes)?;
             Payload::FileRenamed { old_path, new_path }
         }
-        RecordKind::DropCaptured => {
-            let path_offset = u16_at(record, 48)? as usize;
-            let path_bytes = u16_at(record, 50)? as usize;
-            let stored_offset = u16_at(record, 52)? as usize;
-            let stored_bytes = u16_at(record, 54)? as usize;
-            let method = u32_at(record, 56)?;
-            let path = string_at(record, path_offset, path_bytes)?;
-            let stored_name = string_at(record, stored_offset, stored_bytes)?;
-            Payload::DropCaptured { path, stored_name, method }
-        }
+        RecordKind::DropCaptured => parse_drop_captured(record)?,
+        RecordKind::BehaviorCall => parse_behavior_call(record)?,
     };
     Ok(payload)
+}
+
+fn parse_registry_set_value(record: &[u8], size: usize) -> Result<Payload, DecodeError> {
+    let key_offset = u16_at(record, 48)? as usize;
+    let key_bytes = u16_at(record, 50)? as usize;
+    let value_offset = u16_at(record, 52)? as usize;
+    let value_bytes = u16_at(record, 54)? as usize;
+    let data_type = u32_at(record, 56)?;
+    let data_bytes = u32_at(record, 60)? as usize;
+    let key_path = string_at(record, key_offset, key_bytes)?;
+    let value_name = string_at(record, value_offset, value_bytes)?;
+    let data = record
+        .get(value_offset + value_bytes..value_offset + value_bytes + data_bytes)
+        .ok_or(DecodeError::BadString {
+            offset: value_offset + value_bytes,
+            bytes: data_bytes,
+            record_size: size,
+        })?
+        .to_vec();
+    Ok(Payload::RegistrySetValue { key_path, value_name, data_type, data })
+}
+
+fn parse_drop_captured(record: &[u8]) -> Result<Payload, DecodeError> {
+    let path_offset = u16_at(record, 48)? as usize;
+    let path_bytes = u16_at(record, 50)? as usize;
+    let stored_offset = u16_at(record, 52)? as usize;
+    let stored_bytes = u16_at(record, 54)? as usize;
+    let method = u32_at(record, 56)?;
+    let path = string_at(record, path_offset, path_bytes)?;
+    let stored_name = string_at(record, stored_offset, stored_bytes)?;
+    Ok(Payload::DropCaptured { path, stored_name, method })
+}
+
+fn parse_behavior_call(record: &[u8]) -> Result<Payload, DecodeError> {
+    let thread_id = u32_at(record, 48)?;
+    let api = u32_at(record, 52)?;
+    Ok(Payload::BehaviorCall {
+        thread_id,
+        api,
+        arg0: u64_at(record, 56)?,
+        arg1: u64_at(record, 64)?,
+        arg2: u64_at(record, 72)?,
+        arg3: u64_at(record, 80)?,
+    })
 }
 
 /// Decodes a whole drain buffer (records back to back). Returns all records,
@@ -608,7 +661,7 @@ mod tests {
             .expect("committed fixture must exist — regenerate with wiretest --generate");
         let records = decode_all(&bytes).expect("fixture must decode");
 
-        assert_eq!(records.len(), 14);
+        assert_eq!(records.len(), 15);
         for (index, record) in records.iter().enumerate() {
             assert_eq!(record.sequence(), index as u64 + 1, "per-boot seq is gap-free");
             assert_eq!(record.time(), TIME_BASE + record.sequence());
@@ -677,7 +730,17 @@ mod tests {
         assert_eq!(value_name, "Backdoor");
         assert_eq!(*data_type, REG_SZ);
         assert_eq!(data, b"C:\\Users\\Public\\payload.exe");
+    }
 
+    #[test]
+    fn golden_fixture_file_and_behavior_records_decode() {
+        let bytes = std::fs::read(golden_fixture_path())
+            .expect("committed fixture must exist — regenerate with wiretest --generate");
+        let records = decode_all(&bytes).expect("fixture must decode");
+        assert_eq!(records.len(), 15);
+        for (index, record) in records.iter().enumerate() {
+            assert_eq!(record.sequence(), index as u64 + 1, "per-boot seq is gap-free");
+        }
         // 9: file created.
         assert_eq!(records[8].kind(), RecordKind::FileCreated);
         assert_eq!(records[8].trunc_flags(), TRUNC_NONE);
@@ -727,6 +790,21 @@ mod tests {
         assert_eq!(path, "\\Device\\HarddiskVolume2\\Users\\user\\AppData\\payload.dll");
         assert_eq!(stored_name, "drop-00000001.dll");
         assert_eq!(*method, DROP_METHOD_HARDLINK);
+
+        // 15: behavior call from the sensor ring.
+        assert_eq!(records[14].kind(), RecordKind::BehaviorCall);
+        assert_eq!(records[14].trunc_flags(), TRUNC_NONE);
+        let Payload::BehaviorCall { thread_id, api, arg0, arg1, arg2, arg3 } =
+            records[14].payload()
+        else {
+            panic!("payload kind mismatch")
+        };
+        assert_eq!(*thread_id, 2004);
+        assert_eq!(*api, behavior_api::NT_CREATE_FILE);
+        assert_eq!(*arg0, 0xC000_0000_0000_0000);
+        assert_eq!(*arg1, 0x1234);
+        assert_eq!(*arg2, 0x5678);
+        assert_eq!(*arg3, 0x9ABC);
     }
 
     #[test]

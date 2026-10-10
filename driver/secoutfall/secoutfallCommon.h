@@ -40,6 +40,16 @@ enum RecordType : USHORT {
 	FileDeleted = 12,
 	FileRenamed = 13,
 	DropCaptured = 14,
+	BehaviorCall = 15,
+};
+
+// Behavior APIs reported by the sensor (wire values, stable). The v1 hook
+// set; more join behind the same enum (D4).
+enum BehaviorApi : ULONG {
+	BehaviorNtDelayExecution = 1,
+	BehaviorNtCreateFile = 2,
+	BehaviorNtWriteFile = 3,
+	BehaviorNtCreateThreadEx = 4,
 };
 
 // Truncation flags (header TruncFlags): which variable-length field hit its
@@ -171,6 +181,20 @@ struct DropCapturedRecord {
 	// WCHAR StoredName[] at StoredOffset
 };
 
+// Hooked-API call reported by the sensor through the shared-memory ring.
+// The KERNEL composes this record at drain: header identity, sequence and
+// time are kernel-stamped from authoritative values (the ring slot carries
+// only the payload below).
+struct BehaviorCallRecord {
+	RecordHeader Header;       // +0
+	ULONG ThreadId;            // +48
+	ULONG Api;                 // +52 BehaviorApi
+	ULONG64 Arg0;              // +56
+	ULONG64 Arg1;              // +64
+	ULONG64 Arg2;              // +72
+	ULONG64 Arg3;              // +80
+};                             // fixed 88
+
 const ULONG DROP_METHOD_HARDLINK = 0;
 const ULONG DROP_METHOD_COPY = 1;
 
@@ -203,6 +227,9 @@ struct DriverStats {
 	ULONG64 InjectionsFailed;  // allocation / thread-gone / queue failures
 	ULONG64 SensorsRegistered; // nonce echoes accepted
 	ULONG64 SensorsRejected;   // challenge/register denials
+	ULONG64 SensorEventsDrained;   // ring slots promoted to records
+	ULONG64 SensorEventsDropped;   // slots skipped: torn, stale or garbage
+	ULONG64 SensorRingsActive;     // currently registered sensors with rings
 };
 
 // Fixed payload extents ON THE WIRE: header + payload FIELDS, excluding any
@@ -219,6 +246,7 @@ const ULONG FileFixed = 52;
 const ULONG FileWrittenFixed = sizeof(FileWrittenRecord);           // 64
 const ULONG FileRenamedFixed = sizeof(FileRenamedRecord);           // 56
 const ULONG DropCapturedFixed = 60;
+const ULONG BehaviorCallFixed = sizeof(BehaviorCallRecord);         // 88
 static_assert(offsetof(ThreadRecord, ThreadId) + sizeof(ULONG) == ThreadFixed, "wire layout pinned");
 static_assert(offsetof(RegistryKeyRecord, PathBytes) + sizeof(USHORT) == RegistryKeyFixed, "wire layout pinned");
 static_assert(offsetof(FileRecord, PathBytes) + sizeof(USHORT) == FileFixed, "wire layout pinned");
@@ -246,12 +274,14 @@ static_assert(offsetof(FileRecord, PathBytes) + sizeof(USHORT) == FileFixed, "wi
 // D3 injection policy: enabled + sensor DLL path + extra exclusion names.
 #define IOCTL_SECOUTFALL_SET_INJECTION_POLICY \
 	CTL_CODE(0x8000u, 0x805u, METHOD_BUFFERED, FILE_WRITE_ACCESS)
-// Sensor handshake (ledger-gated): challenge returns the nonce for the
-// CALLER's pid — only injected, not-yet-registered pids are answered.
+// Sensor handshake: challenge returns the nonce for the CALLER's pid — only
+// injected, not-yet-registered pids are answered — plus a handle to the
+// caller's private sensor ring (duplicated into the calling process) and the
+// ring geometry.
 #define IOCTL_SECOUTFALL_SENSOR_CHALLENGE \
 	CTL_CODE(0x8000u, 0x806u, METHOD_BUFFERED, FILE_READ_ACCESS)
 // Sensor handshake: echoes the nonce; one-shot, then the ledger marks the
-// pid registered and further challenges are denied.
+// pid registered, the ring is activated, and further challenges are denied.
 #define IOCTL_SECOUTFALL_SENSOR_REGISTER \
 	CTL_CODE(0x8000u, 0x807u, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
@@ -286,9 +316,15 @@ struct InjectionPolicy {
 	// WCHAR dllPath[]; WCHAR exclusions[]
 };
 
-// Output of IOCTL_SECOUTFALL_SENSOR_CHALLENGE.
+// Output of IOCTL_SECOUTFALL_SENSOR_CHALLENGE. RingHandle is valid in the
+// calling process (Section duplicated at challenge time); map it read-write.
 struct SensorChallenge {
 	ULONG64 Nonce;
+	HANDLE RingHandle;
+	ULONG RingSize;
+	ULONG SlotSize;
+	ULONG SlotCount;
+	UCHAR Reserved[4];
 };
 
 // Input of IOCTL_SECOUTFALL_SENSOR_REGISTER.
@@ -297,6 +333,33 @@ struct SensorRegister {
 	ULONG Version;
 	UCHAR Reserved[4];
 };
+
+//
+// Sensor ring (injectee -> kernel), laid out at the START of the section.
+// Slots carry fixed 40-byte payloads:
+//   ULONG Api; ULONG ThreadId; ULONG64 Arg[4]
+// Producers (the sensor's threads) commit Vyukov-style: InterlockedAdd on
+// WriteIndex claims a slot, the payload is written, then the slot's sequence
+// is committed with InterlockedExchange(slotSeq, claimed + 1). The kernel
+// drains without ANY lock: it validates slot sequences (a corrupted or torn
+// slot is skipped + counted — the host process owns its own ring's garbage)
+// and stamps authoritative pid/identity/sequence/time into the wire record.
+// State flips to 1 at sensor registration (lazy activation).
+//
+struct SensorRingControl {
+	volatile LONG State;         // 0 = idle, 1 = active
+	ULONG SlotSize;              // 40
+	ULONG SlotCount;             // 4096 (power of two)
+	volatile LONG64 WriteIndex;  // claimed slots, monotonic
+	volatile LONG64 Dropped;     // events lost to a full ring (producer side)
+	// Kernel-side drain cursor is NOT shared: the kernel keeps it internally,
+	// so the hostile process cannot rewind or forge consumption.
+};
+
+const ULONG SENSOR_SLOT_SIZE = 40;
+const ULONG SENSOR_SLOT_COUNT = 4096;
+const ULONG SENSOR_RING_SIZE = sizeof(SensorRingControl)
+	+ ULONGLONG(SENSOR_SLOT_COUNT) * (8 + SENSOR_SLOT_SIZE); // seq + payload per slot
 
 // Input blob for IOCTL_SECOUTFALL_SET_DROP_POLICY: extension names
 // (NUL-terminated UTF-16, same form as SET_FILE_WATCH) followed by the drops
@@ -352,3 +415,9 @@ static_assert(offsetof(DropCapturedRecord, PathBytes) == 50, "wire layout pinned
 static_assert(offsetof(DropCapturedRecord, StoredOffset) == 52, "wire layout pinned");
 static_assert(offsetof(DropCapturedRecord, StoredBytes) == 54, "wire layout pinned");
 static_assert(offsetof(DropCapturedRecord, Method) == 56, "wire layout pinned");
+static_assert(offsetof(BehaviorCallRecord, ThreadId) == 48, "wire layout pinned");
+static_assert(offsetof(BehaviorCallRecord, Api) == 52, "wire layout pinned");
+static_assert(offsetof(BehaviorCallRecord, Arg0) == 56, "wire layout pinned");
+static_assert(offsetof(BehaviorCallRecord, Arg1) == 64, "wire layout pinned");
+static_assert(offsetof(BehaviorCallRecord, Arg2) == 72, "wire layout pinned");
+static_assert(offsetof(BehaviorCallRecord, Arg3) == 80, "wire layout pinned");

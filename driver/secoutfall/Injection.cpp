@@ -613,20 +613,78 @@ void InjectionOnProcessExit(_In_ ULONG pid) {
 		RemoveLedgerEntryLocked(entry);
 }
 
-bool InjectionSensorChallenge(_In_ ULONG pid, _Out_ ULONG64* nonce) {
-	*nonce = 0;
+// Creates + kernel-maps the sensor ring for an entry (challenge time). The
+// section is UNNAMED — the only route to it is the duplicate handle the
+// challenge hands to the injected sensor.
+bool CreateSensorRing(_Inout_ InjectionEntry* entry) {
+	if (entry->RingKernelVa)
+		return true; // already created (duplicate challenge)
+	LARGE_INTEGER maxSize;
+	maxSize.QuadPart = SENSOR_RING_SIZE;
+	auto status = ::ZwCreateSection(&entry->RingSection, SECTION_MAP_READ | SECTION_MAP_WRITE,
+		nullptr, &maxSize, PAGE_READWRITE, SEC_COMMIT, nullptr);
+	if (!NT_SUCCESS(status))
+		return false;
+	SIZE_T viewSize = SENSOR_RING_SIZE;
+	status = ::MmMapViewInSystemSpace(entry->RingSection, &entry->RingKernelVa, &viewSize);
+	if (!NT_SUCCESS(status)) {
+		::ZwClose(entry->RingSection);
+		entry->RingSection = nullptr;
+		return false;
+	}
+	::RtlZeroMemory(entry->RingKernelVa, SENSOR_RING_SIZE);
+	auto control = (SensorRingControl*)entry->RingKernelVa;
+	control->SlotSize = SENSOR_SLOT_SIZE;
+	control->SlotCount = SENSOR_SLOT_COUNT;
+	entry->RingDrainIndex = 0;
+	return true;
+}
+
+bool InjectionSensorChallenge(_In_ ULONG pid, _In_ HANDLE callerProcess,
+	_Inout_ SensorChallenge* challenge) {
+	challenge->Nonce = 0;
+	challenge->RingHandle = nullptr;
+	challenge->RingSize = 0;
+	challenge->SlotSize = 0;
+	challenge->SlotCount = 0;
+
 	AutoLock<FastMutex> locker(*g_Data.InjectionLedgerLock);
 	auto entry = FindLedgerEntryLocked(pid);
 	if (entry == nullptr || entry->State != InjectionState::Injected) {
 		InterlockedIncrement64(&g_Data.SensorsRejected);
 		return false;
 	}
-	*nonce = entry->Nonce;
+	if (!CreateSensorRing(entry)) {
+		InterlockedIncrement64(&g_Data.AllocFailures);
+		return false;
+	}
+
+	// Duplicate the section into the caller (the injected sensor process).
+	HANDLE caller = nullptr;
+	auto status = ::ObOpenObjectByPointer(callerProcess, 0, nullptr,
+		PROCESS_DUP_HANDLE, *PsProcessType, UserMode, &caller);
+	if (!NT_SUCCESS(status)) {
+		InterlockedIncrement64(&g_Data.SensorsRejected);
+		return false;
+	}
+	HANDLE userHandle = nullptr;
+	status = ::ZwDuplicateObject(NtCurrentProcess(), entry->RingSection, caller,
+		&userHandle, 0, 0, DUPLICATE_SAME_ACCESS);
+	::ZwClose(caller);
+	if (!NT_SUCCESS(status)) {
+		InterlockedIncrement64(&g_Data.SensorsRejected);
+		return false;
+	}
+
+	challenge->Nonce = entry->Nonce;
+	challenge->RingHandle = userHandle;
+	challenge->RingSize = SENSOR_RING_SIZE;
+	challenge->SlotSize = SENSOR_SLOT_SIZE;
+	challenge->SlotCount = SENSOR_SLOT_COUNT;
 	return true;
 }
 
 bool InjectionSensorRegister(_In_ ULONG pid, _In_ ULONG64 nonce, _In_ ULONG sensorVersion) {
-	UNREFERENCED_PARAMETER(sensorVersion);
 	AutoLock<FastMutex> locker(*g_Data.InjectionLedgerLock);
 	auto entry = FindLedgerEntryLocked(pid);
 	if (entry == nullptr || entry->State != InjectionState::Injected
@@ -635,6 +693,96 @@ bool InjectionSensorRegister(_In_ ULONG pid, _In_ ULONG64 nonce, _In_ ULONG sens
 		return false;
 	}
 	entry->State = InjectionState::Registered;
+	entry->SensorVersion = sensorVersion;
+	// Lazy activation: the ring's control block flips to active, and the
+	// sensor's hooks start emitting on their next emit call.
+	if (entry->RingKernelVa)
+		InterlockedExchange(&reinterpret_cast<SensorRingControl*>(entry->RingKernelVa)->State, 1);
 	InterlockedIncrement64(&g_Data.SensorsRegistered);
 	return true;
+}
+
+void InjectionDrainRings() {
+	// Snapshot the registered rings under the lock, then drain lock-free:
+	// slot sequences make torn/garbage reads detectable, and a hostile host
+	// can only damage its own ring (skipped + counted, never the kernel).
+	struct RingRef {
+		PVOID Va;
+		ULONG64 Cursor;
+		ULONG Pid;
+		ULONG64 CreateTime;
+	};
+	RingRef rings[64];
+	ULONG count = 0;
+	{
+		AutoLock<FastMutex> locker(*g_Data.InjectionLedgerLock);
+		for (auto link = g_Data.InjectionLedger.Flink;
+			link != &g_Data.InjectionLedger && count < 64; link = link->Flink) {
+			auto entry = CONTAINING_RECORD(link, InjectionEntry, Link);
+			if (entry->State == InjectionState::Registered && entry->RingKernelVa != nullptr) {
+				rings[count] = { entry->RingKernelVa, entry->RingDrainIndex,
+					entry->Pid, entry->CreateTime };
+				++count;
+			}
+		}
+	}
+
+	ULONG64 drainedTotal = 0, droppedTotal = 0;
+	for (ULONG r = 0; r < count; ++r) {
+		auto control = (SensorRingControl*)rings[r].Va;
+		if (control->State != 1)
+			continue;
+		auto drained = rings[r].Cursor;
+		auto writeIndex = control->WriteIndex;
+
+		// Overflow resync: once the producer is a full ring ahead, the skipped
+		// slots are gone (overwritten) — jump to the newest and count them.
+		if (static_cast<LONG64>(writeIndex) - static_cast<LONG64>(drained)
+			> static_cast<LONG64>(control->SlotCount)) {
+			droppedTotal += writeIndex - static_cast<LONG64>(control->SlotCount) - drained;
+			drained = writeIndex - static_cast<LONG64>(control->SlotCount);
+		}
+
+		auto slots = reinterpret_cast<PUCHAR>(rings[r].Va) + sizeof(SensorRingControl);
+		ULONG drainedNow = 0;
+		while (drainedNow < 256 && static_cast<LONG64>(drained) < static_cast<LONG64>(writeIndex)) {
+			auto slot = slots + static_cast<ULONGLONG>(drained % static_cast<LONG64>(control->SlotCount))
+				* (8 + control->SlotSize);
+			auto committed = InterlockedCompareExchange64(
+				reinterpret_cast<volatile LONG64*>(slot), 0, 0);
+			if (committed != static_cast<LONG64>(drained + 1))
+				break; // not committed yet (or torn/garbage — stop, retry later)
+			auto payload = slot + 8;
+			InjectionEmitBehaviorCall(rings[r].Pid, rings[r].CreateTime,
+				*reinterpret_cast<ULONG*>(payload),
+				*reinterpret_cast<ULONG*>(payload + 4),
+				*reinterpret_cast<ULONG64*>(payload + 8),
+				*reinterpret_cast<ULONG64*>(payload + 16),
+				*reinterpret_cast<ULONG64*>(payload + 24),
+				*reinterpret_cast<ULONG64*>(payload + 32));
+			++drained;
+			++drainedNow;
+			++drainedTotal;
+		}
+
+		// Cursor write-back under the lock, matched by ring VA (the entry may
+		// have been removed if the process exited mid-drain — acceptable: the
+		// ring died with it).
+		AutoLock<FastMutex> locker(*g_Data.InjectionLedgerLock);
+		for (auto link = g_Data.InjectionLedger.Flink;
+			link != &g_Data.InjectionLedger; link = link->Flink) {
+			auto entry = CONTAINING_RECORD(link, InjectionEntry, Link);
+			if (entry->RingKernelVa == rings[r].Va) {
+				entry->RingDrainIndex = drained;
+				break;
+			}
+		}
+	}
+
+	if (drainedTotal > 0)
+		InterlockedExchange64(&g_Data.SensorEventsDrained,
+			g_Data.SensorEventsDrained + drainedTotal);
+	if (droppedTotal > 0)
+		InterlockedExchange64(&g_Data.SensorEventsDropped,
+			g_Data.SensorEventsDropped + droppedTotal);
 }

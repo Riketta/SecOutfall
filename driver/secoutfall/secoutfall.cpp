@@ -190,6 +190,24 @@ void PushDropRecord(_Inout_ ItemFull<RecordHeader>* item) {
 		InterlockedIncrement64(&g_Data.DropsStopped);
 }
 
+// Ring-drain promotion (Injection.cpp): a validated sensor slot becomes a
+// BehaviorCall wire record in the flood-class queue. pid/identity/time come
+// from the kernel's authoritative values, never from the ring.
+void EmitBehaviorCallInternal(_In_ ULONG pid, _In_ ULONG64 createTime, _In_ ULONG threadId,
+	_In_ ULONG api, _In_ ULONG64 arg0, _In_ ULONG64 arg1, _In_ ULONG64 arg2, _In_ ULONG64 arg3) {
+	auto header = AllocRecord(BehaviorCallFixed, BehaviorCall, pid, createTime);
+	if (header == nullptr)
+		return;
+	auto record = reinterpret_cast<BehaviorCallRecord*>(header);
+	record->ThreadId = threadId;
+	record->Api = api;
+	record->Arg0 = arg0;
+	record->Arg1 = arg1;
+	record->Arg2 = arg2;
+	record->Arg3 = arg3;
+	PushRecord(CONTAINING_RECORD(header, ItemFull<RecordHeader>, Item), true);
+}
+
 // Drop-capture target directory, copied out under the lock.
 USHORT DropsDir(_Out_ WCHAR* out, _In_ USHORT capBytes) {
 	return g_Data.Target->Get(out, capBytes);
@@ -590,6 +608,11 @@ void EmitRegistrySetValue(_In_ PCUNICODE_STRING keyPath, _In_ PCUNICODE_STRING v
 
 } // namespace
 
+void InjectionEmitBehaviorCall(_In_ ULONG pid, _In_ ULONG64 createTime, _In_ ULONG threadId,
+	_In_ ULONG api, _In_ ULONG64 arg0, _In_ ULONG64 arg1, _In_ ULONG64 arg2, _In_ ULONG64 arg3) {
+	EmitBehaviorCallInternal(pid, createTime, threadId, api, arg0, arg1, arg2, arg3);
+}
+
 
 extern "C"
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
@@ -907,6 +930,22 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
 			stats->DropsMissedBusy = g_Data.DropsMissedBusy;
 			stats->DropsLinkFailed = g_Data.DropsLinkFailed;
 			stats->DropsCopyFailed = g_Data.DropsCopyFailed;
+			stats->InjectionsQueued = g_Data.InjectionsQueued;
+			stats->InjectionsFailed = g_Data.InjectionsFailed;
+			stats->SensorsRegistered = g_Data.SensorsRegistered;
+			stats->SensorsRejected = g_Data.SensorsRejected;
+			stats->SensorEventsDrained = g_Data.SensorEventsDrained;
+			stats->SensorEventsDropped = g_Data.SensorEventsDropped;
+			stats->SensorRingsActive = 0;
+			{
+				AutoLock<FastMutex> locker(*g_Data.InjectionLedgerLock);
+				for (auto link = g_Data.InjectionLedger.Flink;
+					link != &g_Data.InjectionLedger; link = link->Flink) {
+					auto entry = CONTAINING_RECORD(link, InjectionEntry, Link);
+					if (entry->State == InjectionState::Registered)
+						++stats->SensorRingsActive;
+				}
+			}
 			len = sizeof(DriverStats);
 			break;
 		}
@@ -1115,8 +1154,15 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
 				break;
 			}
 			auto challenge = (SensorChallenge*)Irp->AssociatedIrp.SystemBuffer;
-			if (!InjectionSensorChallenge(HandleToULong(PsGetCurrentProcessId()),
-				&challenge->Nonce)) {
+			PEPROCESS caller = nullptr;
+			if (!NT_SUCCESS(::PsLookupProcessByProcessId(PsGetCurrentProcessId(), &caller))) {
+				status = STATUS_ACCESS_DENIED;
+				break;
+			}
+			auto ok = InjectionSensorChallenge(HandleToULong(PsGetCurrentProcessId()),
+				caller, challenge);
+			ObDereferenceObject(caller);
+			if (!ok) {
 				status = STATUS_ACCESS_DENIED;
 				len = 0;
 				break;

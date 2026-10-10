@@ -54,6 +54,8 @@ struct Globals {
 	volatile LONG64 DropsMissedBusy;
 	volatile LONG64 DropsLinkFailed;
 	volatile LONG64 DropsCopyFailed;
+	volatile LONG64 SensorEventsDrained; // ring slots promoted to records
+	volatile LONG64 SensorEventsDropped; // slots skipped: torn, stale or garbage
 	// Drop extension matcher + target directory (heap-built: FastMutex).
 	FileWatch* DropWatch;
 	DropTarget* Target;

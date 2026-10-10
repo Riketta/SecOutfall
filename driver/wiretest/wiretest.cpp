@@ -176,6 +176,20 @@ void BuildDropCaptured() {
 	AppendWstr(stored);
 }
 
+void BuildBehaviorCall() {
+	ULONG pid = 1004;
+	BehaviorCallRecord record {};
+	record.Header = MakeHeader(BehaviorCall, pid, IdentityBase + pid, TRUNC_NONE,
+		BehaviorCallFixed);
+	record.ThreadId = 2004;
+	record.Api = BehaviorNtCreateFile;
+	record.Arg0 = 0xC000000000000000ull;
+	record.Arg1 = 0x1234;
+	record.Arg2 = 0x5678;
+	record.Arg3 = 0x9ABC;
+	AppendRaw(&record, BehaviorCallFixed);
+}
+
 void BuildFileRenamed() {
 	bool truncated = false;
 	auto oldPath = Clamp(L"\\Device\\HarddiskVolume2\\Users\\user\\Documents\\draft.txt",
@@ -279,7 +293,7 @@ bool WalkFixture(const std::vector<BYTE>& bytes) {
 		offset += header->Size;
 	}
 	printf("fixture walks clean: %d records, %zu bytes\n", count, bytes.size());
-	return count == 14;
+	return count == 15;
 }
 
 } // namespace
@@ -311,6 +325,7 @@ int main(int argc, char** argv) {
 		L"\\Device\\HarddiskVolume2\\Users\\user\\AppData\\log.tmp"); // 12
 	BuildFileRenamed(); // 13
 	BuildDropCaptured(); // 14
+	BuildBehaviorCall(); // 15
 	auto fixture = g_out;
 
 	if (!WalkFixture(fixture)) {

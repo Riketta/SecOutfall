@@ -46,6 +46,13 @@ struct InjectionEntry {
 	HANDLE ProcessHandle;    // kernel handle, VM operation on the target
 	PVOID NtdllBase;         // ntdll base in THIS process
 	InjectionState State;
+
+	// Sensor ring (D3 slice 2): one section per sensor, kernel-mapped for
+	// drain, duplicated into the target at challenge time.
+	HANDLE RingSection;
+	PVOID RingKernelVa;
+	ULONG64 RingDrainIndex;  // kernel-private cursor (never shared)
+	ULONG SensorVersion;
 };
 
 // Engine API (implemented in Injection.cpp, state in Globals).
@@ -64,5 +71,15 @@ void InjectionOnImageLoad(_In_ ULONG pid, _In_ PVOID base, _In_ PCUNICODE_STRING
 void InjectionOnProcessExit(_In_ ULONG pid);
 // Ledger-gated sensor handshake: the challenge is answered only for a pid
 // the engine injected and only before registration (one-shot).
-bool InjectionSensorChallenge(_In_ ULONG pid, _Out_ ULONG64* nonce);
+struct SensorChallenge;
+bool InjectionSensorChallenge(_In_ ULONG pid, _In_ HANDLE callerProcess, _Inout_ SensorChallenge* challenge);
+bool InjectionSensorRegister(_In_ ULONG pid, _In_ ULONG64 nonce, _In_ ULONG sensorVersion);
+// Drains every registered sensor ring into the file (flood) queue. Called
+// from the drain IOCTL; capped per call.
+void InjectionDrainRings();
+// Implemented in secoutfall.cpp (owns the record allocator + queues): the
+// drain promotes a validated ring slot into a BehaviorCall wire record.
+void InjectionEmitBehaviorCall(_In_ ULONG pid, _In_ ULONG64 createTime,
+	_In_ ULONG threadId, _In_ ULONG api, _In_ ULONG64 arg0, _In_ ULONG64 arg1,
+	_In_ ULONG64 arg2, _In_ ULONG64 arg3);
 bool InjectionSensorRegister(_In_ ULONG pid, _In_ ULONG64 nonce, _In_ ULONG sensorVersion);

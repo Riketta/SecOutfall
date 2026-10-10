@@ -10,7 +10,12 @@ fn main() {
         "NtCreateFile",
         "NtWriteFile",
         "NtClose",
-        // "NtTraceEvent",
+        "DeviceIoControl",
+        "CreateFileW",
+        "CloseHandle",
+        "MapViewOfFile",
+        "UnmapViewOfFile",
+        "GetCurrentThreadId",
     ];
 
     windows_bindgen::bindgen(args);
