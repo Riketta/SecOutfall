@@ -295,11 +295,26 @@ pub struct ScoringConfig {
     pub cli_started: u32,
     /// Score for an observed drop.
     pub drop_observed: u32,
+    /// Score for a scoped process writing a `Run`/`RunOnce` value
+    /// (`behavior.call` api `NT_SET_VALUE_KEY_RUN_KEY`), scored once per pid.
+    pub run_key_set: u32,
+    /// Score for the injection chain: cross-process virtual-memory write +
+    /// thread creation from the same pid.
+    pub chain_injection: u32,
+    /// Score for the ransomware chain: mass `CryptEncrypt` use + shadow-copy
+    /// deletion from the same pid.
+    pub chain_ransomware: u32,
 }
 
 impl Default for ScoringConfig {
     fn default() -> Self {
-        Self { cli_started: 4, drop_observed: 5 }
+        Self {
+            cli_started: 4,
+            drop_observed: 5,
+            run_key_set: 3,
+            chain_injection: 20,
+            chain_ransomware: 40,
+        }
     }
 }
 
@@ -654,13 +669,20 @@ mod tests {
         let config = AgentConfig::from_toml_str("[target]\npath = 'x'\n").unwrap();
         assert_eq!(config.scoring.cli_started, 4);
         assert_eq!(config.scoring.drop_observed, 5);
+        assert_eq!(config.scoring.run_key_set, 3);
+        assert_eq!(config.scoring.chain_injection, 20);
+        assert_eq!(config.scoring.chain_ransomware, 40);
 
         let config = AgentConfig::from_toml_str(
-            "[target]\npath = 'x'\n\n[scoring]\ncli_started = 10\ndrop_observed = 20\n",
+            "[target]\npath = 'x'\n\n[scoring]\ncli_started = 10\ndrop_observed = 20\n\
+             run_key_set = 30\nchain_injection = 40\nchain_ransomware = 50\n",
         )
         .unwrap();
         assert_eq!(config.scoring.cli_started, 10);
         assert_eq!(config.scoring.drop_observed, 20);
+        assert_eq!(config.scoring.run_key_set, 30);
+        assert_eq!(config.scoring.chain_injection, 40);
+        assert_eq!(config.scoring.chain_ransomware, 50);
     }
 
     #[test]

@@ -32,4 +32,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "decode_driver_wire"
+path = "fuzz_targets/decode_driver_wire.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

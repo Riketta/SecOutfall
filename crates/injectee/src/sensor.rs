@@ -79,12 +79,28 @@ static RING: AtomicPtr<RingControl> = AtomicPtr::new(std::ptr::null_mut());
 static SENSOR_VERSION: AtomicU32 = AtomicU32::new(1);
 
 /// Behavior API ids (mirror of the driver's `BehaviorApi`; see the protocol
-/// crate's `behavior_api` for the authoritative values).
+/// crate's `behavior_api` for the authoritative values). Ids 7/8/9/10 are
+/// sensor-classified variants: the ring carries no strings, so path- or
+/// handle-derived signals must become distinct ids at the hook itself.
+/// Hook ids land here BEFORE their hooks exist (the numbering is reserved
+/// in all three mirrors at once), so a future hook cannot invent a
+/// conflicting value — hence the deliberate dead-code allowance.
+#[allow(dead_code)]
 pub mod api {
     pub const NT_DELAY_EXECUTION: u32 = 1;
     pub const NT_CREATE_FILE: u32 = 2;
     pub const NT_WRITE_FILE: u32 = 3;
     pub const NT_CREATE_THREAD_EX: u32 = 4;
+    pub const NT_DELETE_FILE: u32 = 5;
+    pub const NT_SET_VALUE_KEY: u32 = 6;
+    pub const NT_SET_VALUE_KEY_RUN_KEY: u32 = 7;
+    pub const NT_ALLOCATE_VM_CROSS_PROCESS: u32 = 8;
+    pub const NT_WRITE_VM_CROSS_PROCESS: u32 = 9;
+    pub const NT_DELETE_FILE_SHADOW_COPY: u32 = 10;
+    pub const LDR_LOAD_DLL: u32 = 11;
+    pub const CRYPT_ENCRYPT: u32 = 12;
+    pub const SHELL_EXECUTE_EX: u32 = 13;
+    pub const WIN_EXEC: u32 = 14;
 }
 
 fn open_device() -> Result<HANDLE, ()> {

@@ -602,6 +602,100 @@ async fn attach_etw(session: &agent::app::runtime::RunningSession) {
     println!("ETW kernel trace attached");
 }
 
+/// One-shot driver policy push (feature `driver`): device-security (console
+/// user so the sensor reaches the device non-elevated), sensor
+/// materialization (randomized name + DACL dir + hash pin), then the
+/// injection/drop/protection blobs. Every step degrades to a log line — a
+/// missing driver or a failed policy must never take the service down.
+#[cfg(all(windows, feature = "driver"))]
+async fn push_driver_policies(config: &protocol::config::AgentConfig) {
+    use agent::ports::driven::{
+        driver_control::{
+            DriverControlPort,
+            DriverPolicies,
+            DropPolicy,
+            InjectionPolicy,
+            ProtectionPolicy,
+            device_security_sddl,
+        },
+        sensor_store::SensorStorePort,
+    };
+
+    // The SID resolution is itself blocking; do it before the blocking task
+    // so the task is one linear push.
+    let console_sid = agent::adapters::driving::ipc_server::console_user_sid().await;
+
+    let driver = config.driver.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let control =
+            match agent::adapters::driven::driver_control_device::DriverControlDevice::open() {
+                Ok(control) => control,
+                Err(error) => {
+                    tracing::warn!(%error, "driver control device not available; policies not pushed");
+                    return;
+                }
+            };
+
+        // 1. Device security: driver default (SYSTEM/Admins) + console user.
+        let sddl = device_security_sddl(console_sid.as_deref());
+        match control.apply_device_security(&sddl) {
+            Ok(()) => tracing::info!(%sddl, "driver device security applied"),
+            Err(error) => tracing::warn!(%error, "driver device security push failed"),
+        }
+
+        // 2. Sensor materialization: copy under a randomized DACL-protected
+        // name, hash-pin, and only arm injection with the verified copy.
+        let injection = if driver.sensor_path.is_empty() {
+            tracing::info!("driver.sensor_path empty; sensor injection stays disarmed");
+            None
+        } else {
+            match agent::adapters::driven::sensor_store::windows::WindowsSensorStore::new() {
+                Ok(store) => match store.materialize(&driver.sensor_path) {
+                    Ok(sensor) => {
+                        tracing::info!(path = %sensor.dos_path, sha256 = %sensor.sha256_hex, "sensor materialized");
+                        Some(InjectionPolicy {
+                            sensor_path: sensor.nt_path,
+                            exclusions: Vec::new(),
+                        })
+                    }
+                    Err(error) => {
+                        // Hash mismatch / copy failure: injection stays OFF —
+                        // pushing an unverified path is worse than no sensor.
+                        tracing::error!(%error, "sensor materialization failed; injection NOT armed");
+                        None
+                    }
+                },
+                Err(error) => {
+                    tracing::error!(%error, "sensor store unavailable; injection NOT armed");
+                    None
+                }
+            }
+        };
+
+        let policies = DriverPolicies {
+            injection,
+            drops: (!driver.drops_dir.is_empty()).then(|| DropPolicy {
+                dir: driver.drops_dir.clone(),
+                extensions: driver.drop_extensions.clone(),
+            }),
+            protection: Some(ProtectionPolicy { names: driver.protected_names.clone() }),
+        };
+        match control.apply_policies(&policies) {
+            Ok(()) => tracing::info!("driver policies applied"),
+            Err(error) => tracing::warn!(%error, "driver policy push failed"),
+        }
+
+        // 3. Baseline health snapshot (loss counters continue via stats).
+        match control.query_stats() {
+            Ok(stats) => tracing::info!(?stats, "driver stats at policy push"),
+            Err(error) => tracing::warn!(%error, "driver stats query failed"),
+        }
+    });
+    if let Err(error) = result.await {
+        tracing::error!(%error, "driver policy push task panicked — policies not pushed");
+    }
+}
+
 /// Attach THE event source for this build. Shared by every host mode
 /// (console / local / service) so the wiring cannot diverge — the service is
 /// the production deployment and must observe exactly like console (the
@@ -616,6 +710,9 @@ async fn attach_event_source(
     #[cfg(all(windows, feature = "driver"))]
     if config.driver.enabled {
         use agent::ports::driving::event_source::EventSourcePort;
+        // Policies go first: injection armed before any process can be
+        // created into an unpolled driver.
+        push_driver_policies(config).await;
         let clock = session.clock();
         let adapter = Arc::new(
             agent::adapters::driving::driver_event_source::DriverEventSourceAdapter::new(clock),

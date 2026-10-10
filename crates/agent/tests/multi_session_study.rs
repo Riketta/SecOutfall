@@ -41,8 +41,10 @@ use kernel::{
 };
 use protocol::{
     config::AgentConfig,
+    driver_wire::behavior_api,
     events::EventType,
     payload::{
+        BehaviorCallData,
         FileReleasedData,
         FileWrittenData,
         ProcessStartedData,
@@ -113,6 +115,32 @@ fn file_closed(pid: u32, path: &str) -> SandboxEvent {
         file_key: Some(2),
         file_name: Some(path.to_owned()),
     }))
+}
+
+/// A sensor hooked-API call (driver track): what the `behavior.call` wire
+/// record becomes after the driver-source mapping.
+fn behavior_call(pid: u32, api: u32) -> SandboxEvent {
+    SandboxEvent::Source(SourceEvent::BehaviorCall(BehaviorCallData {
+        pid,
+        tid: 1,
+        api,
+        arg0: 0,
+        arg1: 0,
+        arg2: 0,
+        arg3: 0,
+    }))
+}
+
+/// The session's `study.score` envelope value, if published.
+fn study_score(broker: &FakeBroker) -> Option<u32> {
+    broker
+        .of_channel(Channel::Event)
+        .into_iter()
+        .find(|envelope| envelope.event_type == EventType::StudyScore)
+        .and_then(|envelope| match envelope.data {
+            protocol::payload::Payload::StudyScore(data) => Some(data.score),
+            _ => None,
+        })
 }
 
 /// Feed events into the pipeline, yielding after each so bus consumers flush.
@@ -563,7 +591,9 @@ async fn twenty_four_session_full_study_simulation() {
 
     for session in 0..total_sessions {
         // Every third session detonates and drops; the others are quiet
-        // (the target still relaunches — `every_session`).
+        // (the target still relaunches — `every_session`). Detonating
+        // sessions also run the ransomware chain through the sensor hooks:
+        // 8 mass encryptions + one shadow-copy deletion from the scoped pid.
         let target_pid = 5000 + session;
         let mut script = vec![
             process_started(4000 + session, None, "explorer.exe"),
@@ -573,6 +603,12 @@ async fn twenty_four_session_full_study_simulation() {
             let path = format!("C:\\Users\\victim\\report-{session}.txt");
             script.push(file_written(target_pid, &path));
             script.push(file_closed(target_pid, &path));
+            // Ransomware chain over the sensor hooks: mass encryption, then
+            // the shadow-copy deletion that completes it.
+            for _ in 0..8 {
+                script.push(behavior_call(target_pid, behavior_api::CRYPT_ENCRYPT));
+            }
+            script.push(behavior_call(target_pid, behavior_api::NT_DELETE_FILE_SHADOW_COPY));
         }
         let boot = run_boot(&config, &repo, &script, true).await;
 
@@ -617,6 +653,12 @@ async fn twenty_four_session_full_study_simulation() {
             EventType::StudyRebootRequested
         };
         assert_eq!(control.first().unwrap().event_type, expected_control);
+
+        // Scoring v2: detonating sessions complete the ransomware chain
+        // (default weight 40 dominates the drop signal 5); quiet sessions
+        // score nothing.
+        let expected_score = if session % 3 == 0 { 40 } else { 0 };
+        assert_eq!(study_score(&boot.broker), Some(expected_score), "session {session} score");
     }
 
     // The persisted study record: 24 ended sessions under one study id.

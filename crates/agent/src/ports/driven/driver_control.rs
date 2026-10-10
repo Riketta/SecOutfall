@@ -104,6 +104,18 @@ pub struct DriverStatsSnapshot {
     pub protection_trusted: u64,
 }
 
+/// The device DACL the agent pushes: the driver's compiled SDDL
+/// (SYSTEM + Administrators, `GA`) plus, when a console-session user exists,
+/// a generic-all ACE for that user — the sensor reaches the device from a
+/// non-elevated target. Pure: the adapter does the Win32 conversion.
+#[must_use]
+pub fn device_security_sddl(console_user_sid: Option<&str>) -> String {
+    match console_user_sid {
+        Some(sid) => format!(r"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{sid})"),
+        None => r"D:P(A;;GA;;;SY)(A;;GA;;;BA)".to_owned(),
+    }
+}
+
 /// Errors from the control device.
 #[derive(Debug, thiserror::Error)]
 pub enum DriverControlError {
@@ -126,6 +138,18 @@ pub trait DriverControlPort: Send + Sync + 'static {
     /// [`DriverControlError`] when the device is missing or a policy is
     /// rejected.
     fn apply_policies(&self, policies: &DriverPolicies) -> Result<(), DriverControlError>;
+
+    /// Replaces the device object's DACL. `sddl` is an SDDL string; the
+    /// adapter converts it to a self-relative descriptor. Idempotent.
+    ///
+    /// Used to grant the console-session user access so the injected sensor
+    /// (running in the analysis user's context) can reach the device for its
+    /// challenge/register handshake from a non-elevated target.
+    ///
+    /// # Errors
+    /// [`DriverControlError`] when the device is missing or the driver
+    /// rejects the descriptor.
+    fn apply_device_security(&self, sddl: &str) -> Result<(), DriverControlError>;
 
     /// Queries the loss/health snapshot.
     ///
@@ -161,5 +185,24 @@ pub trait DriverControlPort: Send + Sync + 'static {
         map.insert("protections_stripped".to_owned(), stats.protections_stripped);
         map.insert("protection_trusted".to_owned(), stats.protection_trusted);
         Ok(map)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn device_sddl_covers_system_admins_and_optional_console_user() {
+        assert_eq!(device_security_sddl(None), r"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+        assert_eq!(
+            device_security_sddl(Some("S-1-5-21-1004336348-1176667385-1801674531-1001")),
+            r"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;S-1-5-21-1004336348-1176667385-1801674531-1001)"
+        );
+        // Degenerate input cannot break the builder's shape; the driver's
+        // SD validation stays the real gate.
+        assert!(device_security_sddl(Some("")).ends_with("(A;;GA;;;)"));
     }
 }

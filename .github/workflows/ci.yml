@@ -55,7 +55,7 @@ jobs:
         working-directory: fuzz
         timeout-minutes: 15
         run: |
-          for target in parse_frame parse_config decode_screenshot_payload; do
+          for target in parse_frame parse_config decode_screenshot_payload decode_driver_wire; do
             cargo +nightly fuzz run "$target" -- -max_total_time=60
           done
 

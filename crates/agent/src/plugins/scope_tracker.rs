@@ -195,6 +195,22 @@ impl MiddlewarePluginPort<SandboxEvent, crate::app::builder::AgentServices> for 
                     self.bus.publish(AgentBusEvent::DropObserved { path, pid: Some(data.pid) });
                 }
             }
+            SandboxEvent::Source(SourceEvent::BehaviorCall(data)) => {
+                // Scoring-v2 bridge: only signal apis of SCOPED processes cross
+                // onto the bus (high-rate hooked calls and unscoped noise are
+                // filtered here, before they can flood the bus).
+                if crate::domain::score::is_scoring_relevant(data.api) {
+                    let state = self.state.lock();
+                    let scoped = self.tracker.lock().is_scoped(&state, data.pid);
+                    drop(state);
+                    if scoped {
+                        self.bus.publish(AgentBusEvent::BehaviorObserved {
+                            pid: data.pid,
+                            api: data.api,
+                        });
+                    }
+                }
+            }
             SandboxEvent::Source(
                 SourceEvent::FileClosed(data) | SourceEvent::FileCleanedUp(data),
             ) => {

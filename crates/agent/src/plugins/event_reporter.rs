@@ -129,12 +129,15 @@ async fn publish_bus_event(
     let now = clock.now_ms();
     let envelope = match event {
         // `target.launched` is reported by the launcher itself (it owns the
-        // pid/args/mechanism facts); score raises feed the finalizer.
+        // pid/args/mechanism facts); score raises feed the finalizer;
+        // behavior observations are scoring-internal (the raw `behavior.call`
+        // wire event flows from the source side).
         AgentBusEvent::TargetLaunched { .. }
         | AgentBusEvent::ExtendScopeExpectation { .. }
         | AgentBusEvent::SessionScoreRaised { .. }
         | AgentBusEvent::ProcessEnteredScope { .. }
-        | AgentBusEvent::ProcessExitedScope { .. } => return,
+        | AgentBusEvent::ProcessExitedScope { .. }
+        | AgentBusEvent::BehaviorObserved { .. } => return,
         AgentBusEvent::DropObserved { path, pid } => crate::plugins::wire::envelope_raw(
             now,
             next_seq(seq),

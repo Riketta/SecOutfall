@@ -110,11 +110,19 @@ focus_method = "win_events"
 screencapture = false
 
 [scoring]
-# Session score = maximum over observed signals (legacy parity).
+# Session score = maximum over observed signals (legacy parity), including
+# behavior signals when the kernel driver's sensor is active.
 # Score for a CLI/interpreter process entering the scope.
 cli_started = 4
 # Score for an observed drop.
 drop_observed = 5
+# Score for a scoped process writing a Run/RunOnce value (once per process).
+run_key_set = 3
+# Injection chain: cross-process VM write + thread creation from one process.
+chain_injection = 20
+# Ransomware chain: 8+ CryptEncrypt calls + shadow-copy deletion from one
+# process.
+chain_ransomware = 40
 
 [driver]
 # Route telemetry through the kernel driver INSTEAD of user-mode ETW

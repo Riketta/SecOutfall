@@ -8,6 +8,7 @@ analyzed malware or the operator:
 | `parse_frame`                | IPC v1 frame header (agent ↔ user-actor pipe)     |
 | `parse_config`               | strict TOML config (`C:\Agent.toml`)              |
 | `decode_screenshot_payload`  | screenshot frame payload (`seq` + JPEG)           |
+| `decode_driver_wire`         | driver IOCTL drain batches (`GET_DATA`, wire v2)  |
 
 Run on a Linux host (libFuzzer needs `-fsanitize=fuzzer`; MSVC is not
 supported):

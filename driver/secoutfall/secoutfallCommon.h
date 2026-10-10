@@ -44,13 +44,26 @@ enum RecordType : USHORT {
 	ProtectionEvent = 16,
 };
 
-// Behavior APIs reported by the sensor (wire values, stable). The v1 hook
-// set; more join behind the same enum (D4).
+// Behavior APIs reported by the sensor (wire values, stable — mirrored in
+// protocol::driver_wire::behavior_api and the injectee's sensor::api). Ids
+// 7/8/9/10 are SENSOR-CLASSIFIED variants: the ring carries no strings, so
+// path- or handle-derived signals (Run-key, cross-process, shadow-copy) must
+// become distinct ids at the hook itself.
 enum BehaviorApi : ULONG {
 	BehaviorNtDelayExecution = 1,
 	BehaviorNtCreateFile = 2,
 	BehaviorNtWriteFile = 3,
 	BehaviorNtCreateThreadEx = 4,
+	BehaviorNtDeleteFile = 5,
+	BehaviorNtSetValueKey = 6,
+	BehaviorNtSetValueKeyRunKey = 7,
+	BehaviorNtAllocateVmCrossProcess = 8,
+	BehaviorNtWriteVmCrossProcess = 9,
+	BehaviorNtDeleteFileShadowCopy = 10,
+	BehaviorLdrLoadDll = 11,
+	BehaviorCryptEncrypt = 12,
+	BehaviorShellExecuteEx = 13,
+	BehaviorWinExec = 14,
 };
 
 // Truncation flags (header TruncFlags): which variable-length field hit its

@@ -50,6 +50,7 @@ const IOCTL_GET_STATS: u32 = ctl_code(0x8000, 0x801, METHOD_OUT_DIRECT, FILE_REA
 const IOCTL_SET_DROP_POLICY: u32 = ctl_code(0x8000, 0x804, METHOD_BUFFERED, FILE_WRITE_ACCESS);
 const IOCTL_SET_INJECTION_POLICY: u32 = ctl_code(0x8000, 0x805, METHOD_BUFFERED, FILE_WRITE_ACCESS);
 const IOCTL_SET_PROTECTED: u32 = ctl_code(0x8000, 0x808, METHOD_BUFFERED, FILE_WRITE_ACCESS);
+const IOCTL_SET_DEVICE_SECURITY: u32 = ctl_code(0x8000, 0x809, METHOD_BUFFERED, FILE_WRITE_ACCESS);
 
 const DRIVER_PATH: PCWSTR = windows::core::w!(r"\\.\secoutfall");
 
@@ -165,6 +166,56 @@ const OFF_PROTECTION_TRUSTED: usize = 192;
 const STATS_MIN_SIZE: usize = 200;
 
 impl DriverControlPort for DriverControlDevice {
+    fn apply_device_security(&self, sddl: &str) -> Result<(), DriverControlError> {
+        use windows::Win32::{
+            Foundation::{
+                HLOCAL,
+                LocalFree,
+            },
+            Security::{
+                Authorization::{
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW,
+                    SDDL_REVISION_1,
+                },
+                GetSecurityDescriptorLength,
+                PSECURITY_DESCRIPTOR,
+            },
+        };
+
+        // SDDL → self-relative SD (user-mode facility; the kernel blob takes
+        // raw bytes). Converted fresh per call — the port may be called with
+        // different SDDLs over a device's lifetime.
+        let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        // SAFETY: out-pointers initialized by the API on success.
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                &windows::core::HSTRING::from(sddl),
+                SDDL_REVISION_1,
+                &raw mut descriptor,
+                None,
+            )
+        };
+        if converted.is_err() || descriptor.0.is_null() {
+            return Err(DriverControlError::Rejected(format!("bad device SDDL: {converted:?}")));
+        }
+        // SAFETY: the pointer is a valid descriptor allocated above.
+        let sd_len = unsafe { GetSecurityDescriptorLength(descriptor) } as usize;
+        // SAFETY: the descriptor memory is valid until LocalFree below;
+        // slice it for the blob.
+        let sd_bytes = unsafe { std::slice::from_raw_parts(descriptor.0.cast::<u8>(), sd_len) };
+
+        let mut blob: Vec<u8> = Vec::with_capacity(8 + sd_bytes.len());
+        blob.push(1); // Enabled (the driver rejects disable — it would
+        // re-apply the compiled SDDL; the agent never disables).
+        blob.extend_from_slice(&[0; 3]);
+        blob.extend_from_slice(&u32::to_le_bytes(u32::try_from(sd_bytes.len()).unwrap_or(0)));
+        blob.extend_from_slice(sd_bytes);
+        // SAFETY: single free of the descriptor allocated above.
+        unsafe { LocalFree(HLOCAL(descriptor.0.cast())) };
+
+        self.send(IOCTL_SET_DEVICE_SECURITY, &blob)
+    }
+
     fn apply_policies(&self, policies: &DriverPolicies) -> Result<(), DriverControlError> {
         // 1. Injection policy (armed when a sensor path is configured).
         if let Some(injection) = &policies.injection

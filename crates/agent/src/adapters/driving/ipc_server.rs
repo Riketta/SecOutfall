@@ -848,7 +848,17 @@ fn create_pipe_instance(
 #[cfg(windows)]
 #[must_use]
 pub async fn console_user_pipe_sddl() -> Option<String> {
-    tokio::task::spawn_blocking(console_user_pipe_sddl_blocking).await.ok().flatten()
+    console_user_sid().await.as_deref().map(pipe_sddl_for_account)
+}
+
+/// The interactive console session user's SID string (`S-1-...`), for any
+/// runtime-built DACL that must include that user (the IPC pipe today, the
+/// driver control device for the sensor in the driver track). Blocking —
+/// call from `spawn_blocking`.
+#[cfg(windows)]
+#[must_use]
+pub async fn console_user_sid() -> Option<String> {
+    tokio::task::spawn_blocking(console_user_sid_blocking).await.ok().flatten()
 }
 
 /// Blocking SID resolution for [`console_user_pipe_sddl`].
@@ -861,7 +871,11 @@ fn pipe_sddl_for_account(sid: &str) -> String {
     format!("{DEFAULT_PIPE_SDDL}(A;;GA;;;{sid})")
 }
 
-fn console_user_pipe_sddl_blocking() -> Option<String> {
+/// Resolves the console-session user's SID (blocking). `None` when there is
+/// no console session or resolution fails — callers fall back to
+/// SYSTEM/Administrators-only DACLs.
+#[cfg(windows)]
+fn console_user_sid_blocking() -> Option<String> {
     use windows::{
         Win32::{
             Foundation::{
@@ -936,9 +950,7 @@ fn console_user_pipe_sddl_blocking() -> Option<String> {
     // SAFETY: the string was allocated by ConvertSidToStringSidW and is
     // freed exactly once.
     unsafe { LocalFree(HLOCAL(sid_string.0.cast())) };
-    let sid = sid?;
-
-    Some(pipe_sddl_for_account(&sid))
+    sid
 }
 
 #[cfg(test)]

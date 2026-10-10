@@ -7,5 +7,6 @@ pub mod driver_control;
 pub mod process_killer;
 pub mod process_launcher;
 pub mod scope_repository;
+pub mod sensor_store;
 pub mod shell_association;
 pub mod uploader;

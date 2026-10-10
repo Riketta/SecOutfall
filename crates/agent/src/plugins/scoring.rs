@@ -30,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     app::event::AgentBusEvent,
     domain::score::{
+        ChainDetector,
         ScoreSignal,
         ScoreWeights,
         score_signal,
@@ -54,6 +55,9 @@ impl ScoringPlugin {
             weights: ScoreWeights {
                 cli_started: config.cli_started,
                 drop_observed: config.drop_observed,
+                run_key_set: config.run_key_set,
+                chain_injection: config.chain_injection,
+                chain_ransomware: config.chain_ransomware,
             },
             bus,
             max_score: Arc::new(AtomicU32::new(0)),
@@ -82,6 +86,9 @@ impl PluginPort for ScoringPlugin {
         let weights = self.weights;
         let max_score = Arc::clone(&self.max_score);
         let handle = tokio::spawn(async move {
+            // Per-session behavior memory; exited pids are forgotten so the
+            // detector stays bounded (see `domain::score::ChainDetector`).
+            let mut detector = ChainDetector::default();
             loop {
                 tokio::select! {
                     biased;
@@ -95,6 +102,24 @@ impl PluginPort for ScoringPlugin {
                                 AgentBusEvent::DropObserved { .. } => {
                                     score_signal(&weights, &ScoreSignal::DropObserved)
                                 }
+                                AgentBusEvent::BehaviorObserved { pid, api } => {
+                                    let finding = detector.observe(pid, api);
+                                    if finding.run_key_set {
+                                        Some(weights.run_key_set)
+                                    } else {
+                                        finding
+                                            .chains
+                                            .iter()
+                                            .map(|chain| chain.weight(&weights))
+                                            .max()
+                                    }
+                                }
+                                // Scope memory hygiene: a dead pid's chain
+                                // progress must not leak into a reused pid.
+                                AgentBusEvent::ProcessExitedScope { pid, .. } => {
+                                    detector.forget(pid);
+                                    None
+                                }
                                 _ => None,
                             };
                             if let Some(candidate) = candidate {
@@ -107,7 +132,7 @@ impl PluginPort for ScoringPlugin {
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
-                            tracing::warn!(lost = count, "scoring bus lag");
+                            tracing::warn!(lost = count, dropped = detector.dropped_pids(), "scoring bus lag");
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     },

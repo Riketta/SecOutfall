@@ -215,6 +215,15 @@ pub enum AgentBusEvent {
         /// Image name (with extension) to expect in the scope.
         name: String,
     },
+    /// A scoped process made a hooked-API call that is a scoring signal
+    /// (`behavior.call` filtered by `domain::score::is_scoring_relevant`).
+    /// Bridged by the scope-tracker — bus events are derived, never raw.
+    BehaviorObserved {
+        /// OS process id (scoped — the tracker checked membership).
+        pid: u32,
+        /// Behavior api id (see `protocol::driver_wire::behavior_api`).
+        api: u32,
+    },
     /// The scoring plugin raised the session maximum score.
     SessionScoreRaised {
         /// New session maximum.

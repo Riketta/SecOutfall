@@ -85,6 +85,31 @@ pub mod behavior_api {
     /// `NtCreateThreadEx` — thread creation (cross-process = injection
     /// candidate for chain scoring).
     pub const NT_CREATE_THREAD_EX: u32 = 4;
+    /// `NtDeleteFile` — file deletion.
+    pub const NT_DELETE_FILE: u32 = 5;
+    /// `NtSetValueKey` — registry value write.
+    pub const NT_SET_VALUE_KEY: u32 = 6;
+    /// `NtSetValueKey` on a `Run`/`RunOnce` key — the hook classifies the key
+    /// path sensor-side (the ring carries no strings, so path-derived signals
+    /// MUST become distinct api ids at the hook).
+    pub const NT_SET_VALUE_KEY_RUN_KEY: u32 = 7;
+    /// `NtAllocateVirtualMemory` targeting ANOTHER process — the hook checks
+    /// the process handle sensor-side; self-allocation is not reported.
+    pub const NT_ALLOCATE_VM_CROSS_PROCESS: u32 = 8;
+    /// `NtWriteVirtualMemory` targeting ANOTHER process — the classic
+    /// injection primitive (chain member).
+    pub const NT_WRITE_VM_CROSS_PROCESS: u32 = 9;
+    /// `NtDeleteFile` on a shadow-copy device path — the hook classifies the
+    /// path sensor-side; the ransomware chain's second member.
+    pub const NT_DELETE_FILE_SHADOW_COPY: u32 = 10;
+    /// `LdrLoadDll` — module loading (reflective/manual-map evidence).
+    pub const LDR_LOAD_DLL: u32 = 11;
+    /// `CryptEncrypt` — payload encryption (mass use = ransomware prep).
+    pub const CRYPT_ENCRYPT: u32 = 12;
+    /// `ShellExecuteExW` — program/document launch.
+    pub const SHELL_EXECUTE_EX: u32 = 13;
+    /// `WinExec` — legacy program launch.
+    pub const WIN_EXEC: u32 = 14;
 }
 
 /// Record type discriminator (wire values are stable).
