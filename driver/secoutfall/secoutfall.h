@@ -3,9 +3,14 @@
 #define DRIVER_PREFIX "secoutfall: "
 #define DRIVER_TAG 'sfal'
 
+#include <fltKernel.h>
+
 #include "FastMutex.h"
+#include "FileWatch.h"
 #include "Identity.h"
 #include "Queue.h"
+
+struct DriverGlobals;
 
 template<typename T>
 struct ItemFull {
@@ -28,7 +33,31 @@ struct Globals {
 	volatile LONG64 AllocFailures;
 	volatile LONG64 OversizedSkipped;
 	volatile LONG64 IdentityMisses;
-	// Heap-built in DriverEntry: a global IdentityTable would carry the
-	// FastMutex constructor into static init (LNK4210 — drivers have no CRT).
 	IdentityTable* Identities;
+
+	//
+	// File/flood class (D2): a second rate-class queue so a ransomware-style
+	// write storm cannot evict process evidence. Same drain path — GET_DATA
+	// merges both lists by sequence.
+	//
+	Queue<FastMutex>* Files;
+	volatile LONG64 FilesOverwritten;
+	volatile LONG64 FileNameQueriesFailed;
+	volatile LONG64 NoiseWritesSkipped;
+
+	// File telemetry stays OFF until a client (agent/dumper) sends
+	// SET_FILE_WATCH — a driver that observes nothing cannot flood anything.
+	volatile LONG64 FileWatchEnabled;
+	// Configured extension list (each WITH the dot, e.g. L".exe"), nonpaged
+	// UNICODE_STRING array; empty array + enabled = ALL files.
+	PUNICODE_STRING* Extensions;
+	ULONG ExtensionsCount;
+	// Scratch buffer backing the extension strings.
+	PWCHAR ExtensionsBlob;
+
+	// Minifilter registration handle (nullptr until registered).
+	PFLT_FILTER Filter;
+
+	// File-telemetry policy (heap-built: see FileWatch.h).
+	FileWatch* Watch;
 };

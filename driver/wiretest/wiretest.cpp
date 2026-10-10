@@ -123,6 +123,58 @@ void BuildRegistryKey(RecordType type, ULONG pid, const std::wstring& rawPath) {
 	AppendWstr(path);
 }
 
+void BuildFileRecord(RecordType type, ULONG pid, const std::wstring& rawPath) {
+	bool truncated = false;
+	auto path = Clamp(rawPath, MaxFilePathBytes, truncated);
+	FileRecord record {};
+	record.Header = MakeHeader(type, pid, IdentityBase + pid,
+		truncated ? TRUNC_FILE_PATH : TRUNC_NONE,
+		FileFixed + static_cast<ULONG>(path.size() * sizeof(WCHAR)));
+	record.PathOffset = FileFixed;
+	record.PathBytes = static_cast<USHORT>(path.size() * sizeof(WCHAR));
+	AppendRaw(&record, FileFixed);
+	AppendWstr(path);
+}
+
+void BuildFileWritten() {
+	bool truncated = false;
+	auto path = Clamp(L"\\Device\\HarddiskVolume2\\Users\\user\\Documents\\notes.txt",
+		MaxFilePathBytes, truncated);
+	ULONG pid = 1004;
+	FileWrittenRecord record {};
+	record.Header = MakeHeader(FileWritten, pid, IdentityBase + pid,
+		truncated ? TRUNC_FILE_PATH : TRUNC_NONE,
+		FileWrittenFixed + static_cast<ULONG>(path.size() * sizeof(WCHAR)));
+	record.ByteOffset = 512;
+	record.BytesCount = 240;
+	record.PathOffset = FileWrittenFixed;
+	record.PathBytes = static_cast<USHORT>(path.size() * sizeof(WCHAR));
+	AppendRaw(&record, FileWrittenFixed);
+	AppendWstr(path);
+}
+
+void BuildFileRenamed() {
+	bool truncated = false;
+	auto oldPath = Clamp(L"\\Device\\HarddiskVolume2\\Users\\user\\Documents\\draft.txt",
+		MaxFilePathBytes, truncated);
+	auto newPath = Clamp(L"\\Device\\HarddiskVolume2\\Users\\user\\Documents\\final.txt",
+		MaxFilePathBytes, truncated);
+	ULONG pid = 1004;
+	UCHAR flags = TRUNC_NONE;
+	if (truncated)
+		flags |= TRUNC_OLD_PATH | TRUNC_NEW_PATH;
+	FileRenamedRecord record {};
+	record.Header = MakeHeader(FileRenamed, pid, IdentityBase + pid, flags,
+		FileRenamedFixed + static_cast<ULONG>((oldPath.size() + newPath.size()) * sizeof(WCHAR)));
+	record.OldPathOffset = FileRenamedFixed;
+	record.OldPathBytes = static_cast<USHORT>(oldPath.size() * sizeof(WCHAR));
+	record.NewPathOffset = static_cast<USHORT>(record.OldPathOffset + record.OldPathBytes);
+	record.NewPathBytes = static_cast<USHORT>(newPath.size() * sizeof(WCHAR));
+	AppendRaw(&record, FileRenamedFixed);
+	AppendWstr(oldPath);
+	AppendWstr(newPath);
+}
+
 void BuildRegistrySetValue() {
 	ULONG pid = 1004;
 	// A path longer than the cap: the clamp must truncate it and flag the
@@ -204,7 +256,7 @@ bool WalkFixture(const std::vector<BYTE>& bytes) {
 		offset += header->Size;
 	}
 	printf("fixture walks clean: %d records, %zu bytes\n", count, bytes.size());
-	return count == 8;
+	return count == 13;
 }
 
 } // namespace
@@ -227,6 +279,14 @@ int main(int argc, char** argv) {
 	BuildRegistryKey(RegistryKeyDeleted, 1004,
 		L"\\REGISTRY\\MACHINE\\SOFTWARE\\Evil\\Persist"); // 7
 	BuildRegistrySetValue(); // 8
+	BuildFileRecord(FileCreated, 1004,
+		L"\\Device\\HarddiskVolume2\\Users\\user\\AppData\\payload.dll"); // 9
+	BuildFileWritten(); // 10
+	BuildFileRecord(FileCleanedUp, 1004,
+		L"\\Device\\HarddiskVolume2\\Users\\user\\AppData\\payload.dll"); // 11
+	BuildFileRecord(FileDeleted, 1004,
+		L"\\Device\\HarddiskVolume2\\Users\\user\\AppData\\log.tmp"); // 12
+	BuildFileRenamed(); // 13
 	auto fixture = g_out;
 
 	if (!WalkFixture(fixture)) {

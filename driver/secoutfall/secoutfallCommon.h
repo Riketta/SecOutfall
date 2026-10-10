@@ -34,6 +34,11 @@ enum RecordType : USHORT {
 	RegistryKeyCreated = 6,
 	RegistryKeyDeleted = 7,
 	RegistrySetValue = 8,
+	FileCreated = 9,
+	FileWritten = 10,
+	FileCleanedUp = 11,
+	FileDeleted = 12,
+	FileRenamed = 13,
 };
 
 // Truncation flags (header TruncFlags): which variable-length field hit its
@@ -44,12 +49,16 @@ const UCHAR TRUNC_KEY_PATH = 0x02;
 const UCHAR TRUNC_VALUE_NAME = 0x04;
 const UCHAR TRUNC_DATA = 0x08;
 const UCHAR TRUNC_IMAGE_NAME = 0x10;
+const UCHAR TRUNC_FILE_PATH = 0x20;
+const UCHAR TRUNC_OLD_PATH = 0x40;
+const UCHAR TRUNC_NEW_PATH = 0x80;
 
 // String caps in BYTES (whole WCHARs on the wire). All fit u16 lengths.
 const USHORT MaxCommandLineBytes = 8192;
 const USHORT MaxKeyPathBytes = 1024;
 const USHORT MaxValueNameBytes = 512;
 const USHORT MaxImageNameBytes = 1024;
+const USHORT MaxFilePathBytes = 1024;
 const ULONG MaxValueDataBytes = 128;
 
 //
@@ -119,6 +128,33 @@ struct RegistrySetValueRecord {
 	// UCHAR Data[] at the end (after ValueName)
 };
 
+// created / cleaned_up / deleted: one path, no byte counts.
+struct FileRecord {
+	RecordHeader Header;       // +0
+	USHORT PathOffset;         // +48 from record start
+	USHORT PathBytes;          // +50 whole WCHARs
+	// WCHAR Path[] at PathOffset
+};
+
+struct FileWrittenRecord {
+	RecordHeader Header;       // +0
+	ULONG64 ByteOffset;        // +48 start of the write
+	ULONG BytesCount;          // +56 write length
+	USHORT PathOffset;         // +60 from record start
+	USHORT PathBytes;          // +62 whole WCHARs
+	// WCHAR Path[] at PathOffset
+};
+
+struct FileRenamedRecord {
+	RecordHeader Header;       // +0
+	USHORT OldPathOffset;      // +48 from record start (pre-rename name)
+	USHORT OldPathBytes;       // +50 whole WCHARs
+	USHORT NewPathOffset;      // +52 from record start
+	USHORT NewPathBytes;       // +54 whole WCHARs
+	// WCHAR OldPath[] at OldPathOffset
+	// WCHAR NewPath[] at NewPathOffset
+};
+
 // Kernel-side loss/diagnostic counters (also the wire shape of
 // IOCTL_SECOUTFALL_GET_STATS: magic + version prefixed, stats only — the
 // client checks them the same way as records).
@@ -128,11 +164,16 @@ struct DriverStats {
 	UCHAR Reserved;
 	ULONG QueueDepth;
 	ULONG QueueCapacity;
+	ULONG FileQueueDepth;
+	ULONG FileQueueCapacity;
 	ULONG64 Sequence;          // last assigned sequence == records emitted
-	ULONG64 QueueOverwritten;  // drop-oldest events
+	ULONG64 QueueOverwritten;  // drop-oldest events, control class
 	ULONG64 AllocFailures;     // pool allocation failures in callbacks
 	ULONG64 OversizedSkipped;  // drain-side skip+count
 	ULONG64 IdentityMisses;    // identity lookups for unknown pids
+	ULONG64 FilesOverwritten;  // drop-oldest events, file class
+	ULONG64 FileNameQueriesFailed; // name query failures (skipped records)
+	ULONG64 NoiseWritesSkipped;    // write-noise heuristic skips
 };
 
 // Fixed payload extents ON THE WIRE: header + payload FIELDS, excluding any
@@ -145,8 +186,12 @@ const ULONG ThreadFixed = 52;
 const ULONG ImageLoadedFixed = sizeof(ImageLoadedRecord);           // 64
 const ULONG RegistryKeyFixed = 52;
 const ULONG RegistrySetValueFixed = sizeof(RegistrySetValueRecord); // 64
+const ULONG FileFixed = 52;
+const ULONG FileWrittenFixed = sizeof(FileWrittenRecord);           // 64
+const ULONG FileRenamedFixed = sizeof(FileRenamedRecord);           // 56
 static_assert(offsetof(ThreadRecord, ThreadId) + sizeof(ULONG) == ThreadFixed, "wire layout pinned");
 static_assert(offsetof(RegistryKeyRecord, PathBytes) + sizeof(USHORT) == RegistryKeyFixed, "wire layout pinned");
+static_assert(offsetof(FileRecord, PathBytes) + sizeof(USHORT) == FileFixed, "wire layout pinned");
 
 // IOCTLs. Unsigned literals: 0x8000 << 16 would overflow int (UB) and the
 // value would stop being a constant expression (unusable as a case label).
@@ -154,6 +199,34 @@ static_assert(offsetof(RegistryKeyRecord, PathBytes) + sizeof(USHORT) == Registr
 	CTL_CODE(0x8000u, 0x800u, METHOD_OUT_DIRECT, FILE_READ_ACCESS)
 #define IOCTL_SECOUTFALL_GET_STATS \
 	CTL_CODE(0x8000u, 0x801u, METHOD_BUFFERED, FILE_READ_ACCESS)
+// Enables/disables file telemetry (flood class stays silent until asked):
+// input is a FILE_WATCH_POLICY blob. SDDL-gated like every other IOCTL.
+#define IOCTL_SECOUTFALL_SET_FILE_WATCH \
+	CTL_CODE(0x8000u, 0x802u, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+// Test hook (lab only): enqueues Count synthetic records of Class
+// (0 = control, 1 = file) to drive overflow counters and the merged drain
+// without a minifilter storm. SYSTEM/Admins only via the device SDDL.
+#define IOCTL_SECOUTFALL_SELFTEST_FLOOD \
+	CTL_CODE(0x8000u, 0x803u, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
+// Input blob for IOCTL_SECOUTFALL_SET_FILE_WATCH: ExtensionsCount UTF-16
+// names (with the dot, e.g. L".exe"), each NUL-terminated, concatenated after
+// the header (ExtensionsBytes includes the terminators). An empty list means
+// ALL files; Enabled = FALSE turns file telemetry off.
+struct FileWatchPolicy {
+	UCHAR Enabled;
+	UCHAR Reserved[3];
+	ULONG ExtensionsCount;
+	ULONG ExtensionsBytes; // total blob bytes, terminators included
+	// WCHAR extensions[]: name L"ext" L"\0" name L"ext" L"\0" ...
+};
+
+// Input blob for IOCTL_SECOUTFALL_SELFTEST_FLOOD. Class 0 = control queue,
+// 1 = file queue. Synthetic records carry pid 0xDEAD0000+i / path "\\??\\flood".
+struct SelftestFloodRequest {
+	ULONG Class;
+	ULONG Count;
+};
 
 static_assert(sizeof(RecordHeader) == 48, "wire header layout pinned");
 static_assert(offsetof(RecordHeader, Magic) == 0, "wire header layout pinned");
@@ -182,3 +255,13 @@ static_assert(offsetof(RegistrySetValueRecord, ValueNameOffset) == 52, "wire lay
 static_assert(offsetof(RegistrySetValueRecord, ValueNameBytes) == 54, "wire layout pinned");
 static_assert(offsetof(RegistrySetValueRecord, DataType) == 56, "wire layout pinned");
 static_assert(offsetof(RegistrySetValueRecord, DataBytes) == 60, "wire layout pinned");
+static_assert(offsetof(FileRecord, PathOffset) == 48, "wire layout pinned");
+static_assert(offsetof(FileRecord, PathBytes) == 50, "wire layout pinned");
+static_assert(offsetof(FileWrittenRecord, ByteOffset) == 48, "wire layout pinned");
+static_assert(offsetof(FileWrittenRecord, BytesCount) == 56, "wire layout pinned");
+static_assert(offsetof(FileWrittenRecord, PathOffset) == 60, "wire layout pinned");
+static_assert(offsetof(FileWrittenRecord, PathBytes) == 62, "wire layout pinned");
+static_assert(offsetof(FileRenamedRecord, OldPathOffset) == 48, "wire layout pinned");
+static_assert(offsetof(FileRenamedRecord, OldPathBytes) == 50, "wire layout pinned");
+static_assert(offsetof(FileRenamedRecord, NewPathOffset) == 52, "wire layout pinned");
+static_assert(offsetof(FileRenamedRecord, NewPathBytes) == 54, "wire layout pinned");

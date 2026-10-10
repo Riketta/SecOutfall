@@ -68,6 +68,9 @@
       <!-- /integritycheck is mandatory: PsSetCreateProcessNotifyRoutineEx
            fails with STATUS_ACCESS_DENIED without it. -->
       <AdditionalOptions>/integritycheck %(AdditionalOptions)</AdditionalOptions>
+      <!-- fltmgr: the minifilter (D2) lives in the same .sys as the control
+           device. -->
+      <AdditionalDependencies>fltmgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalDependencies>wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>

@@ -17,6 +17,9 @@ The full hardening list and phase plan (D0–D5) live in the repo `AGENTS.md`.
 - `dump/` — console dumper (`dump.exe`): opens `\\.\secoutfall`, drains and
   pretty-prints events.
 - `build.ps1` — builds both projects (x64, Debug or Release) with MSBuild.
+- `install.ps1` — registers the kernel service + the Filter Manager instance
+  (altitude) the minifilter attaches through; `-Start` boots it, `-Remove`
+  undoes everything.
 - `sign.ps1` — creates a self-signed code-signing certificate, exports the
   public `.cer`, test-signs the driver.
 
@@ -59,31 +62,32 @@ cd driver
    certutil -addstore TrustedPublisher secoutfall-test.cer
    ```
 
-## Load, observe, unload
+## Install, observe, unload
 
 ```bat
-sc create secoutfall type= kernel start= demand binPath= C:\path\to\secoutfall.sys
-sc start secoutfall
+:: elevated console (dev box built Release):
+install.ps1 -Start
 
-:: elevated console:
-dump\x64\Release\dump.exe
+:: drain events; --files * turns file telemetry on (lab mode):
+dump\x64\Release\dump.exe --files *
 
-sc stop secoutfall
-sc delete secoutfall
+:: drive the flood self-test (class 0 = control, 1 = file):
+dump\x64\Release\dump.exe --flood 1 5000
+
+install.ps1 -Remove
 ```
 
 Kernel-side traces go through `KdPrint` (visible in DebugView with "Capture
 kernel" enabled, or a kernel debugger).
 
-## D0 limitations (by design, resolved in later phases)
+## D2 limitations (by design, resolved in later phases)
 
-- Wire format is the unversioned WKP layout with `short` sizes — command
-  lines are clamped to 8 KiB; D1 replaces it with the versioned schema
-  mirrored into the `protocol` crate.
-- Registry event names are clamped into fixed buffers (the base's
-  unbounded `memcpy` overflow is fixed); D1's wire rework supersedes this.
-- Queue overflow (256 items) drops oldest silently — D1 adds per-class loss
-  counters and split queues; D2+ moves flood-class events to a shared-memory
-  ring.
+- File events go through a second bounded list queue (overwrite-oldest +
+  counter), not yet the shared-memory ring — the ring lands with its actual
+  flood producers (minifilter storm / injectee transport, D3).
+- Drop capture (hard-link tombstone + stream-copy fallback, extension
+  policy) is D2b — this phase is file TELEMETRY only.
+- Writes of exactly {4096, 8192, 16384} bytes at a non-zero offset are
+  skipped as antivirus-style cache noise (carried heuristic, counted).
 - x64 only; requires Windows 10 2004+ (`ExAllocatePool2`).
 - Image-load events and the minifilter (file telemetry, drop capture) are D1/D2.

@@ -45,6 +45,12 @@ pub const TRUNC_VALUE_NAME: u8 = 0x04;
 pub const TRUNC_DATA: u8 = 0x08;
 /// Per-field truncation flags (header `TruncFlags`).
 pub const TRUNC_IMAGE_NAME: u8 = 0x10;
+/// Per-field truncation flags (header `TruncFlags`).
+pub const TRUNC_FILE_PATH: u8 = 0x20;
+/// Per-field truncation flags (header `TruncFlags`).
+pub const TRUNC_OLD_PATH: u8 = 0x40;
+/// Per-field truncation flags (header `TruncFlags`).
+pub const TRUNC_NEW_PATH: u8 = 0x80;
 
 /// String caps in bytes (whole WCHARs on the wire) — mirrored from the header.
 pub const MAX_COMMAND_LINE_BYTES: usize = 8192;
@@ -54,6 +60,8 @@ pub const MAX_KEY_PATH_BYTES: usize = 1024;
 pub const MAX_VALUE_NAME_BYTES: usize = 512;
 /// String caps in bytes (whole WCHARs on the wire) — mirrored from the header.
 pub const MAX_IMAGE_NAME_BYTES: usize = 1024;
+/// String caps in bytes (whole WCHARs on the wire) — mirrored from the header.
+pub const MAX_FILE_PATH_BYTES: usize = 1024;
 /// Registry value data cap in bytes (the driver copies at most this much).
 pub const MAX_VALUE_DATA_BYTES: usize = 128;
 
@@ -79,6 +87,16 @@ pub enum RecordKind {
     RegistryKeyDeleted,
     /// A registry value under HKLM was written.
     RegistrySetValue,
+    /// A file was created.
+    FileCreated,
+    /// A file was written.
+    FileWritten,
+    /// The last handle to a file was closed.
+    FileCleanedUp,
+    /// A file was marked for deletion.
+    FileDeleted,
+    /// A file was renamed.
+    FileRenamed,
 }
 
 impl RecordKind {
@@ -92,6 +110,11 @@ impl RecordKind {
             6 => Some(Self::RegistryKeyCreated),
             7 => Some(Self::RegistryKeyDeleted),
             8 => Some(Self::RegistrySetValue),
+            9 => Some(Self::FileCreated),
+            10 => Some(Self::FileWritten),
+            11 => Some(Self::FileCleanedUp),
+            12 => Some(Self::FileDeleted),
+            13 => Some(Self::FileRenamed),
             _ => None,
         }
     }
@@ -195,6 +218,38 @@ pub enum Payload {
         data_type: u32,
         /// Value data bytes actually carried (already capped by the driver).
         data: Vec<u8>,
+    },
+    /// A file was created.
+    FileCreated {
+        /// Normalized full path, lossy-decoded (empty = name query failed).
+        path: String,
+    },
+    /// A file was written.
+    FileWritten {
+        /// Start of the write.
+        offset: u64,
+        /// Write length in bytes.
+        bytes: u32,
+        /// Normalized full path, lossy-decoded.
+        path: String,
+    },
+    /// The last handle to a file was closed.
+    FileCleanedUp {
+        /// Normalized full path, lossy-decoded.
+        path: String,
+    },
+    /// A file was marked for deletion.
+    FileDeleted {
+        /// Normalized full path, lossy-decoded.
+        path: String,
+    },
+    /// A file was renamed.
+    FileRenamed {
+        /// Pre-rename path, lossy-decoded (empty = the pre-callback query
+        /// failed — the rename still happened, the old name is unknown).
+        old_path: String,
+        /// Post-rename path, lossy-decoded.
+        new_path: String,
     },
 }
 
@@ -350,13 +405,16 @@ pub fn decode(buf: &[u8]) -> Result<Record, DecodeError> {
 /// constants): the minimum record size each kind requires.
 fn min_size(kind: RecordKind) -> usize {
     match kind {
-        RecordKind::ProcessCreated => 56,
         RecordKind::ProcessExited => 48,
+        RecordKind::ProcessCreated | RecordKind::FileRenamed => 56,
         RecordKind::ThreadCreated
         | RecordKind::ThreadExited
         | RecordKind::RegistryKeyCreated
-        | RecordKind::RegistryKeyDeleted => 52,
-        RecordKind::ImageLoaded | RecordKind::RegistrySetValue => 64,
+        | RecordKind::RegistryKeyDeleted
+        | RecordKind::FileCreated
+        | RecordKind::FileCleanedUp
+        | RecordKind::FileDeleted => 52,
+        RecordKind::ImageLoaded | RecordKind::RegistrySetValue | RecordKind::FileWritten => 64,
     }
 }
 
@@ -425,6 +483,33 @@ fn payload_of(
                 .to_vec();
             Payload::RegistrySetValue { key_path, value_name, data_type, data }
         }
+        RecordKind::FileCreated | RecordKind::FileCleanedUp | RecordKind::FileDeleted => {
+            let path_offset = u16_at(record, 48)? as usize;
+            let path_bytes = u16_at(record, 50)? as usize;
+            let path = string_at(record, path_offset, path_bytes)?;
+            match kind {
+                RecordKind::FileCreated => Payload::FileCreated { path },
+                RecordKind::FileCleanedUp => Payload::FileCleanedUp { path },
+                _ => Payload::FileDeleted { path },
+            }
+        }
+        RecordKind::FileWritten => {
+            let offset = u64_at(record, 48)?;
+            let bytes = u32_at(record, 56)?;
+            let path_offset = u16_at(record, 60)? as usize;
+            let path_bytes = u16_at(record, 62)? as usize;
+            let path = string_at(record, path_offset, path_bytes)?;
+            Payload::FileWritten { offset, bytes, path }
+        }
+        RecordKind::FileRenamed => {
+            let old_offset = u16_at(record, 48)? as usize;
+            let old_bytes = u16_at(record, 50)? as usize;
+            let new_offset = u16_at(record, 52)? as usize;
+            let new_bytes = u16_at(record, 54)? as usize;
+            let old_path = string_at(record, old_offset, old_bytes)?;
+            let new_path = string_at(record, new_offset, new_bytes)?;
+            Payload::FileRenamed { old_path, new_path }
+        }
     };
     Ok(payload)
 }
@@ -489,12 +574,12 @@ mod tests {
     const IDENTITY_BASE: u64 = 0x01C8_0000_0000_0000;
 
     #[test]
-    fn golden_fixture_decodes_to_the_eight_canonical_records() {
+    fn golden_fixture_decodes_to_the_canonical_records() {
         let bytes = std::fs::read(golden_fixture_path())
             .expect("committed fixture must exist — regenerate with wiretest --generate");
         let records = decode_all(&bytes).expect("fixture must decode");
 
-        assert_eq!(records.len(), 8);
+        assert_eq!(records.len(), 13);
         for (index, record) in records.iter().enumerate() {
             assert_eq!(record.sequence(), index as u64 + 1, "per-boot seq is gap-free");
             assert_eq!(record.time(), TIME_BASE + record.sequence());
@@ -563,6 +648,46 @@ mod tests {
         assert_eq!(value_name, "Backdoor");
         assert_eq!(*data_type, REG_SZ);
         assert_eq!(data, b"C:\\Users\\Public\\payload.exe");
+
+        // 9: file created.
+        assert_eq!(records[8].kind(), RecordKind::FileCreated);
+        assert_eq!(records[8].trunc_flags(), TRUNC_NONE);
+        let Payload::FileCreated { path } = records[8].payload() else {
+            panic!("payload kind mismatch")
+        };
+        assert_eq!(path, "\\Device\\HarddiskVolume2\\Users\\user\\AppData\\payload.dll");
+
+        // 10: file written with offset + length.
+        assert_eq!(records[9].kind(), RecordKind::FileWritten);
+        let Payload::FileWritten { offset, bytes, path } = records[9].payload() else {
+            panic!("payload kind mismatch")
+        };
+        assert_eq!(*offset, 512);
+        assert_eq!(*bytes, 240);
+        assert_eq!(path, "\\Device\\HarddiskVolume2\\Users\\user\\Documents\\notes.txt");
+
+        // 11: file cleaned up.
+        assert_eq!(records[10].kind(), RecordKind::FileCleanedUp);
+        let Payload::FileCleanedUp { path } = records[10].payload() else {
+            panic!("payload kind mismatch")
+        };
+        assert_eq!(path, "\\Device\\HarddiskVolume2\\Users\\user\\AppData\\payload.dll");
+
+        // 12: file deleted.
+        assert_eq!(records[11].kind(), RecordKind::FileDeleted);
+        let Payload::FileDeleted { path } = records[11].payload() else {
+            panic!("payload kind mismatch")
+        };
+        assert_eq!(path, "\\Device\\HarddiskVolume2\\Users\\user\\AppData\\log.tmp");
+
+        // 13: file renamed, both paths.
+        assert_eq!(records[12].kind(), RecordKind::FileRenamed);
+        assert_eq!(records[12].trunc_flags(), TRUNC_NONE);
+        let Payload::FileRenamed { old_path, new_path } = records[12].payload() else {
+            panic!("payload kind mismatch")
+        };
+        assert_eq!(old_path, "\\Device\\HarddiskVolume2\\Users\\user\\Documents\\draft.txt");
+        assert_eq!(new_path, "\\Device\\HarddiskVolume2\\Users\\user\\Documents\\final.txt");
     }
 
     #[test]

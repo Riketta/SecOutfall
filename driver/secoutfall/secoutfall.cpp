@@ -26,6 +26,24 @@ void OnThreadNotify(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _In_ BOOLEAN Cr
 void OnImageLoadNotify(_In_ PUNICODE_STRING FullImageName, _In_ HANDLE ProcessId, _In_ PIMAGE_INFO ImageInfo);
 NTSTATUS OnRegistryNotify(_In_ PVOID CallbackContext, _In_opt_ PVOID Argument1, _In_opt_ PVOID Argument2);
 
+// Minifilter (D2, same .sys as the control device): file telemetry through
+// the flood-class queue, single drain path with the control queue.
+FLT_PREOP_CALLBACK_STATUS FLTAPI SecOutfallPreSetInfo(_Inout_ PFLT_CALLBACK_DATA Data,
+	_In_ PCFLT_RELATED_OBJECTS FltObjects, _Outptr_ PVOID* NewCompletionContext);
+FLT_POSTOP_CALLBACK_STATUS FLTAPI SecOutfallPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+	_In_ PCFLT_RELATED_OBJECTS FltObjects, _In_opt_ PVOID CompletionContext, _In_ FLT_POST_OPERATION_FLAGS Flags);
+FLT_POSTOP_CALLBACK_STATUS FLTAPI SecOutfallPostWrite(_Inout_ PFLT_CALLBACK_DATA Data,
+	_In_ PCFLT_RELATED_OBJECTS FltObjects, _In_opt_ PVOID CompletionContext, _In_ FLT_POST_OPERATION_FLAGS Flags);
+FLT_POSTOP_CALLBACK_STATUS FLTAPI SecOutfallPostCleanup(_Inout_ PFLT_CALLBACK_DATA Data,
+	_In_ PCFLT_RELATED_OBJECTS FltObjects, _In_opt_ PVOID CompletionContext, _In_ FLT_POST_OPERATION_FLAGS Flags);
+FLT_POSTOP_CALLBACK_STATUS FLTAPI SecOutfallPostSetInfo(_Inout_ PFLT_CALLBACK_DATA Data,
+	_In_ PCFLT_RELATED_OBJECTS FltObjects, _In_opt_ PVOID CompletionContext, _In_ FLT_POST_OPERATION_FLAGS Flags);
+
+// Lab altitude: FSFilter activity-monitor range. A real altitude assignment
+// matters only when leaving the lab (KERNEL.md open items).
+#define SECOUTFALL_FILTER_ALTITUDE L"389910.02"
+#define SECOUTFALL_INSTANCE_NAME L"SecOutfall Instance"
+
 Globals g_Data;
 
 // Device setup class GUID for the secure device creation (unique per driver).
@@ -34,6 +52,34 @@ const GUID GUID_DEVICECLASS_SECOUTFALL = {
 };
 
 namespace {
+
+// Minifilter registration: post-op telemetry only, observe-only. Rename old
+// paths need a PRE hook (post-rename name queries return the NEW name).
+const FLT_OPERATION_REGISTRATION FileCallbacks[] = {
+	{ IRP_MJ_CREATE, 0, nullptr, SecOutfallPostCreate },
+	{ IRP_MJ_WRITE, FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO, nullptr, SecOutfallPostWrite },
+	{ IRP_MJ_CLEANUP, 0, nullptr, SecOutfallPostCleanup },
+	{ IRP_MJ_SET_INFORMATION, 0, SecOutfallPreSetInfo, SecOutfallPostSetInfo },
+	{ IRP_MJ_OPERATION_END }
+};
+
+const FLT_REGISTRATION FilterRegistration = {
+	sizeof(FLT_REGISTRATION),   // Size
+	FLT_REGISTRATION_VERSION,   // Version
+	0,                          // Flags
+	nullptr,                    // Context
+	FileCallbacks,
+	nullptr,                    // FilterUnload: DriverUnload calls FltUnregisterFilter
+	nullptr,                    // InstanceSetup (attachment via registry instance key)
+	nullptr,                    // InstanceQueryTeardown
+	nullptr,                    // InstanceTeardownStart
+	nullptr,                    // InstanceTeardownComplete
+	nullptr,                    // GenerateFileName
+	nullptr,                    // GenerateDestinationFileName
+	nullptr,                    // NormalizeNameComponent
+	nullptr,                    // NormalizeNameComponentEx
+	nullptr,                    // SectionNotification
+};
 
 // Copies up to `capBytes` (whole WCHARs) from a counted string. Returns the
 // bytes copied; `truncated` reports that the source did not fit — surfaced
@@ -80,8 +126,83 @@ RecordHeader* AllocRecord(_In_ ULONG totalSize, _In_ RecordType type, _In_ ULONG
 	return header;
 }
 
-void PushRecord(_Inout_ ItemFull<RecordHeader>* item) {
-	g_Data.Items->Push(item);
+void PushRecord(_Inout_ ItemFull<RecordHeader>* item, _In_ bool fileClass = false) {
+	(fileClass ? g_Data.Files : g_Data.Items)->Push(item);
+}
+
+// Normalized full path for a file-system callback, or nullptr on failure
+// (counted — a skipped record is honest loss, not silence). Above APC_LEVEL
+// only the name cache may be queried; post-write from DPC land degrades to
+// cache-only and skips on a miss.
+PFLT_FILE_NAME_INFORMATION QueryFileName(_In_ PFLT_CALLBACK_DATA data) {
+	auto queryFlags = KeGetCurrentIrql() > APC_LEVEL
+		? FLT_FILE_NAME_QUERY_CACHE_ONLY
+		: FLT_FILE_NAME_QUERY_DEFAULT;
+	PFLT_FILE_NAME_INFORMATION name = nullptr;
+	if (!NT_SUCCESS(::FltGetFileNameInformation(data, FLT_FILE_NAME_NORMALIZED | queryFlags, &name))) {
+		InterlockedIncrement64(&g_Data.FileNameQueriesFailed);
+		return nullptr;
+	}
+	return name;
+}
+
+// Emits a one-path file record (created / cleaned_up / deleted).
+void EmitFileRecord(_In_ RecordType type, _In_ PCUNICODE_STRING path, _In_ ULONG pid) {
+	bool truncated = false;
+	WCHAR scratch[MaxFilePathBytes / sizeof(WCHAR)];
+	auto pathBytes = CopyNameW(scratch, path, MaxFilePathBytes, truncated);
+
+	auto header = AllocRecord(FileFixed + pathBytes, type, pid, g_Data.Identities->Lookup(pid));
+	if (header == nullptr)
+		return;
+	if (truncated)
+		header->TruncFlags |= TRUNC_FILE_PATH;
+
+	auto record = reinterpret_cast<FileRecord*>(header);
+	record->PathOffset = FileFixed;
+	record->PathBytes = pathBytes;
+	::memcpy(reinterpret_cast<UCHAR*>(header) + record->PathOffset, scratch, pathBytes);
+
+	PushRecord(CONTAINING_RECORD(header, ItemFull<RecordHeader>, Item), true);
+}
+
+// Old path is captured by the PRE callback (post-rename queries return the
+// NEW name); a missing context means the rename goes unrecorded — the failed
+// query was already counted there.
+struct RenameContext {
+	UNICODE_STRING OldPath; // Buffer follows the struct, nonpaged
+};
+
+void EmitFileRenamed(_In_opt_ const RenameContext* context, _In_ PCUNICODE_STRING newPath, _In_ ULONG pid) {
+	bool oldTruncated = false, newTruncated = false;
+	WCHAR oldScratch[MaxFilePathBytes / sizeof(WCHAR)];
+	WCHAR newScratch[MaxFilePathBytes / sizeof(WCHAR)];
+	// USHORT(0), not bare 0: a bare int would promote the ternary (and
+	// oldBytes) to int, reintroducing a narrowing warning at every use.
+	auto oldBytes = context ? CopyNameW(oldScratch, &context->OldPath, MaxFilePathBytes, oldTruncated)
+	                        : static_cast<USHORT>(0);
+	auto newBytes = CopyNameW(newScratch, newPath, MaxFilePathBytes, newTruncated);
+
+	auto header = AllocRecord(FileRenamedFixed + oldBytes + newBytes, FileRenamed, pid,
+		g_Data.Identities->Lookup(pid));
+	if (header == nullptr)
+		return;
+	if (oldTruncated)
+		header->TruncFlags |= TRUNC_OLD_PATH;
+	if (newTruncated)
+		header->TruncFlags |= TRUNC_NEW_PATH;
+
+	auto record = reinterpret_cast<FileRenamedRecord*>(header);
+	record->OldPathOffset = FileRenamedFixed;
+	record->OldPathBytes = oldBytes;
+	record->NewPathOffset = static_cast<USHORT>(record->OldPathOffset + oldBytes);
+	record->NewPathBytes = newBytes;
+	auto body = reinterpret_cast<UCHAR*>(header);
+	if (oldBytes > 0)
+		::memcpy(body + record->OldPathOffset, oldScratch, oldBytes);
+	::memcpy(body + record->NewPathOffset, newScratch, newBytes);
+
+	PushRecord(CONTAINING_RECORD(header, ItemFull<RecordHeader>, Item), true);
 }
 
 // \REGISTRY\MACHINE prefix match that rejects longer accidental prefixes
@@ -174,6 +295,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 	auto status = STATUS_SUCCESS;
 	PDEVICE_OBJECT DeviceObject = nullptr;
 	bool processCallbacks = false, threadCallbacks = false, imageCallbacks = false, registryCallbacks = false;
+	bool filterRegistered = false;
 
 	// The malware is a user of this device: SYSTEM + Administrators only.
 	UNICODE_STRING sddl = RTL_CONSTANT_STRING(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
@@ -196,7 +318,12 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 
 		g_Data.Identities = new (PagedPool) IdentityTable;
 		g_Data.Identities->Init();
+		g_Data.Watch = new (PagedPool) FileWatch;
+		g_Data.Watch->Init();
 		g_Data.Items = new (PagedPool) Queue<FastMutex>(256, &g_Data.QueueOverwritten);
+		// Flood class gets its own bounded list: a write storm must not evict
+		// process evidence. Same drain, per-class overflow counters.
+		g_Data.Files = new (PagedPool) Queue<FastMutex>(4096, &g_Data.FilesOverwritten);
 
 		//
 		// setup process, thread and image callbacks
@@ -234,12 +361,32 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 		}
 		registryCallbacks = true;
 
+		//
+		// register the minifilter (D2): file telemetry, same .sys, one drain
+		//
+		status = ::FltRegisterFilter(DriverObject, &FilterRegistration, &g_Data.Filter);
+		if (!NT_SUCCESS(status)) {
+			KdPrint((DRIVER_PREFIX "failed to register minifilter (status=%08X)\n", status));
+			break;
+		}
+		filterRegistered = true;
+
+		// Starts attachment to the instances configured at install time
+		// (Services\secoutfall\Instances — see driver/install.ps1).
+		status = ::FltStartFiltering(g_Data.Filter);
+		if (!NT_SUCCESS(status)) {
+			KdPrint((DRIVER_PREFIX "failed to start filtering (status=%08X)\n", status));
+			break;
+		}
+
 		DriverObject->DriverUnload = SecOutfallUnload;
 		DriverObject->MajorFunction[IRP_MJ_CREATE] = DriverObject->MajorFunction[IRP_MJ_CLOSE] = SecOutfallCreateClose;
 		DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = SecOutfallDeviceControl;
 	} while (false);
 
 	if (!NT_SUCCESS(status)) {
+		if (filterRegistered)
+			::FltUnregisterFilter(g_Data.Filter);
 		if (registryCallbacks)
 			::CmUnRegisterCallback(g_Data.RegistryCookie);
 		if (imageCallbacks)
@@ -262,6 +409,15 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 			delete g_Data.Identities;
 			g_Data.Identities = nullptr;
 		}
+		if (g_Data.Watch) {
+			delete g_Data.Watch;
+			g_Data.Watch = nullptr;
+		}
+		if (g_Data.Files) {
+			g_Data.Files->FreeAll<ItemFull<RecordHeader>>();
+			delete g_Data.Files;
+			g_Data.Files = nullptr;
+		}
 		UNICODE_STRING symName = RTL_CONSTANT_STRING(L"\\??\\" SECOUTFALL_NAME);
 		::IoDeleteSymbolicLink(&symName);
 
@@ -283,20 +439,23 @@ NTSTATUS CompleteRequest(PIRP Irp, NTSTATUS status = STATUS_SUCCESS, ULONG_PTR I
 }
 
 void SecOutfallUnload(PDRIVER_OBJECT DriverObject) {
-	// Removals quiesce in-flight callbacks before returning, so the queue and
-	// the identity table are producer-free below.
+	// Removals quiesce in-flight callbacks before returning; FltUnregisterFilter
+	// likewise waits for file-system activity to drain before we free queues.
 	::CmUnRegisterCallback(g_Data.RegistryCookie);
 	::PsRemoveLoadImageNotifyRoutine(OnImageLoadNotify);
 	::PsRemoveCreateThreadNotifyRoutine(OnThreadNotify);
 	::PsSetCreateProcessNotifyRoutineEx(OnProcessNotify, TRUE);
+	if (g_Data.Filter)
+		::FltUnregisterFilter(g_Data.Filter);
 
 	g_Data.Items->FreeAll<ItemFull<RecordHeader>>();
 	delete g_Data.Items;
-	if (g_Data.Identities) {
-		g_Data.Identities->Clear();
-		delete g_Data.Identities;
-		g_Data.Identities = nullptr;
-	}
+	g_Data.Files->FreeAll<ItemFull<RecordHeader>>();
+	delete g_Data.Files;
+	if (g_Data.Watch)
+		delete g_Data.Watch;
+	g_Data.Identities->Clear();
+	delete g_Data.Identities;
 
 	UNICODE_STRING symName = RTL_CONSTANT_STRING(L"\\??\\" SECOUTFALL_NAME);
 	::IoDeleteSymbolicLink(&symName);
@@ -330,33 +489,42 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
 				break;
 			}
 			auto count = 0UL;
-			while (true) {
-				// Check-and-pop under one lock: peeking and popping separately
-				// let two concurrent drains validate one item and pop another
-				// (size from X, bytes from Y — a pool over-read and a corrupt
-				// record stream). A head that fits goes out; one that does not
-				// fit the REMAINING space stops this batch; one that cannot fit
-				// ANY buffer this client ever sends is skipped and counted — a
-				// wedged queue is a worse fate than a lost oversized record.
-				auto item = g_Data.Items->PopIfFits<ItemFull<RecordHeader>>(size - count);
+			// Merged drain over both rate-class queues, ordered by the global
+			// sequence: pop the globally-older head that fits; a head that can
+			// never fit this client is skipped + counted; heads that would fit
+			// a bigger batch stop this one.
+			auto tryPop = [&](Queue<FastMutex>* queue) -> int {
+				auto item = queue->PopIfFits<ItemFull<RecordHeader>>(size - count);
 				if (item != nullptr) {
 					auto recordSize = item->Item.Size;
 					::memcpy(buffer + count, &item->Item, recordSize);
 					count += recordSize;
 					ExFreePool(item);
-					continue;
+					return 1;
 				}
-
-				auto headSize = g_Data.Items->HeadSize<ItemFull<RecordHeader>>();
+				auto headSize = queue->HeadSize<ItemFull<RecordHeader>>();
 				if (headSize == 0)
-					break; // drained empty
+					return -1; // empty
 				if (headSize > size) {
-					item = g_Data.Items->Pop<ItemFull<RecordHeader>>();
+					item = queue->Pop<ItemFull<RecordHeader>>();
 					ExFreePool(item);
 					InterlockedIncrement64(&g_Data.OversizedSkipped);
-					continue;
+					return 1;
 				}
-				break; // head needs a bigger buffer; leave it queued
+				return 0; // needs a bigger batch
+			};
+			while (true) {
+				auto seqControl = g_Data.Items->HeadSeq<ItemFull<RecordHeader>>();
+				auto seqFiles = g_Data.Files->HeadSeq<ItemFull<RecordHeader>>();
+				if (seqControl == MAXULONGLONG && seqFiles == MAXULONGLONG)
+					break;
+				auto first = (seqFiles < seqControl) ? g_Data.Files : g_Data.Items;
+				auto second = (first == g_Data.Files) ? g_Data.Items : g_Data.Files;
+				if (tryPop(first) == 1)
+					continue;
+				if (tryPop(second) == 1)
+					continue;
+				break; // both heads need a bigger buffer
 			}
 			len = count;
 			break;
@@ -377,12 +545,128 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
 			stats->Reserved = 0;
 			stats->QueueDepth = static_cast<ULONG>(g_Data.Items->GetCount());
 			stats->QueueCapacity = static_cast<ULONG>(g_Data.Items->GetCapacity());
+			stats->FileQueueDepth = static_cast<ULONG>(g_Data.Files->GetCount());
+			stats->FileQueueCapacity = static_cast<ULONG>(g_Data.Files->GetCapacity());
 			stats->Sequence = g_Data.NextSequence;
 			stats->QueueOverwritten = g_Data.QueueOverwritten;
 			stats->AllocFailures = g_Data.AllocFailures;
 			stats->OversizedSkipped = g_Data.OversizedSkipped;
 			stats->IdentityMisses = g_Data.IdentityMisses;
+			stats->FilesOverwritten = g_Data.FilesOverwritten;
+			stats->FileNameQueriesFailed = g_Data.FileNameQueriesFailed;
+			stats->NoiseWritesSkipped = g_Data.NoiseWritesSkipped;
 			len = sizeof(DriverStats);
+			break;
+		}
+
+		case IOCTL_SECOUTFALL_SET_FILE_WATCH:
+		{
+			auto inputLength = stack->Parameters.DeviceIoControl.InputBufferLength;
+			auto input = (FileWatchPolicy*)Irp->AssociatedIrp.SystemBuffer;
+			if (input == nullptr || inputLength < sizeof(FileWatchPolicy)
+				|| (input->Enabled > 1)) {
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			auto blobBytes = input->ExtensionsBytes;
+			if (blobBytes > FileWatch::MaxBlobBytes || blobBytes % 2 != 0
+				|| input->ExtensionsCount > FileWatch::MaxExtensions
+				|| inputLength < sizeof(FileWatchPolicy) + blobBytes) {
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			if (!input->Enabled || input->ExtensionsCount == 0) {
+				// Off, or on-for-everything: both are single-switch policies.
+				g_Data.Watch->Apply(input->Enabled != 0, nullptr, 0, nullptr, 0);
+				break;
+			}
+
+			// Build the replacement off to the side; Apply swaps atomically and
+			// keeps the old policy alive on any failure.
+			auto blob = (PWCHAR)::ExAllocatePool2(POOL_FLAG_NON_PAGED, blobBytes, DRIVER_TAG);
+			auto exts = (PUNICODE_STRING*)::ExAllocatePool2(POOL_FLAG_NON_PAGED,
+				sizeof(PUNICODE_STRING) * input->ExtensionsCount, DRIVER_TAG);
+			if (blob == nullptr || exts == nullptr) {
+				if (blob) ExFreePool(blob);
+				if (exts) ExFreePool(exts);
+				status = STATUS_INSUFFICIENT_RESOURCES;
+				break;
+			}
+			::memcpy(blob, reinterpret_cast<UCHAR*>(input) + sizeof(FileWatchPolicy), blobBytes);
+
+			ULONG count = 0;
+			auto cursor = blob;
+			auto end = blob + blobBytes / sizeof(WCHAR);
+			auto parseOk = true;
+			while (cursor < end && count < input->ExtensionsCount) {
+				ULONG nameLen = 0;
+				while (cursor + nameLen < end && cursor[nameLen] != L'\0')
+					++nameLen;
+				if (nameLen == 0 || cursor + nameLen >= end) {
+					parseOk = false; // empty name or unterminated tail
+					break;
+				}
+				auto entry = (PUNICODE_STRING)::ExAllocatePool2(POOL_FLAG_NON_PAGED,
+					sizeof(UNICODE_STRING), DRIVER_TAG);
+				if (entry == nullptr) {
+					parseOk = false;
+					break;
+				}
+				entry->Buffer = cursor;
+				entry->Length = static_cast<USHORT>(nameLen * sizeof(WCHAR));
+				entry->MaximumLength = entry->Length;
+				exts[count] = entry;
+				++count;
+				cursor += nameLen + 1; // skip the terminator
+			}
+			if (!parseOk || count != input->ExtensionsCount) {
+				for (ULONG i = 0; i < count; ++i)
+					ExFreePool(exts[i]);
+				ExFreePool(exts);
+				ExFreePool(blob);
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			g_Data.Watch->Apply(true, exts, count, blob, blobBytes);
+			break;
+		}
+
+		case IOCTL_SECOUTFALL_SELFTEST_FLOOD:
+		{
+			auto inputLength = stack->Parameters.DeviceIoControl.InputBufferLength;
+			auto input = (SelftestFloodRequest*)Irp->AssociatedIrp.SystemBuffer;
+			if (input == nullptr || inputLength != sizeof(SelftestFloodRequest)
+				|| input->Class > 1 || input->Count == 0 || input->Count > 100000) {
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			auto fileClass = input->Class == 1;
+			for (ULONG i = 0; i < input->Count; ++i) {
+				ULONG pid = 0xDEAD0000u + i;
+				if (!fileClass) {
+					auto header = AllocRecord(ProcessExitedFixed, ProcessExited, pid, 0);
+					if (header == nullptr)
+						break; // alloc failures are counted in AllocRecord
+					PushRecord(CONTAINING_RECORD(header, ItemFull<RecordHeader>, Item));
+				} else {
+					PCUNICODE_STRING floodPath;
+					UNICODE_STRING floodName = RTL_CONSTANT_STRING(L"\\??\\flood");
+					floodPath = &floodName;
+					bool truncated = false;
+					WCHAR scratch[MaxFilePathBytes / sizeof(WCHAR)];
+					auto pathBytes = CopyNameW(scratch, floodPath, MaxFilePathBytes, truncated);
+					auto header = AllocRecord(FileWrittenFixed + pathBytes, FileWritten, pid, 0);
+					if (header == nullptr)
+						break;
+					auto record = reinterpret_cast<FileWrittenRecord*>(header);
+					record->ByteOffset = i;
+					record->BytesCount = 1;
+					record->PathOffset = FileWrittenFixed;
+					record->PathBytes = pathBytes;
+					::memcpy(reinterpret_cast<UCHAR*>(header) + record->PathOffset, scratch, pathBytes);
+					PushRecord(CONTAINING_RECORD(header, ItemFull<RecordHeader>, Item), true);
+				}
+			}
 			break;
 		}
 
@@ -544,4 +828,197 @@ NTSTATUS OnRegistryNotify(_In_ PVOID CallbackContext, _In_opt_ PVOID Argument1, 
 	}
 
 	return STATUS_SUCCESS;
+}
+
+//
+// Minifilter callbacks (D2): post-op telemetry only, observe-only. File
+// telemetry is OFF until SET_FILE_WATCH enables it; every record still pays
+// identity lookup, caps and truncation flags like the control class.
+//
+
+FLT_PREOP_CALLBACK_STATUS FLTAPI SecOutfallPreSetInfo(_Inout_ PFLT_CALLBACK_DATA Data,
+	_In_ PCFLT_RELATED_OBJECTS FltObjects, _Outptr_ PVOID* NewCompletionContext) {
+	UNREFERENCED_PARAMETER(FltObjects);
+	*NewCompletionContext = nullptr;
+
+	auto cls = Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
+	if (cls != FileRenameInformation && cls != FileRenameInformationEx)
+		return FLT_PREOP_SUCCESS_NO_CALLBACK;
+	if (!g_Data.Watch->Enabled() || KeGetCurrentIrql() > APC_LEVEL)
+		return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+	// The pre-rename name only exists NOW: post-rename queries return the
+	// new name. Capture it into a nonpaged context for the post callback.
+	PFLT_FILE_NAME_INFORMATION name = nullptr;
+	if (!NT_SUCCESS(::FltGetFileNameInformation(Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &name))) {
+		InterlockedIncrement64(&g_Data.FileNameQueriesFailed);
+		return FLT_PREOP_SUCCESS_NO_CALLBACK;
+	}
+
+	auto bytes = static_cast<USHORT>(min(name->Name.Length, MaxFilePathBytes));
+	bytes &= static_cast<USHORT>(~1);
+	auto context = (RenameContext*)::ExAllocatePool2(POOL_FLAG_NON_PAGED,
+		sizeof(RenameContext) + bytes, DRIVER_TAG);
+	if (context == nullptr) {
+		InterlockedIncrement64(&g_Data.AllocFailures);
+		::FltReleaseFileNameInformation(name);
+		return FLT_PREOP_SUCCESS_NO_CALLBACK;
+	}
+	context->OldPath.Buffer = reinterpret_cast<PWCHAR>(context + 1);
+	context->OldPath.Length = bytes;
+	context->OldPath.MaximumLength = bytes;
+	::memcpy(context->OldPath.Buffer, name->Name.Buffer, bytes);
+	::FltReleaseFileNameInformation(name);
+
+	*NewCompletionContext = context;
+	return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+}
+
+FLT_POSTOP_CALLBACK_STATUS FLTAPI SecOutfallPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+	_In_ PCFLT_RELATED_OBJECTS FltObjects, _In_opt_ PVOID CompletionContext,
+	_In_ FLT_POST_OPERATION_FLAGS Flags) {
+	UNREFERENCED_PARAMETER(FltObjects);
+	UNREFERENCED_PARAMETER(CompletionContext);
+	UNREFERENCED_PARAMETER(Flags);
+
+	if (FLT_IS_FASTIO_OPERATION(Data) || FLT_IS_FS_FILTER_OPERATION(Data))
+		return FLT_POSTOP_FINISHED_PROCESSING;
+	if (!g_Data.Watch->Enabled() || !NT_SUCCESS(Data->IoStatus.Status))
+		return FLT_POSTOP_FINISHED_PROCESSING;
+	// IoStatus.Information after create: FILE_SUPERSEDED / FILE_CREATED /
+	// FILE_OPENED / FILE_OVERWRITTEN / FILE_OVERWRITTEN_OR_CREATED — only
+	// the first two mean a NEW file came into existence.
+	if (Data->IoStatus.Information != FILE_SUPERSEDED && Data->IoStatus.Information != FILE_CREATED)
+		return FLT_POSTOP_FINISHED_PROCESSING;
+
+	auto name = QueryFileName(Data);
+	if (name == nullptr)
+		return FLT_POSTOP_FINISHED_PROCESSING;
+	if (g_Data.Watch->Matches(&name->Name))
+		EmitFileRecord(FileCreated, &name->Name, HandleToULong(PsGetCurrentProcessId()));
+	::FltReleaseFileNameInformation(name);
+	return FLT_POSTOP_FINISHED_PROCESSING;
+}
+
+FLT_POSTOP_CALLBACK_STATUS FLTAPI SecOutfallPostWrite(_Inout_ PFLT_CALLBACK_DATA Data,
+	_In_ PCFLT_RELATED_OBJECTS FltObjects, _In_opt_ PVOID CompletionContext,
+	_In_ FLT_POST_OPERATION_FLAGS Flags) {
+	UNREFERENCED_PARAMETER(FltObjects);
+	UNREFERENCED_PARAMETER(CompletionContext);
+	UNREFERENCED_PARAMETER(Flags);
+
+	// Paging-IO writes (cache flushes, not thread writes) never reach this
+	// callback: skipped at registration via FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO.
+	if (!g_Data.Watch->Enabled())
+		return FLT_POSTOP_FINISHED_PROCESSING;
+
+	auto length = Data->Iopb->Parameters.Write.Length;
+	auto offset = Data->Iopb->Parameters.Write.ByteOffset.QuadPart;
+	if (length == 0)
+		return FLT_POSTOP_FINISHED_PROCESSING;
+	// Write-noise heuristic (carried from the reference implementation):
+	// whole-cache-page writes at a non-zero offset are antivirus-style cache
+	// touches, not drops.
+	if ((length == 4096 || length == 8192 || length == 16384) && offset > 0) {
+		InterlockedIncrement64(&g_Data.NoiseWritesSkipped);
+		return FLT_POSTOP_FINISHED_PROCESSING;
+	}
+
+	auto name = QueryFileName(Data);
+	if (name == nullptr)
+		return FLT_POSTOP_FINISHED_PROCESSING;
+	if (!g_Data.Watch->Matches(&name->Name)) {
+		::FltReleaseFileNameInformation(name);
+		return FLT_POSTOP_FINISHED_PROCESSING;
+	}
+
+	bool truncated = false;
+	WCHAR scratch[MaxFilePathBytes / sizeof(WCHAR)];
+	auto pathBytes = CopyNameW(scratch, &name->Name, MaxFilePathBytes, truncated);
+	::FltReleaseFileNameInformation(name);
+
+	auto pid = HandleToULong(PsGetCurrentProcessId());
+	auto header = AllocRecord(FileWrittenFixed + pathBytes, FileWritten, pid,
+		g_Data.Identities->Lookup(pid));
+	if (header == nullptr)
+		return FLT_POSTOP_FINISHED_PROCESSING;
+	if (truncated)
+		header->TruncFlags |= TRUNC_FILE_PATH;
+	auto record = reinterpret_cast<FileWrittenRecord*>(header);
+	record->ByteOffset = static_cast<ULONG64>(offset);
+	record->BytesCount = length;
+	record->PathOffset = FileWrittenFixed;
+	record->PathBytes = pathBytes;
+	::memcpy(reinterpret_cast<UCHAR*>(header) + record->PathOffset, scratch, pathBytes);
+	PushRecord(CONTAINING_RECORD(header, ItemFull<RecordHeader>, Item), true);
+	return FLT_POSTOP_FINISHED_PROCESSING;
+}
+
+FLT_POSTOP_CALLBACK_STATUS FLTAPI SecOutfallPostCleanup(_Inout_ PFLT_CALLBACK_DATA Data,
+	_In_ PCFLT_RELATED_OBJECTS FltObjects, _In_opt_ PVOID CompletionContext,
+	_In_ FLT_POST_OPERATION_FLAGS Flags) {
+	UNREFERENCED_PARAMETER(FltObjects);
+	UNREFERENCED_PARAMETER(CompletionContext);
+	UNREFERENCED_PARAMETER(Flags);
+
+	if (FLT_IS_FASTIO_OPERATION(Data) || FLT_IS_FS_FILTER_OPERATION(Data))
+		return FLT_POSTOP_FINISHED_PROCESSING;
+	if (!g_Data.Watch->Enabled())
+		return FLT_POSTOP_FINISHED_PROCESSING;
+
+	auto name = QueryFileName(Data);
+	if (name == nullptr)
+		return FLT_POSTOP_FINISHED_PROCESSING;
+	if (g_Data.Watch->Matches(&name->Name))
+		EmitFileRecord(FileCleanedUp, &name->Name, HandleToULong(PsGetCurrentProcessId()));
+	::FltReleaseFileNameInformation(name);
+	return FLT_POSTOP_FINISHED_PROCESSING;
+}
+
+FLT_POSTOP_CALLBACK_STATUS FLTAPI SecOutfallPostSetInfo(_Inout_ PFLT_CALLBACK_DATA Data,
+	_In_ PCFLT_RELATED_OBJECTS FltObjects, _In_opt_ PVOID CompletionContext,
+	_In_ FLT_POST_OPERATION_FLAGS Flags) {
+	UNREFERENCED_PARAMETER(FltObjects);
+	UNREFERENCED_PARAMETER(Flags);
+
+	auto context = static_cast<RenameContext*>(CompletionContext);
+	auto cls = Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
+	auto isDelete = cls == FileDispositionInformation || cls == FileDispositionInformationEx;
+	auto isRename = cls == FileRenameInformation || cls == FileRenameInformationEx;
+	if (!isDelete && !isRename)
+		return FLT_POSTOP_FINISHED_PROCESSING;
+	if (!NT_SUCCESS(Data->IoStatus.Status)) {
+		if (context)
+			ExFreePool(context);
+		return FLT_POSTOP_FINISHED_PROCESSING;
+	}
+	if (!g_Data.Watch->Enabled()) {
+		if (context)
+			ExFreePool(context);
+		return FLT_POSTOP_FINISHED_PROCESSING;
+	}
+
+	auto name = QueryFileName(Data);
+	if (name == nullptr) {
+		if (context)
+			ExFreePool(context);
+		return FLT_POSTOP_FINISHED_PROCESSING;
+	}
+
+	auto pid = HandleToULong(PsGetCurrentProcessId());
+	if (isDelete) {
+		if (g_Data.Watch->Matches(&name->Name))
+			EmitFileRecord(FileDeleted, &name->Name, pid);
+	} else {
+		// No context = the old path never made it out of the pre callback
+		// (query failed there and was counted); skip rather than emit a
+		// rename with a fabricated origin.
+		if (context != nullptr && g_Data.Watch->Matches(&name->Name))
+			EmitFileRenamed(context, &name->Name, pid);
+	}
+
+	::FltReleaseFileNameInformation(name);
+	if (context)
+		ExFreePool(context);
+	return FLT_POSTOP_FINISHED_PROCESSING;
 }

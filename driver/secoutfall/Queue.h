@@ -66,6 +66,17 @@ public:
 		return _maxItems;
 	}
 
+	// Sequence of the head item, or MAX for empty. The merged drain picks the
+	// globally smaller sequence across both rate-class queues.
+	template<typename T>
+	ULONG64 HeadSeq() const {
+		AutoLock<TLock> locker(_lock);
+		if (_size == 0)
+			return MAXULONGLONG;
+		auto item = CONTAINING_RECORD(_head.Flink, T, Entry);
+		return item->Item.Sequence;
+	}
+
 	// Serialized size of the head item, or 0 when empty. The drain uses this
 	// to distinguish "head too big for the remaining buffer" (stop, leave it
 	// for a bigger batch) from "head bigger than any buffer" (skip + count).
