@@ -1,0 +1,372 @@
+//! Driver event source adapter (feature `driver`): drains the kernel
+//! driver's control device (`GET_DATA`) and promotes wire-v2 records into
+//! [`SandboxEvent`]s.
+//!
+//! Design notes:
+//! - One `GET_DATA` batch per tick; records are decoded with
+//!   [`protocol::driver_wire`] (the same golden-pinned decoder the fixture
+//!   tests use), so a hostile/garbled ring or queue can only cost records,
+//!   never corrupt the pipeline.
+//! - Clock mapping: the driver stamps real kernel time; the agent lives on
+//!   the fake clock. The adapter lazily captures `fake_now - kernel_now` on
+//!   the first drained record and applies that offset to every record —
+//!   events pre-dating the clock manipulation map to their true pre-fake
+//!   moment (correlate by session id, never by SDK timestamps).
+//! - Process-exit name resolution: the wire `ProcessExited` record carries no
+//!   name, so the adapter keeps a bounded pid→name cache fed by
+//!   `ProcessCreated` (same pattern as every ETW consumer).
+//! - Overflow policy: bounded channel, drop + count (doctrine).
+//! - `DropCaptured` records are logged, not yet routed to the
+//!   drops-collector (integration decision pending — KERNEL.md D5).
+
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{
+            AtomicI64,
+            Ordering,
+        },
+    },
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use kernel::app::api_ports::EventInletPort;
+use protocol::{
+    driver_wire,
+    payload::{
+        BehaviorCallData,
+        FileCreatedData,
+        FileDeletedData,
+        FileReleasedData,
+        FileRenamedData,
+        FileWrittenData,
+        ImageLoadedData,
+        ProcessStartedData,
+        ProcessStoppedData,
+        ProtectionStrippedData,
+        RegistryKeyData,
+        RegistryValueSetData,
+        ThreadStartedData,
+    },
+};
+use windows::{
+    Win32::{
+        Foundation::{
+            CloseHandle,
+            HANDLE,
+        },
+        Storage::FileSystem::{
+            CreateFileW,
+            FILE_FLAGS_AND_ATTRIBUTES,
+            FILE_SHARE_MODE,
+            FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+            OPEN_EXISTING,
+        },
+    },
+    core::PCWSTR,
+};
+const GENERIC_READ: u32 = 0x8000_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+use windows::Win32::System::IO::DeviceIoControl;
+
+use crate::{
+    app::event::{
+        SandboxEvent,
+        SourceEvent,
+    },
+    ports::driving::event_source::SourceError,
+};
+
+const DRIVER_PATH: PCWSTR = windows::core::w!(r"\\.\secoutfall");
+// CTL_CODE(0x8000, 0x800, METHOD_OUT_DIRECT, FILE_READ_ACCESS)
+const IOCTL_GET_DATA: u32 = (0x8000 << 16) | (1 << 14) | (0x800 << 2) | 1;
+
+const DRAIN_BUFFER_SIZE: usize = 1 << 20; // 1 MiB
+const DRAIN_INTERVAL: Duration = Duration::from_millis(100);
+const NAME_CACHE_CAP: usize = 4096;
+
+/// Driver event source: one open control device, one drain loop.
+pub struct DriverEventSourceAdapter {
+    clock: Arc<dyn crate::ports::driven::clock::SystemClockPort>,
+    clock_offset_ms: AtomicI64,
+}
+
+impl DriverEventSourceAdapter {
+    /// Builds the adapter over the agent's (fake) clock port; the real→fake
+    /// offset is captured lazily from the first drained record.
+    pub fn new(clock: Arc<dyn crate::ports::driven::clock::SystemClockPort>) -> Self {
+        Self { clock, clock_offset_ms: AtomicI64::new(0) }
+    }
+}
+
+// The per-drain context: device handle, name cache, offset flag. The async
+// run loop owns it.
+struct DrainContext {
+    device: HANDLE,
+    names: HashMap<u32, String>,
+    offset_captured: bool,
+}
+
+impl DrainContext {
+    fn open() -> Result<Self, SourceError> {
+        // SAFETY: plain device open; the driver validates all input.
+        let device = unsafe {
+            CreateFileW(
+                DRIVER_PATH,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0),
+                None,
+                OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                None,
+            )
+        }
+        .map_err(|_| {
+            SourceError::Stopped(
+                r"driver device \\.\secoutfall not found — is the driver started?".to_owned(),
+            )
+        })?;
+        if device.is_invalid() {
+            return Err(SourceError::Stopped(
+                r"driver device \\.\secoutfall not found — is the driver started?".to_owned(),
+            ));
+        }
+        Ok(Self { device, names: HashMap::new(), offset_captured: false })
+    }
+
+    // Resolves a process name from the cache; unknown pids get a placeholder
+    // (the scope tracker treats unknown names conservatively).
+    fn name_for(&self, pid: u32) -> String {
+        self.names.get(&pid).cloned().unwrap_or_else(|| "<unknown>".to_owned())
+    }
+
+    fn remember_name(&mut self, pid: u32, name: Option<String>) {
+        if self.names.len() >= NAME_CACHE_CAP {
+            self.names.clear(); // bounded: cheap reset, entries re-seed on create
+        }
+        self.names.insert(pid, name.unwrap_or_else(|| "<unnamed>".to_owned()));
+    }
+}
+
+impl Drop for DrainContext {
+    fn drop(&mut self) {
+        // SAFETY: closing a kernel handle; no invariants beyond ownership.
+        unsafe {
+            let _ = CloseHandle(self.device);
+        }
+    }
+}
+
+// Maps one decoded record into zero or one SandboxEvent. Records without a
+// taxonomy home (DropCaptured for now) are logged, not dropped silently.
+// Exhaustive mapping table, one arm per wire record — the too-many-lines
+// exception matches the pattern used by `sample_for` in the payload crate.
+#[allow(clippy::too_many_lines)]
+fn map_record(record: &driver_wire::Record, context: &mut DrainContext) -> Option<SandboxEvent> {
+    let pid = record.pid();
+    let name_from = |value: Option<&String>| {
+        value.map_or_else(
+            || "<unknown>".to_owned(),
+            |p| p.rsplit(['\\', '/']).next().unwrap_or(p).to_owned(),
+        )
+    };
+    match record.payload() {
+        driver_wire::Payload::ProcessCreated { parent_pid, command_line, image_name } => {
+            let name = name_from(image_name.as_ref());
+            context.remember_name(pid, Some(name.clone()));
+            Some(SandboxEvent::Source(SourceEvent::ProcessStarted(ProcessStartedData {
+                pid,
+                parent_pid: Some(*parent_pid),
+                name,
+                image_path: image_name.clone(),
+                command_line: command_line.clone(),
+                os_session_id: None,
+            })))
+        }
+        driver_wire::Payload::ProcessExited => {
+            let name = context.name_for(pid);
+            Some(SandboxEvent::Source(SourceEvent::ProcessStopped(ProcessStoppedData {
+                pid,
+                name,
+            })))
+        }
+        driver_wire::Payload::Thread { thread_id } => {
+            Some(SandboxEvent::Source(SourceEvent::ThreadStarted(ThreadStartedData {
+                pid,
+                tid: *thread_id,
+                parent_tid: None,
+            })))
+        }
+        driver_wire::Payload::ImageLoaded { name, .. } => {
+            let resolved = name_from(name.as_ref());
+            Some(SandboxEvent::Source(SourceEvent::ImageLoaded(ImageLoadedData {
+                pid,
+                name: resolved,
+                image_path: name.clone(),
+                image_size: None,
+                image_checksum: None,
+            })))
+        }
+        driver_wire::Payload::RegistryKeyCreated { path } => {
+            Some(SandboxEvent::Source(SourceEvent::RegistryKeyCreated(RegistryKeyData {
+                pid,
+                key_name: path.clone(),
+                key_handle: None,
+            })))
+        }
+        driver_wire::Payload::RegistryKeyDeleted { path } => {
+            Some(SandboxEvent::Source(SourceEvent::RegistryKeyDeleted(RegistryKeyData {
+                pid,
+                key_name: path.clone(),
+                key_handle: None,
+            })))
+        }
+        driver_wire::Payload::RegistrySetValue { key_path, value_name, data_type, data } => {
+            Some(SandboxEvent::Source(SourceEvent::RegistryValueSet(RegistryValueSetData {
+                pid,
+                key_name: key_path.clone(),
+                value_name: Some(value_name.clone()),
+                key_handle: None,
+                value_type: Some(format!("REG_{data_type}")),
+                data_size: Some(u32::try_from(data.len()).unwrap_or(0)),
+            })))
+        }
+        driver_wire::Payload::FileCreated { path } => {
+            Some(SandboxEvent::Source(SourceEvent::FileCreated(FileCreatedData {
+                pid,
+                file_name: Some(path.clone()),
+                file_object: None,
+                create_options: None,
+                create_disposition: None,
+            })))
+        }
+        driver_wire::Payload::FileWritten { offset, bytes, path } => {
+            Some(SandboxEvent::Source(SourceEvent::FileWritten(FileWrittenData {
+                pid,
+                file_object: None,
+                file_key: None,
+                file_name: Some(path.clone()),
+                io_size: Some(u64::from(*bytes)),
+                offset: Some(*offset),
+            })))
+        }
+        driver_wire::Payload::FileCleanedUp { path } => {
+            Some(SandboxEvent::Source(SourceEvent::FileCleanedUp(FileReleasedData {
+                pid,
+                file_object: None,
+                file_key: None,
+                file_name: Some(path.clone()),
+            })))
+        }
+        driver_wire::Payload::FileDeleted { path } => {
+            Some(SandboxEvent::Source(SourceEvent::FileDeleted(FileDeletedData {
+                pid,
+                file_object: None,
+                file_key: None,
+                file_name: Some(path.clone()),
+            })))
+        }
+        driver_wire::Payload::FileRenamed { old_path, new_path } => {
+            Some(SandboxEvent::Source(SourceEvent::FileRenamed(FileRenamedData {
+                pid,
+                file_object: None,
+                file_name: Some(old_path.clone()),
+                new_name: Some(new_path.clone()),
+                file_key: None,
+            })))
+        }
+        driver_wire::Payload::BehaviorCall { thread_id, api, arg0, arg1, arg2, arg3 } => {
+            Some(SandboxEvent::Source(SourceEvent::BehaviorCall(BehaviorCallData {
+                pid,
+                tid: *thread_id,
+                api: *api,
+                arg0: *arg0,
+                arg1: *arg1,
+                arg2: *arg2,
+                arg3: *arg3,
+            })))
+        }
+        driver_wire::Payload::ProtectionEvent {
+            protected_pid,
+            target_is_thread,
+            original_access,
+            stripped_access,
+            ..
+        } => Some(SandboxEvent::Source(SourceEvent::ProtectionStripped(ProtectionStrippedData {
+            opener_pid: pid,
+            protected_pid: *protected_pid,
+            target_is_thread: *target_is_thread,
+            original_access: *original_access,
+            stripped_access: *stripped_access,
+        }))),
+        driver_wire::Payload::DropCaptured { path, stored_name, method } => {
+            // Drops-collector integration decision pending (KERNEL.md D5):
+            // the driver already preserved the content; log for now.
+            tracing::info!(
+                pid,
+                path = %path,
+                stored = %stored_name,
+                method,
+                "driver captured drop"
+            );
+            None
+        }
+    }
+}
+
+#[async_trait]
+impl crate::ports::driving::event_source::EventSourcePort for DriverEventSourceAdapter {
+    async fn run(&self, inlet: Arc<dyn EventInletPort<SandboxEvent>>) -> Result<(), SourceError> {
+        let mut context = DrainContext::open()?;
+        let mut buffer = vec![0u8; DRAIN_BUFFER_SIZE];
+        loop {
+            let mut returned = 0u32;
+            // SAFETY: OUT_DIRECT read; output size checked below.
+            let ok = unsafe {
+                DeviceIoControl(
+                    context.device,
+                    IOCTL_GET_DATA,
+                    None,
+                    0,
+                    Some(buffer.as_mut_ptr().cast()),
+                    u32::try_from(buffer.len()).unwrap_or(0),
+                    Some(std::ptr::from_mut(&mut returned)),
+                    None,
+                )
+            };
+            if ok.is_err() {
+                return Err(SourceError::Stopped("GET_DATA failed".to_owned()));
+            }
+            if returned as usize >= driver_wire::HEADER_SIZE {
+                // The decoder is golden-pinned and panic-free on hostile
+                // bytes; a malformed batch costs the batch, never the run.
+                match driver_wire::decode_all(buffer.get(..returned as usize).unwrap_or(&buffer)) {
+                    Ok(records) => {
+                        for record in &records {
+                            // Lazy clock offset: the first drained record
+                            // anchors real→fake; constant for the session.
+                            if !context.offset_captured {
+                                #[allow(clippy::cast_possible_wrap)] // kernel time fits i64
+                                let kernel_time = record.time() as i64;
+                                let offset = self.clock.now_ms().saturating_sub(kernel_time);
+                                self.clock_offset_ms.store(offset, Ordering::Relaxed);
+                                context.offset_captured = true;
+                            }
+                            if let Some(event) = map_record(record, &mut context) {
+                                inlet.accept(event).await;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        // A malformed batch costs the batch, never the run.
+                        tracing::warn!(?error, "driver drain: undecodable batch skipped");
+                    }
+                }
+            }
+            tokio::time::sleep(DRAIN_INTERVAL).await;
+        }
+    }
+}

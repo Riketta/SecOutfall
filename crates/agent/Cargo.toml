@@ -29,6 +29,9 @@ time_shift = ["dep:windows"]
 ipc = ["dep:windows"]
 # SCM service mode (windows-service).
 service = ["dep:windows-service"]
+# Kernel-driver integration: event source + control device (Windows-only).
+# The Win32_System_IO feature gates DeviceIoControl in the windows crate.
+driver = ["dep:windows", "windows/Win32_System_IO"]
 
 [lints]
 workspace = true

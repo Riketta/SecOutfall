@@ -68,16 +68,27 @@ std::wstring Clamp(const std::wstring& s, USHORT capBytes, bool& truncated) {
 void BuildProcessCreated() {
 	bool truncated = false;
 	auto cmd = Clamp(L"C:\\Windows\\system32\\cmd.exe /c whoami", MaxCommandLineBytes, truncated);
+	bool imageTruncated = false;
+	auto image = Clamp(L"C:\\Windows\\system32\\cmd.exe", MaxImageNameBytes, imageTruncated);
 	ULONG pid = 1004;
+	UCHAR flags = TRUNC_NONE;
+	if (truncated)
+		flags |= TRUNC_CMDLINE;
+	if (imageTruncated)
+		flags |= TRUNC_IMAGE_NAME;
 	ProcessCreatedRecord record {};
-	record.Header = MakeHeader(ProcessCreated, pid, IdentityBase + pid,
-		truncated ? TRUNC_CMDLINE : TRUNC_NONE,
-		ProcessCreatedFixed + static_cast<ULONG>(cmd.size() * sizeof(WCHAR)));
+	record.Header = MakeHeader(ProcessCreated, pid, IdentityBase + pid, flags,
+		ProcessCreatedFixed
+			+ static_cast<ULONG>((cmd.size() + image.size()) * sizeof(WCHAR)));
 	record.ParentProcessId = 998;
 	record.CommandLineOffset = cmd.empty() ? 0 : ProcessCreatedFixed;
 	record.CommandLineBytes = static_cast<USHORT>(cmd.size() * sizeof(WCHAR));
+	record.ImageNameOffset = image.empty() ? 0
+		: static_cast<USHORT>(record.CommandLineOffset + record.CommandLineBytes);
+	record.ImageNameBytes = static_cast<USHORT>(image.size() * sizeof(WCHAR));
 	AppendRaw(&record, ProcessCreatedFixed);
 	AppendWstr(cmd);
+	AppendWstr(image);
 }
 
 void BuildProcessExited() {

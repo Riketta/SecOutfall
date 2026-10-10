@@ -4,9 +4,22 @@
 pub mod broker;
 pub mod clock;
 pub mod config_toml;
+#[cfg(all(windows, feature = "driver"))]
+pub mod driver_control_device;
 pub mod killer;
 pub mod launcher;
-#[cfg(windows)]
+// Needs the optional `windows` dep: compiled whenever any windows-using
+// feature is on (its consumers are all feature-gated the same way).
+#[cfg(all(
+    windows,
+    any(
+        feature = "time_shift",
+        feature = "launcher",
+        feature = "schedtask",
+        feature = "ipc",
+        feature = "killer"
+    )
+))]
 pub mod privileges;
 pub mod scope_store;
 pub mod shell_association;

@@ -116,6 +116,21 @@ cli_started = 4
 # Score for an observed drop.
 drop_observed = 5
 
+[driver]
+# Route telemetry through the kernel driver INSTEAD of user-mode ETW
+# (exactly one source is active). Requires the driver service started and
+# an elevated agent.
+enabled = false
+# Sensor DLL path pushed to the injection policy (verbatim to LdrLoadDll —
+# NT form recommended). Empty disables sensor injection.
+sensor_path = ""
+# Process images protected by ObCallbacks stripping (with extension).
+protected_names = []
+# Drops directory in normalized NT form (empty disables drop capture).
+drops_dir = ""
+# Drop-capture extension filter (with the dot; empty = all files).
+drop_extensions = []
+
 [telemetry]
 # Master switch for Sentry-protocol egress to the local GlitchTip. Egress
 # from the analysis VM is visible to malware — keep off unless GlitchTip is

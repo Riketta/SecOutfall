@@ -3,6 +3,7 @@
 
 pub mod broker;
 pub mod clock;
+pub mod driver_control;
 pub mod process_killer;
 pub mod process_launcher;
 pub mod scope_repository;

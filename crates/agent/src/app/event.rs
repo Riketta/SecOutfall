@@ -8,6 +8,7 @@
 use protocol::{
     events::EventType,
     payload::{
+        BehaviorCallData,
         FileCreatedData,
         FileDeletedData,
         FileFsctlData,
@@ -19,6 +20,7 @@ use protocol::{
         Payload,
         ProcessStartedData,
         ProcessStoppedData,
+        ProtectionStrippedData,
         RegistryKeyData,
         RegistryValueQueriedData,
         RegistryValueSetData,
@@ -110,6 +112,11 @@ pub enum SourceEvent {
     NetTcpAccepted(TcpConnectionData),
     /// See [`TcpConnectionData`] / `net.tcp.disconnected`.
     NetTcpDisconnected(TcpConnectionData),
+    /// Sensor hooked-API call (`behavior.call`, driver track).
+    BehaviorCall(BehaviorCallData),
+    /// Handle access to a protected process was stripped
+    /// (`protection.stripped`, driver track).
+    ProtectionStripped(ProtectionStrippedData),
 }
 
 /// Generates `event_type()` and `into_payload()` from one variant table —
@@ -160,6 +167,8 @@ source_variants! {
     NetTcpConnected(TcpConnectionData) => EventType::NetTcpConnected,
     NetTcpAccepted(TcpConnectionData) => EventType::NetTcpAccepted,
     NetTcpDisconnected(TcpConnectionData) => EventType::NetTcpDisconnected,
+    BehaviorCall(BehaviorCallData) => EventType::BehaviorCall,
+    ProtectionStripped(ProtectionStrippedData) => EventType::ProtectionStripped,
 }
 
 /// Derived, plugin-owned domain events carried on the agent bus. Never raw

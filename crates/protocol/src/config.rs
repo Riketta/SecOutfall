@@ -303,6 +303,25 @@ impl Default for ScoringConfig {
     }
 }
 
+/// Kernel-driver integration (`[driver]` section). When enabled, the
+/// driver replaces user-mode ETW as the active event source — exactly one
+/// source runs at a time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DriverConfig {
+    /// Route event telemetry through the kernel driver instead of ETW.
+    pub enabled: bool,
+    /// Sensor DLL path pushed to the driver's injection policy (verbatim to
+    /// `LdrLoadDll` — NT form recommended). Empty disables injection.
+    pub sensor_path: String,
+    /// Process names protected by `ObCallbacks` stripping (with extension).
+    pub protected_names: Vec<String>,
+    /// Drops directory in normalized NT form (empty disables drop capture).
+    pub drops_dir: String,
+    /// Drop-capture extension filter (with the dot; empty = all files).
+    pub drop_extensions: Vec<String>,
+}
+
 /// Debug switches (`[debug]` section) — for development on non-VM hosts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -339,6 +358,8 @@ pub struct AgentConfig {
     pub scoring: ScoringConfig,
     /// Telemetry egress.
     pub telemetry: TelemetryConfig,
+    /// Kernel-driver integration.
+    pub driver: DriverConfig,
     /// Debug switches.
     pub debug: DebugConfig,
 }

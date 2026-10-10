@@ -81,6 +81,7 @@ pub struct RunningSession {
     kernel: Arc<AgentKernel>,
     state: SharedScopeState,
     scheduler: Arc<SchedulerAdapter>,
+    clock: Arc<dyn SystemClockPort>,
     seq: Arc<std::sync::atomic::AtomicU64>,
     finalize_done: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -133,7 +134,11 @@ impl RunningSession {
         });
 
         let (stop_tx, stop_rx) = mpsc::channel::<SandboxEvent>(8);
-        Ok((Self { kernel, state, scheduler, seq, finalize_done }, stop_tx, stop_rx))
+        Ok((
+            Self { kernel, state, scheduler, clock: Arc::clone(&deps.clock), seq, finalize_done },
+            stop_tx,
+            stop_rx,
+        ))
     }
 
     /// The shared per-boot wire sequence counter (adapters that publish to
@@ -141,6 +146,12 @@ impl RunningSession {
     #[must_use]
     pub fn seq(&self) -> Arc<std::sync::atomic::AtomicU64> {
         Arc::clone(&self.seq)
+    }
+
+    /// The session's (fake) clock, for adapters that map driver timestamps.
+    #[must_use]
+    pub fn clock(&self) -> Arc<dyn SystemClockPort> {
+        Arc::clone(&self.clock)
     }
 
     /// The pipeline inlet for additional driving adapters (ETW, probes...).

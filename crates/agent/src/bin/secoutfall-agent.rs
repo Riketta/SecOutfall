@@ -27,8 +27,6 @@ use std::{
     sync::Arc,
 };
 
-#[cfg(all(windows, feature = "etw"))]
-use agent::ports::driving::event_source::EventSourcePort;
 use agent::{
     app::{
         event::SandboxEvent,
@@ -470,6 +468,7 @@ async fn console(args: &Args) -> anyhow::Result<()> {
     let ipc_clock = Arc::clone(&session_deps.clock);
     let ipc_config = Arc::clone(&session_deps.config);
     let ipc_pid_gate = Arc::clone(&session_deps.user_actor_pid_gate);
+    let event_source_config = Arc::clone(&session_deps.config);
 
     let (session, stop_tx, stop_rx) =
         agent::app::runtime::RunningSession::start(session_deps).await?;
@@ -485,7 +484,7 @@ async fn console(args: &Args) -> anyhow::Result<()> {
         let _ = ctrl_c_tx.send(SandboxEvent::ServiceStop).await;
     });
 
-    attach_event_source(&session).await;
+    attach_event_source(&session, &event_source_config).await;
 
     drop(stop_tx);
     session.run_until_stop(stop_rx).await?;
@@ -578,7 +577,7 @@ async fn local(args: &Args) -> anyhow::Result<()> {
         let _ = ctrl_c_tx.send(SandboxEvent::ServiceStop).await;
     });
 
-    attach_event_source(&session).await;
+    attach_event_source(&session, &config).await;
 
     drop(stop_tx);
     session.run_until_stop(stop_rx).await?;
@@ -589,6 +588,7 @@ async fn local(args: &Args) -> anyhow::Result<()> {
 #[cfg(all(windows, feature = "etw"))]
 #[allow(clippy::unused_async)] // keeps the console flow shape uniform across features
 async fn attach_etw(session: &agent::app::runtime::RunningSession) {
+    use agent::ports::driving::event_source::EventSourcePort;
     let adapter = Arc::new(agent::adapters::driving::etw_adapter::EtwKernelTraceAdapter::new(
         8192,
         agent::adapters::driving::etw_adapter::SESSION_NAME,
@@ -607,17 +607,38 @@ async fn attach_etw(session: &agent::app::runtime::RunningSession) {
 /// the production deployment and must observe exactly like console (the
 /// historical bug: service mode attached nothing and observed silently). The
 /// driver-track `DriverEventSourceAdapter` replaces this call site.
-#[allow(clippy::unused_async)] // signature parity across the etw feature lanes
-async fn attach_event_source(session: &agent::app::runtime::RunningSession) {
+#[allow(clippy::unused_async)] // signature parity across the feature lanes
+async fn attach_event_source(
+    session: &agent::app::runtime::RunningSession,
+    config: &protocol::config::AgentConfig,
+) {
+    // Driver replaces ETW when armed: exactly one source is active.
+    #[cfg(all(windows, feature = "driver"))]
+    if config.driver.enabled {
+        use agent::ports::driving::event_source::EventSourcePort;
+        let clock = session.clock();
+        let adapter = Arc::new(
+            agent::adapters::driving::driver_event_source::DriverEventSourceAdapter::new(clock),
+        );
+        let inlet = session.inlet();
+        tokio::spawn(async move {
+            if let Err(error) = adapter.run(inlet).await {
+                println!("driver event source failed: {error}");
+            }
+        });
+        println!("driver event source attached (kernel telemetry)");
+        return;
+    }
+
     #[cfg(all(windows, feature = "etw"))]
     attach_etw(session).await;
 
-    #[cfg(not(all(windows, feature = "etw")))]
+    #[cfg(not(any(all(windows, feature = "etw"), all(windows, feature = "driver"))))]
     {
-        let _ = session;
+        let _ = (session, config);
         println!(
-            "no event source: build with --features etw (and run elevated) — \
-             nothing will be observed and the run will idle"
+            "no event source: build with --features etw or --features driver (and run \
+             elevated) — nothing will be observed and the run will idle"
         );
     }
 }
@@ -739,6 +760,8 @@ fn service_uninstall() -> anyhow::Result<()> {
 /// ETW probe: run a live kernel trace for N seconds and summarize what we see.
 #[cfg(all(windows, feature = "etw"))]
 async fn etw_probe() -> anyhow::Result<()> {
+    use agent::ports::driving::event_source::EventSourcePort;
+
     struct RecordingInlet;
     #[async_trait::async_trait]
     impl kernel::app::api_ports::EventInletPort<SandboxEvent> for RecordingInlet {
@@ -758,7 +781,7 @@ async fn etw_probe() -> anyhow::Result<()> {
 
     let inlet: Arc<dyn kernel::app::api_ports::EventInletPort<SandboxEvent>> =
         Arc::new(RecordingInlet);
-    let run = adapter.run(inlet);
+    let run = EventSourcePort::run(adapter.as_ref(), inlet);
     match tokio::time::timeout(std::time::Duration::from_secs(seconds), run).await {
         Err(_elapsed) => {
             adapter.stop().await;
@@ -813,7 +836,7 @@ async fn run_service_body(args: Vec<std::ffi::OsString>) -> anyhow::Result<()> {
 
     let (session, stop_tx, stop_rx) = agent::app::runtime::RunningSession::start(deps).await?;
     attach_ipc(&session, &ipc_config, ipc_broker, ipc_clock, &nonce, ipc_pid_gate).await;
-    attach_event_source(&session).await;
+    attach_event_source(&session, &ipc_config).await;
 
     // SCM handler (sync thread) → runtime stop channel (async).
     let (scm_tx, scm_rx) = std::sync::mpsc::channel::<SandboxEvent>();

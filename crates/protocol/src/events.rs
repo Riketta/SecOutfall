@@ -81,6 +81,12 @@ pub enum EventType {
     /// A TCP connection was torn down.
     #[serde(rename = "net.tcp.disconnected")]
     NetTcpDisconnected,
+    /// A hooked-API call was reported by the injected sensor (driver track).
+    #[serde(rename = "behavior.call")]
+    BehaviorCall,
+    /// Handle access to a protected process was stripped (D4 self-protection).
+    #[serde(rename = "protection.stripped")]
+    ProtectionStripped,
     /// The agent opened a new session.
     #[serde(rename = "session.started")]
     SessionStarted,
@@ -174,6 +180,8 @@ pub const ALL: &[EventType] = &[
     EventType::NetTcpConnected,
     EventType::NetTcpAccepted,
     EventType::NetTcpDisconnected,
+    EventType::BehaviorCall,
+    EventType::ProtectionStripped,
     EventType::SessionStarted,
     EventType::SessionFinalizing,
     EventType::SessionEnded,
@@ -226,6 +234,8 @@ impl EventType {
             Self::NetTcpConnected => "net.tcp.connected",
             Self::NetTcpAccepted => "net.tcp.accepted",
             Self::NetTcpDisconnected => "net.tcp.disconnected",
+            Self::BehaviorCall => "behavior.call",
+            Self::ProtectionStripped => "protection.stripped",
             Self::SessionStarted => "session.started",
             Self::SessionFinalizing => "session.finalizing",
             Self::SessionEnded => "session.ended",

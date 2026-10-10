@@ -1333,21 +1333,33 @@ void OnProcessNotify(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _Inout_op
 		bool cmdTruncated = false;
 		WCHAR cmdScratch[MaxCommandLineBytes / sizeof(WCHAR)];
 		auto cmdBytes = CopyNameW(cmdScratch, CreateInfo->CommandLine, MaxCommandLineBytes, cmdTruncated);
+		// The image name seeds the agent's scope tracking — as essential as
+		// the command line. Same cap, same truncation-flag treatment (the
+		// ProcessCreated record reuses TRUNC_IMAGE_NAME, distinct record).
+		bool imageTruncated = false;
+		WCHAR imageScratch[MaxImageNameBytes / sizeof(WCHAR)];
+		auto imageBytes = CopyNameW(imageScratch, CreateInfo->ImageFileName, MaxImageNameBytes, imageTruncated);
 
 		auto pid = HandleToULong(ProcessId);
-		auto header = AllocRecord(ProcessCreatedFixed + cmdBytes, ProcessCreated, pid, 0);
+		auto header = AllocRecord(ProcessCreatedFixed + cmdBytes + imageBytes, ProcessCreated, pid, 0);
 		if (header == nullptr)
 			return;
 		auto createTime = header->Time;
 		if (cmdTruncated)
 			header->TruncFlags |= TRUNC_CMDLINE;
+		if (imageTruncated)
+			header->TruncFlags |= TRUNC_IMAGE_NAME;
 
 		auto record = reinterpret_cast<ProcessCreatedRecord*>(header);
 		record->ParentProcessId = HandleToULong(CreateInfo->ParentProcessId);
 		record->CommandLineOffset = cmdBytes > 0 ? ProcessCreatedFixed : 0;
 		record->CommandLineBytes = cmdBytes;
+		record->ImageNameOffset = imageBytes > 0 ? ProcessCreatedFixed + cmdBytes : 0;
+		record->ImageNameBytes = imageBytes;
 		if (cmdBytes > 0)
 			::memcpy(reinterpret_cast<UCHAR*>(header) + record->CommandLineOffset, cmdScratch, cmdBytes);
+		if (imageBytes > 0)
+			::memcpy(reinterpret_cast<UCHAR*>(header) + record->ImageNameOffset, imageScratch, imageBytes);
 
 		// Track identity regardless of queue pressure: scope correctness
 		// outweighs telemetry completeness.

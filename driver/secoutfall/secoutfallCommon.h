@@ -97,7 +97,10 @@ struct ProcessCreatedRecord {
 	ULONG ParentProcessId;     // +48
 	USHORT CommandLineOffset;  // +52 from record start; 0 = absent
 	USHORT CommandLineBytes;   // +54 whole WCHARs
+	USHORT ImageNameOffset;    // +56 from record start; 0 = absent
+	USHORT ImageNameBytes;     // +58 whole WCHARs
 	// WCHAR CommandLine[] at CommandLineOffset (when non-zero)
+	// WCHAR ImageName[] at ImageNameOffset (when non-zero)
 };
 
 struct ProcessExitedRecord {
@@ -254,7 +257,7 @@ struct DriverStats {
 // `Size`, so sizeof(ThreadRecord)'s 56-byte tail-padded form never goes on
 // the wire). static_asserts keep the constants honest against the structs.
 const ULONG ProcessExitedFixed = sizeof(ProcessExitedRecord);       // 48
-const ULONG ProcessCreatedFixed = sizeof(ProcessCreatedRecord);     // 56
+const ULONG ProcessCreatedFixed = sizeof(ProcessCreatedRecord);     // 60
 const ULONG ThreadFixed = 52;
 const ULONG ImageLoadedFixed = sizeof(ImageLoadedRecord);           // 64
 const ULONG RegistryKeyFixed = 52;
@@ -436,6 +439,8 @@ static_assert(offsetof(RecordHeader, Size) == 40, "wire header layout pinned");
 static_assert(offsetof(ProcessCreatedRecord, ParentProcessId) == 48, "wire layout pinned");
 static_assert(offsetof(ProcessCreatedRecord, CommandLineOffset) == 52, "wire layout pinned");
 static_assert(offsetof(ProcessCreatedRecord, CommandLineBytes) == 54, "wire layout pinned");
+static_assert(offsetof(ProcessCreatedRecord, ImageNameOffset) == 56, "wire layout pinned");
+static_assert(offsetof(ProcessCreatedRecord, ImageNameBytes) == 58, "wire layout pinned");
 static_assert(offsetof(ThreadRecord, ThreadId) == 48, "wire layout pinned");
 static_assert(offsetof(ImageLoadedRecord, ImageBase) == 48, "wire layout pinned");
 static_assert(offsetof(ImageLoadedRecord, ImageSize) == 56, "wire layout pinned");

@@ -303,6 +303,45 @@ pub struct FileFsctlData {
     pub file_key: Option<u64>,
 }
 
+/// Payload of `behavior.call` — one hooked-API call from the injected
+/// sensor. Raw argument values (host pointers/handles); interpretation is
+/// per-API in the scoring layer, never here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BehaviorCallData {
+    /// Owning process id.
+    pub pid: u32,
+    /// Reporting thread id.
+    pub tid: u32,
+    /// Behavior API id (sensor's `BehaviorApi` enum).
+    pub api: u32,
+    /// Raw first argument.
+    pub arg0: u64,
+    /// Raw second argument.
+    pub arg1: u64,
+    /// Raw third argument.
+    pub arg2: u64,
+    /// Raw fourth argument.
+    pub arg3: u64,
+}
+
+/// Payload of `protection.stripped` — a handle-open to a protected process
+/// had dangerous access bits removed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtectionStrippedData {
+    /// Process that opened the handle (the potential attacker).
+    pub opener_pid: u32,
+    /// The protected process whose handle was opened.
+    pub protected_pid: u32,
+    /// True when the handle was to a thread of the target.
+    pub target_is_thread: bool,
+    /// Access the opener originally requested.
+    pub original_access: u64,
+    /// Access bits actually removed.
+    pub stripped_access: u64,
+}
+
 /// Payload schema shared by `net.tcp.connected`, `net.tcp.accepted` and
 /// `net.tcp.disconnected`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -587,6 +626,8 @@ payload_variants! {
     NetTcpConnected(TcpConnectionData) => EventType::NetTcpConnected,
     NetTcpAccepted(TcpConnectionData) => EventType::NetTcpAccepted,
     NetTcpDisconnected(TcpConnectionData) => EventType::NetTcpDisconnected,
+    BehaviorCall(BehaviorCallData) => EventType::BehaviorCall,
+    ProtectionStripped(ProtectionStrippedData) => EventType::ProtectionStripped,
     SessionStarted(SessionStartedData) => EventType::SessionStarted,
     SessionFinalizing(SessionFinalizingData) => EventType::SessionFinalizing,
     SessionEnded(SessionEndedData) => EventType::SessionEnded,
@@ -754,6 +795,22 @@ mod tests {
                 source_port: 49_152,
                 dest_addr: "203.0.113.7".to_owned(),
                 dest_port: 443,
+            }),
+            EventType::BehaviorCall => Payload::BehaviorCall(BehaviorCallData {
+                pid: 484,
+                tid: 2004,
+                api: 2,
+                arg0: 0xC000_0000_0000_0000,
+                arg1: 0x1234,
+                arg2: 0x5678,
+                arg3: 0x9ABC,
+            }),
+            EventType::ProtectionStripped => Payload::ProtectionStripped(ProtectionStrippedData {
+                opener_pid: 4242,
+                protected_pid: 484,
+                target_is_thread: false,
+                original_access: 0x1F_FFFF,
+                stripped_access: 0x7B,
             }),
             EventType::SessionStarted => {
                 Payload::SessionStarted(SessionStartedData { scheduled_duration_secs: Some(6000) })

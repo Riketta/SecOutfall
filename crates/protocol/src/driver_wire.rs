@@ -149,9 +149,10 @@ impl RecordKind {
 }
 
 /// Why a byte sequence is not a valid v2 record stream.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DecodeError {
     /// Fewer bytes than the header (or the declared size) provide.
+    #[error("truncated record: {available} bytes available, {needed} needed")]
     Truncated {
         /// Bytes actually available.
         available: usize,
@@ -159,12 +160,16 @@ pub enum DecodeError {
         needed: usize,
     },
     /// Magic mismatch.
+    #[error("bad magic: {0:#06x}")]
     BadMagic(u16),
     /// Schema version this decoder refuses to guess at.
+    #[error("bad wire version: {0}")]
     BadVersion(u8),
     /// Header extent differs from the pinned layout.
+    #[error("bad header size: {0}")]
     BadHeaderSize(u16),
     /// Record size below the header or past the available bytes.
+    #[error("bad record size {size} (available {available})")]
     BadSize {
         /// Declared total size.
         size: u32,
@@ -172,12 +177,15 @@ pub enum DecodeError {
         available: usize,
     },
     /// Record size above [`MAX_RECORD_BYTES`] — hostile-stream bound.
+    #[error("oversize record: {0}")]
     Oversize(u32),
     /// Unknown record type: forward-compat is the CALLER's choice (skip by
     /// size), never the decoder's silent guess.
+    #[error("unknown record type: {0}")]
     UnknownType(u16),
     /// A variable-length string whose extent leaves the record or is not a
     /// whole number of WCHARs.
+    #[error("bad string extent {bytes}@{offset} in record of {record_size}")]
     BadString {
         /// String offset from the record start.
         offset: usize,
@@ -209,6 +217,8 @@ pub enum Payload {
         parent_pid: u32,
         /// UTF-16 command line, lossy-decoded; `None` when absent on the wire.
         command_line: Option<String>,
+        /// Image path, lossy-decoded; `None` when absent on the wire.
+        image_name: Option<String>,
     },
     /// A process exited.
     ProcessExited,
@@ -475,7 +485,7 @@ pub fn decode(buf: &[u8]) -> Result<Record, DecodeError> {
 fn min_size(kind: RecordKind) -> usize {
     match kind {
         RecordKind::ProcessExited => 48,
-        RecordKind::ProcessCreated | RecordKind::FileRenamed => 56,
+        RecordKind::ProcessCreated | RecordKind::FileRenamed | RecordKind::DropCaptured => 60,
         RecordKind::ThreadCreated
         | RecordKind::ThreadExited
         | RecordKind::RegistryKeyCreated
@@ -484,7 +494,6 @@ fn min_size(kind: RecordKind) -> usize {
         | RecordKind::FileCleanedUp
         | RecordKind::FileDeleted => 52,
         RecordKind::ImageLoaded | RecordKind::RegistrySetValue | RecordKind::FileWritten => 64,
-        RecordKind::DropCaptured => 60,
         RecordKind::BehaviorCall => 88,
         RecordKind::ProtectionEvent => 80,
     }
@@ -506,9 +515,16 @@ fn payload_of(
             let parent_pid = u32_at(record, 48)?;
             let cmd_offset = u16_at(record, 52)? as usize;
             let cmd_bytes = u16_at(record, 54)? as usize;
+            let image_offset = u16_at(record, 56)? as usize;
+            let image_bytes = u16_at(record, 58)? as usize;
             let command_line =
                 if cmd_bytes == 0 { None } else { Some(string_at(record, cmd_offset, cmd_bytes)?) };
-            Payload::ProcessCreated { parent_pid, command_line }
+            let image_name = if image_bytes == 0 {
+                None
+            } else {
+                Some(string_at(record, image_offset, image_bytes)?)
+            };
+            Payload::ProcessCreated { parent_pid, command_line, image_name }
         }
         RecordKind::ProcessExited => Payload::ProcessExited,
         RecordKind::ThreadCreated | RecordKind::ThreadExited => {
@@ -709,11 +725,13 @@ mod tests {
         assert_eq!(records[0].pid(), 1004);
         assert_eq!(records[0].process_create_time(), IDENTITY_BASE + 1004);
         assert_eq!(records[0].trunc_flags(), TRUNC_NONE);
-        let Payload::ProcessCreated { parent_pid, command_line } = records[0].payload() else {
+        let Payload::ProcessCreated { parent_pid, command_line, image_name } = records[0].payload()
+        else {
             panic!("payload kind mismatch")
         };
         assert_eq!(*parent_pid, 998);
         assert_eq!(command_line.as_deref(), Some("C:\\Windows\\system32\\cmd.exe /c whoami"));
+        assert_eq!(image_name.as_deref(), Some("C:\\Windows\\system32\\cmd.exe"));
 
         // 2: process exited.
         assert_eq!(records[1].kind(), RecordKind::ProcessExited);

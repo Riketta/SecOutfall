@@ -6,6 +6,8 @@ pub mod etw_mapping;
 pub mod event_source_fake;
 pub mod scheduler;
 
+#[cfg(all(windows, feature = "driver"))]
+pub mod driver_event_source;
 #[cfg(all(windows, feature = "etw"))]
 pub mod etw_adapter;
 #[cfg(all(windows, feature = "ipc"))]
