@@ -97,8 +97,12 @@ jobs:
       # build it explicitly — it must not rot in a corner.
       - uses: dtolnay/rust-toolchain@nightly
 
+      # Run from INSIDE crates/injectee: rustup resolves the toolchain from
+      # the current directory, and the workspace root pins stable — the
+      # injectee's own nightly rust-toolchain.toml only applies from here.
       - name: Build injectee (separate nightly workspace)
-        run: cargo build --locked --manifest-path crates/injectee/Cargo.toml
+        working-directory: crates/injectee
+        run: cargo build --locked
 
   driver:
     name: Windows · driver build
@@ -109,6 +113,22 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+
+      # The windows-2022 image has no winget (windows-latest does, but its
+      # VS is 18.x — see runs-on above). Bootstrap winget from the official
+      # sources: VCLibs + UI.Xaml first, then the bundle.
+      - name: Ensure winget
+        shell: pwsh
+        run: |
+          if (Get-Command winget -ErrorAction SilentlyContinue) { exit 0 }
+          $progressPreference = 'silentlyContinue'
+          Invoke-WebRequest -Uri "https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx" -OutFile "$env:TEMP\vclibs.appx"
+          Add-AppxPackage "$env:TEMP\vclibs.appx"
+          Invoke-WebRequest -Uri "https://github.com/microsoft/microsoft-ui-xaml/releases/download/v2.8.6/Microsoft.UI.Xaml.2.8.x64.appx" -OutFile "$env:TEMP\xaml.appx"
+          Add-AppxPackage "$env:TEMP\xaml.appx"
+          Invoke-WebRequest -Uri "https://aka.ms/getwinget" -OutFile "$env:TEMP\winget.msixbundle"
+          Add-AppxPackage "$env:TEMP\winget.msixbundle"
+          winget --version
 
       # WDK 10.0.26100 matches the dev box. The WDK installer deploys the
       # `WindowsKernelModeDriver10.0` MSBuild toolset into the preinstalled
