@@ -115,8 +115,11 @@ jobs:
       - uses: actions/checkout@v4
 
       # The windows-2022 image has no winget (windows-latest does, but its
-      # VS is 18.x — see runs-on above). Bootstrap winget from the official
-      # sources: VCLibs + UI.Xaml first, then the bundle.
+      # VS is 18.x — see runs-on above). Bootstrap a PINNED winget release:
+      # the latest bundle needs the Windows App Runtime 1.8 framework,
+      # which the image lacks. This release's dependency zip carries every
+      # framework the bundle needs, so install all x64 packages from it,
+      # then the bundle itself.
       - name: Ensure winget
         shell: pwsh
         run: |
@@ -125,11 +128,11 @@ jobs:
           # through the compatibility shim.
           Import-Module Appx -UseWindowsPowerShell
           $progressPreference = 'silentlyContinue'
-          Invoke-WebRequest -Uri "https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx" -OutFile "$env:TEMP\vclibs.appx"
-          Add-AppxPackage "$env:TEMP\vclibs.appx"
-          Invoke-WebRequest -Uri "https://github.com/microsoft/microsoft-ui-xaml/releases/download/v2.8.6/Microsoft.UI.Xaml.2.8.x64.appx" -OutFile "$env:TEMP\xaml.appx"
-          Add-AppxPackage "$env:TEMP\xaml.appx"
-          Invoke-WebRequest -Uri "https://aka.ms/getwinget" -OutFile "$env:TEMP\winget.msixbundle"
+          $base = "https://github.com/microsoft/winget-cli/releases/download/v1.10.340"
+          Invoke-WebRequest -Uri "$base/DesktopAppInstaller_Dependencies.zip" -OutFile "$env:TEMP\winget-deps.zip"
+          Expand-Archive "$env:TEMP\winget-deps.zip" -DestinationPath "$env:TEMP\winget-deps" -Force
+          Get-ChildItem "$env:TEMP\winget-deps\x64\*.appx" | ForEach-Object { Add-AppxPackage $_.FullName }
+          Invoke-WebRequest -Uri "$base/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle" -OutFile "$env:TEMP\winget.msixbundle"
           Add-AppxPackage "$env:TEMP\winget.msixbundle"
           winget --version
 
