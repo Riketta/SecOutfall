@@ -17,7 +17,7 @@
 //!   `ProcessCreated` (same pattern as every ETW consumer).
 //! - Overflow policy: bounded channel, drop + count (doctrine).
 //! - `DropCaptured` records are logged, not yet routed to the
-//!   drops-collector (integration decision pending — KERNEL.md D5).
+//!   drops-collector (the driver has already preserved the content).
 
 use std::{
     collections::HashMap,
@@ -308,8 +308,8 @@ fn map_record(record: &driver_wire::Record, context: &mut DrainContext) -> Optio
             stripped_access: *stripped_access,
         }))),
         driver_wire::Payload::DropCaptured { path, stored_name, method } => {
-            // Drops-collector integration decision pending (KERNEL.md D5):
-            // the driver already preserved the content; log for now.
+            // The driver has already preserved the content; routing these
+            // into the drops-collector is not wired yet — log for now.
             tracing::info!(
                 pid,
                 path = %path,

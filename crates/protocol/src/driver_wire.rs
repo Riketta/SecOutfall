@@ -377,7 +377,7 @@ impl Record {
     }
 
     /// Kernel system time at the event (NOT fake-clock unix ms — the agent
-    /// maps this at drain; see KERNEL.md).
+    /// maps this at drain, anchoring the boot's lazy real→fake offset).
     #[must_use]
     pub fn time(&self) -> u64 {
         self.time

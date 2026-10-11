@@ -11,8 +11,8 @@
 # one.
 
 [broker]
-# NATS server URL. The agent retries the connection at startup (18 × 5 s,
-# legacy parity) because the broker may come up after the VM boots.
+# NATS server URL. The agent retries the connection at startup (18 × 5 s)
+# because the broker may come up after the VM boots.
 uri = "nats://127.0.0.1:4222"
 # Control subject: keepalive / reboot / shutdown requests.
 control_channel = "control"
@@ -33,11 +33,11 @@ every_session = false
 [study]
 # Session durations in seconds, one entry per planned session (e.g. 24
 # sessions of 100 min: [6000, 6000, ...]). An EMPTY list means dynamic mode:
-# sessions end when every scoped process has died (legacy bug #6 fixed).
+# sessions end when every scoped process has died; an empty list together
+# with autoshutdown ends the study with a shutdown.
 # uptimes = [6000, 6000, 6000]
 uptimes = []
-# Finalize early (and end the study) once every scoped process died — requires
-# the dead-session detection to actually work; leave off unless you want it.
+# Finalize early (and end the study) once every scoped process has died.
 autoshutdown = false
 # Extra processes killed at every finalization.
 processes_to_terminate = ["WINWORD", "POWERPNT", "EXCEL", "OfficeClickToRun"]
@@ -54,8 +54,7 @@ path = 'C:\ProgramData\SecOutfall\Drops'
 # Extension filter. `*` = everything, `none` = extensionless files, entries
 # otherwise match case-insensitively with an optional leading dot.
 extensions = [".txt", ".exe", ".dll", ".bat", ".ps1", ".py", ".js", ".vbs", "none"]
-# Per-file size cap in bytes (10 MiB). ENFORCED in the rewrite — legacy
-# parsed but never applied it (legacy bug #3).
+# Per-file size cap in bytes (10 MiB); larger files are rejected preflight.
 max_size = 10485760
 # Max drops collected per session; overflow is counted and reported, never
 # buffered into OOM.
@@ -71,7 +70,7 @@ path = 'C:\ProgramData\SecOutfall\Screenshots'
 # Save received screenshots locally.
 save = false
 # Max screenshots per session; also the capture quota pushed to the user
-# actor (respected exactly — legacy bug #4 fixed).
+# actor (respected exactly).
 max_per_session = 30
 # Upload endpoint; omit to disable.
 # upload_uri = "http://127.0.0.1:8085"
@@ -87,8 +86,8 @@ offset_secs = 0
 
 [platform]
 # Interactive-process launch mechanism: "token" (CreateProcessAsUser with the
-# interactive user's duplicated token) or "sched_task" (legacy EventID-777
-# scheduled-task trick via runas_utility_path).
+# interactive user's duplicated token) or "sched_task" (Application-log
+# EventID-777 scheduled-task launch via runas_utility_path).
 launch_mechanism = "token"
 # Marker process whose sighting signals an interactive session.
 non_s0_process = "explorer"
@@ -109,12 +108,12 @@ scripted = false
 # "win_events" (EVENT_SYSTEM_FOREGROUND hooks).
 focus_method = "win_events"
 # Capture screenshots on focus changes. When false, NO screenshots are
-# produced or sent (legacy bug #4 fixed).
+# produced or sent.
 screencapture = false
 
 [scoring]
-# Session score = maximum over observed signals (legacy parity), including
-# behavior signals when the kernel driver's sensor is active.
+# Session score = maximum over observed signals, including behavior signals
+# when the kernel driver's sensor is active.
 # Score for a CLI/interpreter process entering the scope.
 cli_started = 4
 # Score for an observed drop.

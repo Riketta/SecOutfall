@@ -15,7 +15,7 @@
 // The APC routine is a 17-byte stub written into the target: it bridges the
 // user-APC single argument to LdrLoadDll's four (see InjectStubBytes).
 //
-// Known, accepted v1 limits (documented in KERNEL.md):
+// Known, accepted v1 limits:
 //   - PPL targets: the kernel-side allocation works, the in-target
 //     LdrLoadDll fails code-integrity checks — harmless, counted.
 //   - WOW64: the x64 sensor loads into the x64 side of WOW64 processes;

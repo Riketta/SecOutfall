@@ -1,112 +1,76 @@
-# injectee
+# injectee — SecOutfall sensor DLL
 
-A minimal Windows API hooking framework and DLL-injection testbed, written in Rust.
+The in-process sensor of the [SecOutfall](../../README.md) sandbox: a Rust
+`cdylib` injected into analyzed processes by the kernel driver. It registers
+with the driver using a per-injection nonce (anti-impersonation), maps its
+private event ring, and reports what the host process asks the operating
+system to do by hooking ntdll-level APIs.
 
-`injectee` is a `cdylib`: once loaded into a process, it installs detours on
-Windows API functions and logs what the process asks the operating system to
-do. The framework itself is a single declarative macro (`hook!`) built on
-[retour](https://crates.io/crates/retour) static detours. The hooks in
-`src/hooks/` are working examples — and double as the framework's test suite.
+Hooks are **enrichment, not ground truth**: the driver's kernel callbacks
+see everything anyway, and direct syscalls bypass user-mode hooks — sensor
+silence is itself a scoring signal. The DLL is silent: nothing prints (a
+GUI or service host has no console, and `println!` would panic).
 
 > [!WARNING]
 > DLL injection and API hooking are dual-use techniques. This project exists
-> for education, security research, and testing your own software. Use it only
-> on systems you own or are explicitly permitted to experiment with, and in
-> compliance with applicable laws. The authors accept no liability for misuse.
+> for education, security research, and testing your own software. Use it
+> only on systems you own or are explicitly permitted to experiment with,
+> and in compliance with applicable laws. The authors accept no liability
+> for misuse.
 
-## Features
+## Lifecycle
 
-- **`hook!` macro** — declare a detour in a few lines; the macro generates the
-  detour function, a handle to the original function, and an idempotent
-  `install()` function.
-- **Symbol resolution** — hook any export of any loaded module
-  (`"module.dll"!Export`), resolved at install time via `GetProcAddress`.
-- **Batch installer** — installs every registered hook and collects all
-  failures instead of stopping at the first one.
-- **Executable examples** — `kernel32!Sleep` and `ntdll!NtDelayExecution`
-  hooks, verified by tests against real system calls.
+1. `DllMain` spawns the init thread and returns immediately — the loader
+   lock stays free, so nothing here can deadlock the host's loader.
+2. The init thread (its body is `catch_unwind`-contained: a panic degrades
+   the sensor, never the host) runs the handshake with the driver:
+   `SENSOR_CHALLENGE` → map the offered ring section → `SENSOR_REGISTER`
+   (one-shot, nonce-gated), with bounded retries.
+3. It waits until the driver activates the sensor (the analyzed process is
+   in scope), then installs every hook. Until then the DLL is inert.
+4. Each hook emits `(api id, args[4])` into the lock-free ring; the driver
+   drains it into `behavior.call` wire records with kernel-stamped identity.
 
-## Requirements
+## Survival rules
 
-- Windows (developed and tested on x64)
-- Rust nightly — pinned in `rust-toolchain.toml`, installed automatically by
-  `rustup`
+- No allocation and no panics on the emit path (bounded, lock-free,
+  `fetch_add` slot claim; a full ring drops the record).
+- `panic = "abort"` is deliberately NOT set — in a cdylib an abort kills the
+  host process. Detours are `extern "system"`, so a panic there aborts at
+  the FFI boundary regardless; the real rule is "hooks are written
+  panic-free".
+- Hook installation failures are collected and reported once; they never
+  propagate into the host.
 
-## Build
+## The `hook!` macro
 
-```sh
-cargo build --release
-```
-
-The library is written to `target\release\injectee.dll`.
-
-## Usage
-
-1. Load `injectee.dll` into a target process with any standard injector that
-   calls `LoadLibraryW` (e.g. System Informer's *Inject DLL*, or your own
-   loader).
-2. On `DLL_PROCESS_ATTACH` the demo entry point:
-   - allocates a console and shows the host process ID in a message box,
-   - installs every hook registered in `src/hooks/mod.rs`,
-   - starts `calc.exe` (remove that from `attach()` in `src/lib.rs` if you
-     don't want it).
-3. Hook output appears on the allocated console:
-
-   ```text
-   Hooking kernel32.dll!Sleep.
-   Expected sleep time: 5000.
-   Sleep: 100 ms.
-   ```
-
-   Beware that the example hooks alter host behavior by design: while active,
-   every `Sleep` call in the host lasts one second regardless of the requested
-   duration.
-
-The library also exports `some_export`, a no-op marker function useful for
-testing `GetProcAddress`-based loaders.
-
-## Writing a hook
-
-Hooks live in `src/hooks/`, one module per hook:
+Hooks are declared with one macro built on
+[retour](https://crates.io/crates/retour) static detours. The macro generates
+the detour function, a handle to the original function, and an idempotent
+`install()`:
 
 ```rust
-// src/hooks/myhook.rs
 crate::hook! {
-    /// Logs relative delays before passing them through unchanged.
-    in "ntdll.dll"!NtDelayExecution as NT_DELAY_EXECUTION_ORIGINAL
-    fn nt_delay_execution_detour(alertable: bool, delay_interval: *const i64) -> i32 {
-        // Negative - relative, positive - absolute timestamp.
-        if unsafe { *delay_interval } < 0 {
-            println!("Delaying...");
-        }
-
-        unsafe { NT_DELAY_EXECUTION_ORIGINAL.call(alertable, delay_interval) }
+    /// Reports delay calls, passes them through unchanged.
+    in "ntdll.dll"!NtDelayExecution as NTDELAYEXECUTION_ORIGINAL
+    fn ntdelayexecution_detour(alertable: u8, delay_interval: *const i64) -> i32 {
+        crate::sensor::emit(
+            crate::sensor::api::NT_DELAY_EXECUTION,
+            [u64::from(alertable), delay_interval as u64, 0, 0],
+        );
+        unsafe { NTDELAYEXECUTION_ORIGINAL.call(alertable, delay_interval) }
     }
 }
 ```
 
-The grammar reads: hook `"module.dll"!Symbol`, expose the original function as
-`ORIGINAL`, then the detour signature and body. The macro generates:
+The grammar reads: hook `"module.dll"!Symbol`, expose the original function
+as `ORIGINAL`, then the detour signature and body. The macro generates:
 
-| Generated item         | Purpose                                                                 |
-| ---------------------- | ----------------------------------------------------------------------- |
-| `fn $name(...)`        | Your detour — called instead of the target                               |
-| `static $original`     | The original function — call it with `$original.call(...)`               |
-| `fn install()`         | Resolves the export and enables the detour; safe to call more than once  |
-
-Register the hook in `src/hooks/mod.rs` (hooks are installed top to bottom):
-
-```rust
-mod myhook;
-
-pub(crate) fn install_all() -> anyhow::Result<()> {
-    crate::hooking::install_all(&[
-        ntdelayexecution::install,
-        sleep::install,
-        myhook::install,
-    ])
-}
-```
+| Generated item     | Purpose                                                        |
+| ------------------ | -------------------------------------------------------------- |
+| `fn $name(...)`    | Your detour — called instead of the target                     |
+| `static $original` | The original function — call it with `$original.call(...)`     |
+| `fn install()`     | Resolves the export and enables the detour; safe to re-call    |
 
 Rules of thumb:
 
@@ -115,57 +79,57 @@ Rules of thumb:
 - The `extern "system"` calling convention is assumed, which is correct for
   the Win32 API.
 - Keep one hook per module: every hook module exposes `install`.
+- The ring carries no strings — path/handle-derived classifications must
+  become distinct api ids (`sensor::api`).
 
-## How it works
+## Hook set
 
-`install()` resolves the export address with `GetModuleHandleW` +
-`GetProcAddress`, transmutes it to the declared function type, and hands it to
-a retour `static_detour`, which patches the function's first instructions with
-a jump to your detour. Calling `$original.call(...)` goes through retour's
-trampoline — a copy of the patched prologue — so the original code runs
-untouched. See `src/hooking.rs`; the whole framework fits in one file.
+The id numbering (1–14) is reserved in all three mirrors at once —
+`driver/secoutfall/secoutfallCommon.h`, `protocol::driver_wire`, and
+`sensor::api` — so hooks can land one by one without ever inventing a
+conflicting id.
 
-## Testing
+Installed (v1):
+
+| Id | Api | Why |
+|----|-----|-----|
+| 1 | `NtDelayExecution` | Evasion timing (long sleeps between stages) |
+| 2 | `NtCreateFile` | File access the kernel telemetry can miss |
+| 3 | `NtWriteFile` | Write sizes/patterns |
+| 4 | `NtCreateThreadEx` | Thread creation from user mode |
+
+Reserved for follow-up hooks: `NtDeleteFile` (5), `NtSetValueKey` (6) with
+the sensor-classified Run-key variant (7), cross-process VM
+allocate/write (8, 9), shadow-copy-delete variant (10), `LdrLoadDll` (11),
+`CryptEncrypt` (12), `ShellExecuteEx` (13), `WinExec` (14).
+
+## Build
+
+The crate has its own nightly workspace (excluded from the repository's main
+cargo workspace); the toolchain is pinned in `rust-toolchain.toml`:
 
 ```sh
-cargo test
+cd crates/injectee
+cargo build --locked
+# -> target/debug/injectee.dll (release for deployment)
 ```
 
-The example-hook tests install real detours inside the test process and assert
-their effect — e.g. a `Sleep(3000)` must return in about a second while the
-hook is active. Everything is process-local and gone once the process exits.
-
-Two tests are `#[ignore]`d because they need the built DLL or manual
-interaction:
-
-- `test_get_proc_address_self` — resolves this crate's own export; the test
-  executable exports no symbols, so it only works in the injected DLL
-- `test_self_injection` — blocks on a message box, and `force_unload` is
-  still a stub
-
-Run them explicitly with `cargo test -- --ignored`.
+Win32 bindings are generated at build time by `windows-bindgen` (`build.rs`).
+The driver injects the built DLL by path; the agent materializes a
+per-boot copy under a DACL-protected directory and arms injection with its
+verified NT path.
 
 ## Project layout
 
 ```text
 src/
-├── lib.rs                  # DllMain entry point + integration tests
-├── hooking.rs              # the framework: hook! macro, symbol resolution, installer
-├── hooks/
-│   ├── mod.rs              # example hook registry
-│   ├── sleep.rs            # example: kernel32!Sleep
-│   └── ntdelayexecution.rs # example: ntdll!NtDelayExecution
-├── utils.rs                # small Win32 helpers (message box)
-└── bindings.rs             # generated by windows-bindgen (build.rs)
+├── lib.rs           # DllMain (init thread only) + marker export
+├── sensor.rs        # handshake, ring mapping, emit, reserved api ids
+├── hooking.rs       # the framework: hook! macro, symbol resolution, installer
+├── hooks/           # the v1 hook set (see table above)
+├── ntapis.rs        # hand-written Nt* declarations
+└── bindings.rs      # generated by windows-bindgen (build.rs)
 ```
-
-## Status
-
-Early-stage playground project. Not done yet:
-
-- `force_unload` and `hide_self` (`src/lib.rs`) are unimplemented stubs
-- no runtime hook removal/disable management
-- no automatic hook registration — hooks are listed in one place
 
 ## License
 

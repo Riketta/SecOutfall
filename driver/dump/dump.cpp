@@ -1,6 +1,6 @@
 // secoutfall console dumper: opens the driver's control device, prints
-// drained wire-v2 events and the loss-counter stats. D1 tool — the agent's
-// DriverEventSourceAdapter (D5) replaces it on the consumption side.
+// drained wire-v2 events and the loss-counter stats. Standalone lab tool —
+// the agent's DriverEventSourceAdapter is the production consumer.
 
 #include <windows.h>
 #include <cstdio>
