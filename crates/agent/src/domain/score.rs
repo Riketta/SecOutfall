@@ -262,12 +262,12 @@ mod tests {
     fn injection_chain_fires_on_both_members_and_never_refires() {
         let mut detector = ChainDetector::default();
         let pid = 100;
-        assert!(detector.observe(pid, behavior_api::NT_CREATE_THREAD_EX).chains.is_empty());
+        assert_eq!(detector.observe(pid, behavior_api::NT_CREATE_THREAD_EX).chains, []);
         let finding = detector.observe(pid, behavior_api::NT_WRITE_VM_CROSS_PROCESS);
         assert_eq!(finding.chains, vec![ChainId::Injection]);
         // One-shot: repeats stay silent.
-        assert!(detector.observe(pid, behavior_api::NT_WRITE_VM_CROSS_PROCESS).chains.is_empty());
-        assert!(detector.observe(pid, behavior_api::NT_CREATE_THREAD_EX).chains.is_empty());
+        assert_eq!(detector.observe(pid, behavior_api::NT_WRITE_VM_CROSS_PROCESS).chains, []);
+        assert_eq!(detector.observe(pid, behavior_api::NT_CREATE_THREAD_EX).chains, []);
     }
 
     #[test]
@@ -277,7 +277,7 @@ mod tests {
         detector.observe(pid, behavior_api::NT_DELETE_FILE_SHADOW_COPY);
         // Below the mass threshold the chain must NOT fire.
         for _ in 0..7 {
-            assert!(detector.observe(pid, behavior_api::CRYPT_ENCRYPT).chains.is_empty());
+            assert_eq!(detector.observe(pid, behavior_api::CRYPT_ENCRYPT).chains, []);
         }
         let finding = detector.observe(pid, behavior_api::CRYPT_ENCRYPT);
         assert_eq!(finding.chains, vec![ChainId::Ransomware]);
@@ -297,7 +297,7 @@ mod tests {
         let mut detector = ChainDetector::default();
         detector.observe(400, behavior_api::NT_WRITE_VM_CROSS_PROCESS);
         // Another pid's thread creation must not complete OUR chain.
-        assert!(detector.observe(401, behavior_api::NT_CREATE_THREAD_EX).chains.is_empty());
+        assert_eq!(detector.observe(401, behavior_api::NT_CREATE_THREAD_EX).chains, []);
         assert_eq!(
             detector.observe(400, behavior_api::NT_CREATE_THREAD_EX).chains,
             vec![ChainId::Injection]
@@ -321,7 +321,7 @@ mod tests {
         let mut detector = ChainDetector::default();
         let limit = u32::try_from(MAX_TRACKED_PIDS).unwrap_or(u32::MAX);
         for pid in 0..limit {
-            assert!(detector.observe(pid, behavior_api::CRYPT_ENCRYPT).chains.is_empty());
+            assert_eq!(detector.observe(pid, behavior_api::CRYPT_ENCRYPT).chains, []);
         }
         let finding = detector.observe(limit, behavior_api::CRYPT_ENCRYPT);
         assert!(finding.chains.is_empty() && !finding.run_key_set);

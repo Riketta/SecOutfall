@@ -102,7 +102,11 @@ jobs:
 
   driver:
     name: Windows · driver build
-    runs-on: windows-latest
+    # Pinned to the VS2022 image: `windows-latest` moved to VS "18" (18.x),
+    # and build.ps1's vswhere pin (`[17.0,18.0)`) — which matches the
+    # dev-box-verified WDK 26100 toolset integration — finds no MSBuild
+    # there. Revisit when the WDK integration is verified against 18.x.
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
 
