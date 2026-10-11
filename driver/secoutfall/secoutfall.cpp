@@ -687,7 +687,7 @@ void ProtectionEmitStrippedEvent(_In_ ULONG openerPid, _In_ ULONG64 openerIdenti
 
 extern "C"
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
-	KdPrint((DRIVER_PREFIX "DriverEntry entered\n"));
+	SF_LOG_INFO("DriverEntry entered\n");
 
 	auto status = STATUS_SUCCESS;
 	PDEVICE_OBJECT DeviceObject = nullptr;
@@ -703,14 +703,14 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 		status = ::IoCreateDeviceSecure(DriverObject, 0, &deviceName, FILE_DEVICE_UNKNOWN,
 			0, TRUE, &sddl, &GUID_DEVICECLASS_SECOUTFALL, &DeviceObject);
 		if (!NT_SUCCESS(status)) {
-			KdPrint((DRIVER_PREFIX "failed to create device object (status=%08X)\n", status));
+			SF_LOG_ERROR("failed to create device object (status=%08X)\n", status);
 			break;
 		}
 
 		UNICODE_STRING symName = RTL_CONSTANT_STRING(L"\\??\\" SECOUTFALL_NAME);
 		status = ::IoCreateSymbolicLink(&symName, &deviceName);
 		if (!NT_SUCCESS(status)) {
-			KdPrint((DRIVER_PREFIX "failed to create symbolic link (status=%08X)\n", status));
+			SF_LOG_ERROR("failed to create symbolic link (status=%08X)\n", status);
 			break;
 		}
 
@@ -739,21 +739,21 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 		//
 		status = ::PsSetCreateProcessNotifyRoutineEx(OnProcessNotify, FALSE);
 		if (!NT_SUCCESS(status)) {
-			KdPrint((DRIVER_PREFIX "failed to set process callbacks (status=%08X)\n", status));
+			SF_LOG_ERROR("failed to set process callbacks (status=%08X)\n", status);
 			break;
 		}
 		processCallbacks = true;
 
 		status = ::PsSetCreateThreadNotifyRoutine(OnThreadNotify);
 		if (!NT_SUCCESS(status)) {
-			KdPrint((DRIVER_PREFIX "failed to set thread callbacks (status=%08X)\n", status));
+			SF_LOG_ERROR("failed to set thread callbacks (status=%08X)\n", status);
 			break;
 		}
 		threadCallbacks = true;
 
 		status = ::PsSetLoadImageNotifyRoutine(OnImageLoadNotify);
 		if (!NT_SUCCESS(status)) {
-			KdPrint((DRIVER_PREFIX "failed to set image callbacks (status=%08X)\n", status));
+			SF_LOG_ERROR("failed to set image callbacks (status=%08X)\n", status);
 			break;
 		}
 		imageCallbacks = true;
@@ -765,7 +765,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 		status = ::CmRegisterCallbackEx(OnRegistryNotify, &altitude, DriverObject, nullptr,
 			&g_Data.RegistryCookie, nullptr);
 		if (!NT_SUCCESS(status)) {
-			KdPrint((DRIVER_PREFIX "failed to register registry callbacks (status=%08X)\n", status));
+			SF_LOG_ERROR("failed to register registry callbacks (status=%08X)\n", status);
 			break;
 		}
 		registryCallbacks = true;
@@ -775,7 +775,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 		//
 		status = ::FltRegisterFilter(DriverObject, &FilterRegistration, &g_Data.Filter);
 		if (!NT_SUCCESS(status)) {
-			KdPrint((DRIVER_PREFIX "failed to register minifilter (status=%08X)\n", status));
+			SF_LOG_ERROR("failed to register minifilter (status=%08X)\n", status);
 			break;
 		}
 		filterRegistered = true;
@@ -783,7 +783,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 		// D4: ObCallbacks self-protection registration.
 		status = ProtectionRegisterCallbacks(DriverObject);
 		if (!NT_SUCCESS(status)) {
-			KdPrint((DRIVER_PREFIX "failed to register ob callbacks (status=%08X)\n", status));
+			SF_LOG_ERROR("failed to register ob callbacks (status=%08X)\n", status);
 			break;
 		}
 		obRegistered = true;
@@ -792,7 +792,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 		// (Services\secoutfall\Instances — see driver/install.ps1).
 		status = ::FltStartFiltering(g_Data.Filter);
 		if (!NT_SUCCESS(status)) {
-			KdPrint((DRIVER_PREFIX "failed to start filtering (status=%08X)\n", status));
+			SF_LOG_ERROR("failed to start filtering (status=%08X)\n", status);
 			break;
 		}
 
@@ -859,7 +859,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 		return status;
 	}
 
-	KdPrint((DRIVER_PREFIX "DriverEntry completed successfully\n"));
+	SF_LOG_INFO("DriverEntry completed successfully\n");
 
 	return status;
 }
@@ -1066,6 +1066,7 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 			if (!input->Enabled || input->ExtensionsCount == 0) {
 				// Off, or on-for-everything: both are single-switch policies.
 				g_Data.Watch->Apply(input->Enabled != 0, nullptr, 0, nullptr, 0);
+				SF_LOG_INFO("file watch %s\n", input->Enabled ? "enabled (all files)" : "disabled");
 				break;
 			}
 
@@ -1116,6 +1117,7 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 				break;
 			}
 			g_Data.Watch->Apply(true, exts, count, blob, blobBytes);
+			SF_LOG_INFO("file watch enabled (%lu extensions)\n", count);
 			break;
 		}
 
@@ -1139,6 +1141,7 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
 			if (!input->Enabled) {
 				g_Data.DropWatch->Apply(false, nullptr, 0, nullptr, 0);
+				SF_LOG_INFO("drop policy disabled\n");
 				break;
 			}
 
@@ -1214,6 +1217,7 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 				break;
 			}
 			g_Data.DropWatch->Apply(true, exts, count, extBlob, extBytes);
+			SF_LOG_INFO("drop policy applied (%lu extensions)\n", count);
 			break;
 		}
 
@@ -1234,6 +1238,7 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 			}
 			if (!input->Enabled) {
 				ProtectionSetPolicy(false, nullptr);
+				SF_LOG_INFO("protection disabled\n");
 				break;
 			}
 			UNICODE_STRING names;
@@ -1241,8 +1246,11 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 				reinterpret_cast<UCHAR*>(input) + sizeof(ProtectionPolicy));
 			names.Length = static_cast<USHORT>(namesBytes);
 			names.MaximumLength = names.Length;
-			if (!ProtectionSetPolicy(true, &names))
+			if (!ProtectionSetPolicy(true, &names)) {
 				status = STATUS_INSUFFICIENT_RESOURCES;
+			} else {
+				SF_LOG_INFO("protection policy applied (%lu name bytes)\n", namesBytes);
+			}
 			break;
 		}
 
@@ -1270,6 +1278,8 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 			}
 			status = ProtectionSetDeviceSecurity(DeviceObject,
 				reinterpret_cast<UCHAR*>(input) + sizeof(DeviceSecurityBlob), sdBytes);
+			if (NT_SUCCESS(status))
+				SF_LOG_INFO("device security descriptor applied (%lu bytes)\n", sdBytes);
 			break;
 		}
 
@@ -1305,6 +1315,7 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 				status = STATUS_INSUFFICIENT_RESOURCES;
 				break;
 			}
+			SF_LOG_INFO("injection policy %s\n", input->Enabled ? "armed" : "disabled");
 			break;
 		}
 
@@ -1385,12 +1396,24 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 					PushRecord(CONTAINING_RECORD(header, ItemFull<RecordHeader>, Item), true);
 				}
 			}
+			SF_LOG_INFO("selftest flood: %lu records injected\n", input->Count);
 			break;
 		}
 
 		default:
 			status = STATUS_INVALID_DEVICE_REQUEST;
 			break;
+	}
+
+	// One failure line per rejected control request. Hot-path event records
+	// are never logged (the GET_STATS counters own loss reporting), and
+	// sensor handshake denials stay counter-only: an in-VM process with
+	// user access could otherwise spam the debug log at will.
+	auto code = stack->Parameters.DeviceIoControl.IoControlCode;
+	if (!NT_SUCCESS(status) && status != STATUS_INVALID_DEVICE_REQUEST
+		&& code != IOCTL_SECOUTFALL_SENSOR_CHALLENGE
+		&& code != IOCTL_SECOUTFALL_SENSOR_REGISTER) {
+		SF_LOG_WARN("ioctl %08X rejected (status=%08X)\n", code, status);
 	}
 
 	return CompleteRequest(Irp, status, len);

@@ -522,7 +522,9 @@ async fn apply_study_start_timestamp(
                     cause: ClockCause::StudyStart,
                 }),
             );
-            let _ = plugin.deps.broker.publish(Channel::Event, &adjusted).await;
+            if let Err(error) = plugin.deps.broker.publish(Channel::Event, &adjusted).await {
+                tracing::error!(%error, "clock.adjusted (study start) publish failed");
+            }
         }
         Err(error) => {
             tracing::warn!(%error, "study timestamp could not be applied");

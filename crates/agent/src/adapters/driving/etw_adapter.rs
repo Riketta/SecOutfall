@@ -14,6 +14,7 @@
 use std::sync::{
     Arc,
     atomic::{
+        AtomicBool,
         AtomicU64,
         Ordering,
     },
@@ -377,9 +378,21 @@ fn parse_file_io(parser: &Parser<'_, '_>, event: EventType) -> Option<SourceEven
     }
 }
 
+/// Logs once: kernel net events whose SOCKADDR fields never parse usually
+/// mean a layout mismatch — the event is dropped entirely (no zero-filled
+/// record), and this is the only trace of why.
+static NET_ADDR_MISS_LOGGED: AtomicBool = AtomicBool::new(false);
+
 fn parse_tcp_ip(parser: &Parser<'_, '_>, event: EventType) -> Option<SourceEvent> {
-    let source_addr = opt_string(parser, &["saddr", "SourceAddress", "SrcAddr"])?;
-    let dest_addr = opt_string(parser, &["daddr", "DestinationAddress", "DestAddr"])?;
+    let (Some(source_addr), Some(dest_addr)) = (
+        opt_string(parser, &["saddr", "SourceAddress", "SrcAddr"]),
+        opt_string(parser, &["daddr", "DestinationAddress", "DestAddr"]),
+    ) else {
+        if !NET_ADDR_MISS_LOGGED.swap(true, Ordering::Relaxed) {
+            tracing::debug!(?event, "net event dropped: address fields missing (SOCKADDR layout?)");
+        }
+        return None;
+    };
     let connection = TcpConnectionData {
         pid: parser.try_parse::<u32>("PID").ok(),
         source_addr,

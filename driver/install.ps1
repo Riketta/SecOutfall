@@ -26,7 +26,9 @@ if ($Remove) {
     Remove-Item -Path "$instancesKey\$instance" -ErrorAction SilentlyContinue
     Remove-Item -Path $instancesKey -ErrorAction SilentlyContinue
     sc.exe delete $name | Out-Null
-    Write-Host "Removed service '$name' and instance keys."
+    Remove-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Debug Print Filter" `
+        -Name "IHVDRIVER" -ErrorAction SilentlyContinue
+    Write-Host "Removed service '$name', instance keys and the IHVDRIVER print filter override."
     return
 }
 
@@ -47,6 +49,12 @@ Set-ItemProperty -Path $instancesKey -Name "DefaultInstance" -Value $instance
 New-Item -Path "$instancesKey\$instance" -Force | Out-Null
 Set-ItemProperty -Path "$instancesKey\$instance" -Name "Altitude" -Value $altitude
 Set-ItemProperty -Path "$instancesKey\$instance" -Name "Flags" -Value 0 -Type DWord
+
+# Raise the driver's print filter so SF_LOG WARNING/INFO reach DebugView and
+# a kernel debugger (ERROR level prints by default). 0xF = ERROR|WARNING|INFO|TRACE.
+$printFilter = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Debug Print Filter"
+New-Item -Path $printFilter -Force | Out-Null
+Set-ItemProperty -Path $printFilter -Name "IHVDRIVER" -Value 15 -Type DWord
 
 Write-Host "Installed service '$name' (system start, Filter group), instance '$instance' at altitude $altitude."
 if ($Start) {

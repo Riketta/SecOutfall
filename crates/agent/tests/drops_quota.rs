@@ -139,6 +139,7 @@ async fn boot(config: &AgentConfig) -> Harness {
         killer: Arc::new(agent::adapters::driven::killer::fake::FakeProcessKiller::default())
             as Arc<dyn agent::ports::driven::process_killer::ProcessKillerPort>,
         shifter: Arc::clone(&clock) as Arc<dyn agent::ports::driven::clock::ClockShiftPort>,
+        driver_control: None,
         statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
         bus: InMemoryEventBus::new(4096),
         user_actor_nonce: "drops-quota-nonce".to_owned(),

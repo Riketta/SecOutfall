@@ -68,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
             killer: Arc::new(agent::adapters::driven::killer::fake::FakeProcessKiller::default())
                 as Arc<dyn agent::ports::driven::process_killer::ProcessKillerPort>,
             shifter: Arc::clone(&clock) as Arc<dyn agent::ports::driven::clock::ClockShiftPort>,
+            driver_control: None,
             statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
             user_actor_nonce: "sim-nonce".to_owned(),
             seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),

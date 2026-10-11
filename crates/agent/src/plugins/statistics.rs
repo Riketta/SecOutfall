@@ -171,7 +171,7 @@ impl PluginPort for StatisticsPlugin {
 
 #[async_trait]
 impl MiddlewarePluginPort<SandboxEvent, AgentServices> for StatisticsPlugin {
-    async fn pre(&self, event: &mut SandboxEvent, _services: &AgentServices) -> Next {
+    async fn pre(&self, event: &mut SandboxEvent, services: &AgentServices) -> Next {
         match event {
             SandboxEvent::Source(_) | SandboxEvent::SourceDated(_, _) => {
                 self.stats.source_events.fetch_add(1, Ordering::Relaxed);
@@ -198,6 +198,14 @@ impl MiddlewarePluginPort<SandboxEvent, AgentServices> for StatisticsPlugin {
                     screenshots = snapshot.screenshots,
                     "session statistics"
                 );
+                // Driver loss counters ride the same tick: the baseline at the
+                // policy push is otherwise the only sighting of them.
+                if let Some(driver) = &services.driver_control {
+                    match driver.query_stats() {
+                        Ok(stats) => tracing::info!(?stats, "driver stats"),
+                        Err(error) => tracing::debug!(%error, "driver stats query failed"),
+                    }
+                }
             }
             SandboxEvent::PersistTick
             | SandboxEvent::SessionDeadline

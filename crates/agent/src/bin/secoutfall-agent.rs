@@ -94,6 +94,13 @@ fn standalone_config(
 /// client is not. Called AFTER the config is loaded in every config-holding
 /// mode: `log_dir` is a config value, and the pre-subscriber window only
 /// carries startup prints (config errors go to stderr via anyhow).
+///
+/// An unusable log dir degrades to a fallback under `%TEMP%` before it gives
+/// up entirely — a service has no console, so "log nowhere" would mean
+/// exactly that. The degradation itself is logged through tracing (console
+/// layer) once the subscriber is up.
+static TRACING_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn init_tracing(log_dir: Option<&std::path::Path>) {
     use tracing_subscriber::{
         EnvFilter,
@@ -103,25 +110,43 @@ fn init_tracing(log_dir: Option<&std::path::Path>) {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,agent=debug"));
     let console = tracing_subscriber::fmt::layer().with_target(false);
+
+    let mut degradation = None;
+    let dir = log_dir.and_then(|dir| {
+        if std::fs::create_dir_all(dir).is_ok() {
+            return Some(dir.to_path_buf());
+        }
+        let fallback = std::env::temp_dir().join("secoutfall-logs");
+        if std::fs::create_dir_all(&fallback).is_ok() {
+            degradation = Some((dir.display().to_string(), fallback.display().to_string(), false));
+            return Some(fallback);
+        }
+        degradation = Some((dir.display().to_string(), String::new(), true));
+        None
+    });
+
     let registry =
         tracing_subscriber::registry().with(filter).with(console).with(sentry_tracing::layer());
-    let Some(dir) = log_dir else {
+    if let Some(dir) = dir {
+        let appender = tracing_appender::rolling::daily(dir, "secoutfall-agent.log");
+        let (writer, guard) = tracing_appender::non_blocking(appender);
+        // The worker guard is leaked deliberately — process-lifetime transport,
+        // the same choice as the Sentry client guard.
+        std::mem::forget(guard);
+        registry
+            .with(tracing_subscriber::fmt::layer().with_target(false).with_writer(writer))
+            .init();
+    } else {
         registry.init();
-        return;
-    };
-    if let Err(error) = std::fs::create_dir_all(dir) {
-        // The file sink is diagnostics, not the product: log nowhere rather
-        // than refuse to start.
-        eprintln!("log dir {} unavailable ({error}); file logging disabled", dir.display());
-        registry.init();
-        return;
     }
-    let appender = tracing_appender::rolling::daily(dir, "secoutfall-agent.log");
-    let (writer, guard) = tracing_appender::non_blocking(appender);
-    // The worker guard is leaked deliberately — process-lifetime transport,
-    // the same choice as the Sentry client guard.
-    std::mem::forget(guard);
-    registry.with(tracing_subscriber::fmt::layer().with_target(false).with_writer(writer)).init();
+    TRACING_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some((configured, fallback, fatal)) = degradation {
+        if fatal {
+            tracing::error!("log dir {configured} unavailable; file logging disabled");
+        } else {
+            tracing::warn!("log dir {configured} unavailable; file logging moved to {fallback}");
+        }
+    }
 }
 
 /// Activate Sentry egress to the local `GlitchTip` (doctrine: gated by
@@ -255,12 +280,38 @@ async fn production_session_deps(
         shell: production_shell(),
         killer: production_killer(),
         shifter: production_shifter(),
+        driver_control: driver_stats_handle(&config),
         statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
         user_actor_nonce,
         seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         user_actor_pid_gate: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         finalize_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
+}
+
+/// Long-lived driver control handle backing the periodic loss-counter stats
+/// (`None` = disabled, unavailable, or not built with the feature).
+#[cfg(all(windows, feature = "driver"))]
+fn driver_stats_handle(
+    config: &protocol::config::AgentConfig,
+) -> Option<Arc<dyn agent::ports::driven::driver_control::DriverControlPort>> {
+    if !config.driver.enabled {
+        return None;
+    }
+    match agent::adapters::driven::driver_control_device::DriverControlDevice::open() {
+        Ok(device) => Some(Arc::new(device) as _),
+        Err(error) => {
+            tracing::warn!(%error, "driver control device unavailable; periodic stats disabled");
+            None
+        }
+    }
+}
+
+#[cfg(not(all(windows, feature = "driver")))]
+fn driver_stats_handle(
+    _config: &protocol::config::AgentConfig,
+) -> Option<Arc<dyn agent::ports::driven::driver_control::DriverControlPort>> {
+    None
 }
 
 /// Launcher selection by config mechanism (adapter availability per feature).
@@ -414,6 +465,7 @@ async fn simulate() -> anyhow::Result<()> {
         ),
         killer: Arc::new(agent::adapters::driven::killer::fake::FakeProcessKiller::default()),
         shifter: Arc::clone(&clock) as Arc<dyn ClockShiftPort>,
+        driver_control: None,
         statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
         user_actor_nonce: "demo-nonce".to_owned(),
         seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -476,6 +528,7 @@ async fn console(args: &Args) -> anyhow::Result<()> {
                     as Arc<dyn ProcessKillerPort>,
                 shifter: Arc::new(agent::adapters::driven::clock::fake::FakeClock::new(0))
                     as Arc<dyn ClockShiftPort>,
+                driver_control: None,
                 statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
                 user_actor_nonce: nonce.clone(),
                 seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -596,6 +649,7 @@ async fn local(args: &Args) -> anyhow::Result<()> {
         shell: production_shell(),
         killer: production_killer(),
         shifter: production_shifter(),
+        driver_control: driver_stats_handle(&config),
         statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
         user_actor_nonce: generate_nonce(),
         seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -634,10 +688,10 @@ fn attach_etw(session: &agent::app::runtime::RunningSession) -> SourceHandle {
     let task_adapter = Arc::clone(&adapter);
     tokio::spawn(async move {
         if let Err(error) = task_adapter.run(inlet).await {
-            println!("ETW attach failed (admin required?): {error}");
+            tracing::error!(%error, "ETW event source failed (admin required?)");
         }
     });
-    println!("ETW event source attached (kernel trace)");
+    tracing::info!("ETW event source attached (kernel trace)");
     SourceHandle::Etw(adapter)
 }
 
@@ -803,10 +857,10 @@ async fn attach_event_source(
         let task_adapter = Arc::clone(&adapter);
         tokio::spawn(async move {
             if let Err(error) = task_adapter.run(inlet).await {
-                println!("driver event source failed: {error}");
+                tracing::error!(%error, "driver event source failed");
             }
         });
-        println!("driver event source attached (kernel telemetry)");
+        tracing::info!("driver event source attached (kernel telemetry)");
         return SourceHandle::Driver(adapter);
     }
 
@@ -816,7 +870,7 @@ async fn attach_event_source(
     #[cfg(not(any(all(windows, feature = "etw"), all(windows, feature = "driver"))))]
     {
         let _ = (session, config);
-        println!(
+        tracing::warn!(
             "no event source: build with --features etw or --features driver (and run \
              elevated) — nothing will be observed and the run will idle"
         );
@@ -997,11 +1051,25 @@ fn service_main(args: Vec<std::ffi::OsString>) {
     match runtime {
         Ok(rt) => {
             if let Err(error) = rt.block_on(run_service_body(args)) {
-                eprintln!("service body failed: {error}");
+                service_report_failure(&format!("service body failed: {error}"));
             }
         }
-        Err(error) => eprintln!("failed to build tokio runtime: {error}"),
+        Err(error) => service_report_failure(&format!("failed to build tokio runtime: {error}")),
     }
+}
+
+/// The failure boundary for everything the service body cannot report
+/// itself (pre-tracing config/SCM failures included): the Windows Event Log
+/// first — it survives a broken config and a missing console — then the
+/// append-only fallback file, then tracing when the subscriber came up, and
+/// stderr as the last resort.
+#[cfg(all(windows, feature = "service"))]
+fn service_report_failure(message: &str) {
+    agent::adapters::driven::event_log::report_failure(message);
+    if TRACING_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        tracing::error!("{message}");
+    }
+    eprintln!("{message}");
 }
 
 /// Same runtime as console; stop fed by the SCM control handler.

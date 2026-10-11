@@ -190,6 +190,7 @@ async fn assemble_boot(
             agent::adapters::driven::killer::fake::FakeProcessKiller::with_killed_per_name(1),
         ) as Arc<dyn agent::ports::driven::process_killer::ProcessKillerPort>,
         shifter: Arc::clone(&clock) as Arc<dyn agent::ports::driven::clock::ClockShiftPort>,
+        driver_control: None,
         statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
         bus: InMemoryEventBus::new(1024),
         user_actor_nonce: "test-nonce".to_owned(),

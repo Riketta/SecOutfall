@@ -7,6 +7,9 @@ pub mod config_toml;
 #[cfg(all(windows, feature = "driver"))]
 pub mod driver_control_device;
 pub mod driver_control_fake;
+// Pre-tracing service failure reporting (Event Log + fallback file).
+#[cfg(all(windows, feature = "service"))]
+pub mod event_log;
 pub mod killer;
 pub mod launcher;
 // Needs the optional `windows` dep: compiled whenever any windows-using

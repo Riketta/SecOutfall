@@ -179,6 +179,7 @@ async fn boot_with_launcher(
         killer: Arc::clone(&killer)
             as Arc<dyn agent::ports::driven::process_killer::ProcessKillerPort>,
         shifter: Arc::clone(&clock) as Arc<dyn agent::ports::driven::clock::ClockShiftPort>,
+        driver_control: None,
         statistics: Arc::clone(&counters),
         bus: InMemoryEventBus::new(4096),
         user_actor_nonce: "test-nonce".to_owned(),

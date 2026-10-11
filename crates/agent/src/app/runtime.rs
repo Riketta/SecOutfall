@@ -60,6 +60,9 @@ pub struct SessionDeps {
     pub killer: Arc<dyn ProcessKillerPort>,
     /// Clock manipulation (fake timestamps, finalize offsets).
     pub shifter: Arc<dyn ClockShiftPort>,
+    /// Driver control device (`None` = driver source disabled / unavailable /
+    /// not built with the feature).
+    pub driver_control: Option<Arc<dyn crate::ports::driven::driver_control::DriverControlPort>>,
     /// Shared session counters.
     pub statistics: Arc<crate::plugins::statistics::SessionStatistics>,
     /// Per-boot user-actor nonce; shared with the IPC server adapter.
@@ -117,6 +120,7 @@ impl RunningSession {
             seq: Arc::clone(&seq),
             user_actor_pid_gate: Arc::clone(&deps.user_actor_pid_gate),
             finalize_done: Arc::clone(&finalize_done),
+            driver_control: deps.driver_control,
             bus,
         }));
         kernel.boot().await?;

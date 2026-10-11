@@ -27,8 +27,8 @@ killer = ["dep:windows"]
 time_shift = ["dep:windows"]
 # Named-pipe IPC server for the user-actor (Windows-only transport).
 ipc = ["dep:windows"]
-# SCM service mode (windows-service).
-service = ["dep:windows-service"]
+# SCM service mode (windows-service) + Event Log failure reporting.
+service = ["dep:windows-service", "dep:windows"]
 # Kernel-driver integration: event source + control device (Windows-only).
 # The Win32_System_IO feature gates DeviceIoControl in the windows crate.
 driver = ["dep:windows", "windows/Win32_System_IO"]

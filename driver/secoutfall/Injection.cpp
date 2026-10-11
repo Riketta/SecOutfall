@@ -389,6 +389,7 @@ void TryInjectLocked(_In_ InjectionEntry* entry, _In_ ULONG pid) {
 		InterlockedExchange(reinterpret_cast<volatile LONG*>(&current->State),
 			LONG(InjectionState::Failed));
 		InterlockedIncrement64(&g_Data.InjectionsFailed);
+		SF_LOG_WARN("sensor injection attempt failed (pid %lu)\n", pid);
 	}
 }
 
@@ -406,8 +407,10 @@ void InjectionInit() {
 	g_Data.InjectionLedgerLock = new (NonPagedPool) FastMutex;
 	g_Data.InjectionBlocklist = new (NonPagedPool) FileWatch;
 	g_Data.InjectionExtraBlocklist = new (NonPagedPool) FileWatch;
-	if (!g_Data.InjectionLedgerLock || !g_Data.InjectionBlocklist || !g_Data.InjectionExtraBlocklist)
+	if (!g_Data.InjectionLedgerLock || !g_Data.InjectionBlocklist || !g_Data.InjectionExtraBlocklist) {
+		SF_LOG_ERROR("injection init: allocation failed\n");
 		return;
+	}
 
 	g_Data.InjectionBlocklist->Init();
 	g_Data.InjectionExtraBlocklist->Init();
@@ -640,6 +643,9 @@ void InjectionOnImageLoad(_In_ ULONG pid, _In_ PVOID base, _In_ PCUNICODE_STRING
 				if (ResolveLdrLoadDllRva(base, &rva)) {
 					g_Data.LdrLoadDllRva = rva;
 					g_Data.LdrLoadDllRvaResolved = true;
+					SF_LOG_INFO("LdrLoadDll resolved (rva=%lX)\n", rva);
+				} else {
+					SF_LOG_WARN("LdrLoadDll export walk failed on ntdll\n");
 				}
 			}
 		}

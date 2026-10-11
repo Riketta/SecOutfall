@@ -3,6 +3,16 @@
 #define DRIVER_PREFIX "secoutfall: "
 #define DRIVER_TAG 'sfal'
 
+// Release-live logging: KdPrint compiles out without DBG (checked builds
+// only), DbgPrintEx stays active in free builds. ERROR level prints by
+// default; install.ps1 raises the IHVDRIVER Debug Print Filter so WARNING
+// and INFO show in DebugView/WinDbg too. Use on failure paths and one-shot
+// policy announcements ONLY — never per-event: the hot paths report through
+// the GET_STATS counters, not strings.
+#define SF_LOG_ERROR(...) ::DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, DRIVER_PREFIX __VA_ARGS__)
+#define SF_LOG_WARN(...)  ::DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL, DRIVER_PREFIX __VA_ARGS__)
+#define SF_LOG_INFO(...)  ::DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, DRIVER_PREFIX __VA_ARGS__)
+
 #include <fltKernel.h>
 
 #include "FastMutex.h"

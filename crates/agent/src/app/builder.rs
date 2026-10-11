@@ -62,6 +62,7 @@ use crate::{
             ClockShiftPort,
             SystemClockPort,
         },
+        driver_control::DriverControlPort,
         process_killer::ProcessKillerPort,
         process_launcher::ProcessLauncherPort,
         scope_repository::ScopeRepository,
@@ -80,6 +81,9 @@ pub struct AgentServices {
     pub broker: Arc<dyn BrokerPort>,
     /// Time source.
     pub clock: Arc<dyn SystemClockPort>,
+    /// Driver control device (`None` = driver source disabled / unavailable /
+    /// not built with the feature). Backs the periodic loss-counter log.
+    pub driver_control: Option<Arc<dyn DriverControlPort>>,
     /// Shared per-boot wire sequence counter.
     pub seq: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -110,6 +114,9 @@ pub struct AgentDeps {
     pub killer: Arc<dyn ProcessKillerPort>,
     /// Clock manipulation (fake timestamps, finalize offsets).
     pub shifter: Arc<dyn ClockShiftPort>,
+    /// Driver control device (`None` = driver source disabled / unavailable /
+    /// not built with the feature).
+    pub driver_control: Option<Arc<dyn DriverControlPort>>,
     /// Shared session counters (ops/tests read them).
     pub statistics: Arc<SessionStatistics>,
     /// Per-boot user-actor nonce; shared with the IPC server adapter.
@@ -164,6 +171,7 @@ pub fn assemble(deps: AgentDeps) -> AgentKernel {
         scope_repo: Arc::clone(&deps.scope_repo),
         broker: Arc::clone(&deps.broker),
         clock: Arc::clone(&deps.clock),
+        driver_control: deps.driver_control.clone(),
         seq: Arc::clone(&seq),
     };
 

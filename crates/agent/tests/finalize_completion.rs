@@ -108,6 +108,7 @@ async fn finalize_survives_host_teardown() -> Result<(), Box<dyn std::error::Err
         killer: Arc::new(agent::adapters::driven::killer::fake::FakeProcessKiller::default())
             as Arc<dyn agent::ports::driven::process_killer::ProcessKillerPort>,
         shifter: Arc::clone(&clock) as Arc<dyn ClockShiftPort>,
+        driver_control: None,
         statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
         user_actor_nonce: "finalize-race-nonce".to_owned(),
         seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -195,6 +196,7 @@ async fn shutdown_delay_elapses_before_the_request_publishes()
         killer: Arc::new(agent::adapters::driven::killer::fake::FakeProcessKiller::default())
             as Arc<dyn agent::ports::driven::process_killer::ProcessKillerPort>,
         shifter: Arc::clone(&clock) as Arc<dyn ClockShiftPort>,
+        driver_control: None,
         statistics: Arc::new(agent::plugins::statistics::SessionStatistics::default()),
         user_actor_nonce: "finalize-delay-nonce".to_owned(),
         seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
