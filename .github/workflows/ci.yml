@@ -114,36 +114,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The windows-2022 image has no winget (windows-latest does, but its
-      # VS is 18.x — see runs-on above). Bootstrap a PINNED winget release:
-      # the latest bundle needs the Windows App Runtime 1.8 framework,
-      # which the image lacks. This release's dependency zip carries every
-      # framework the bundle needs, so install all x64 packages from it,
-      # then the bundle itself.
-      - name: Ensure winget
+      # SDK + WDK, downloaded straight from Microsoft — the exact installers
+      # winget's own manifests point at, pinned to the matching 2454 build
+      # pair (the WDK requires the same-build SDK; the vcxproj pins the
+      # generic 10.0.26100.0, which any 26100.x satisfies). winget itself is
+      # a Store-licensed AppX the runner cannot launch, so it is not used.
+      # SHA-256 pins come from those same manifests.
+      - name: Install Windows SDK + WDK
         shell: pwsh
         run: |
-          if (Get-Command winget -ErrorAction SilentlyContinue) { exit 0 }
-          # The Appx module is Windows PowerShell 5.1-only; pwsh 7 loads it
-          # through the compatibility shim.
-          Import-Module Appx -UseWindowsPowerShell
           $progressPreference = 'silentlyContinue'
-          $base = "https://github.com/microsoft/winget-cli/releases/download/v1.10.340"
-          Invoke-WebRequest -Uri "$base/DesktopAppInstaller_Dependencies.zip" -OutFile "$env:TEMP\winget-deps.zip"
-          Expand-Archive "$env:TEMP\winget-deps.zip" -DestinationPath "$env:TEMP\winget-deps" -Force
-          Get-ChildItem "$env:TEMP\winget-deps\x64\*.appx" | ForEach-Object { Add-AppxPackage $_.FullName }
-          Invoke-WebRequest -Uri "$base/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle" -OutFile "$env:TEMP\winget.msixbundle"
-          Add-AppxPackage "$env:TEMP\winget.msixbundle"
-          winget --version
-
-      # WDK 10.0.26100 matches the dev box. The WDK installer deploys the
-      # `WindowsKernelModeDriver10.0` MSBuild toolset into the preinstalled
-      # VS2022 (verified locally: VS-integrated under VC/v170 PlatformToolsets).
-      - name: Install Windows SDK + WDK (winget)
-        shell: pwsh
-        run: |
-          winget install --id Microsoft.WindowsSDK.10.0.26100 --exact --silent --accept-package-agreements --accept-source-agreements
-          winget install --id Microsoft.WindowsWDK.10.0.26100 --exact --silent --accept-package-agreements --accept-source-agreements
+          Invoke-WebRequest -Uri "https://download.microsoft.com/download/a/f/2/af287d69-2c0a-4320-9d0f-555d5be767b9/WinSDKSetup.exe" -OutFile "$env:TEMP\WinSDKSetup.exe"
+          Invoke-WebRequest -Uri "https://download.microsoft.com/download/a/0/4/a04a6ea0-d70d-496f-9949-a73e283be017/wdksetup.exe" -OutFile "$env:TEMP\wdksetup.exe"
+          $sdkHash = (Get-FileHash "$env:TEMP\WinSDKSetup.exe" -Algorithm SHA256).Hash
+          if ($sdkHash -ne "2D1C2335BE6639464AC18A98FE55C96E5313608DE4EBFFB3CBA7ED5D113D994D") { throw "SDK installer hash mismatch: $sdkHash" }
+          $wdkHash = (Get-FileHash "$env:TEMP\wdksetup.exe" -Algorithm SHA256).Hash
+          if ($wdkHash -ne "89C8BD4DA6FDF0761E3C3D6A208E40FA5BA10743D84A4F63B6E867A388E07997") { throw "WDK installer hash mismatch: $wdkHash" }
+          $sdk = Start-Process -FilePath "$env:TEMP\WinSDKSetup.exe" -ArgumentList "/q", "/norestart" -Wait -PassThru
+          if ($sdk.ExitCode -notin 0, 3010) { throw "SDK install failed: $($sdk.ExitCode)" }
+          $wdk = Start-Process -FilePath "$env:TEMP\wdksetup.exe" -ArgumentList "/q", "/norestart" -Wait -PassThru
+          if ($wdk.ExitCode -notin 0, 3010) { throw "WDK install failed: $($wdk.ExitCode)" }
 
       - name: Build driver + dumper + wiretest
         shell: pwsh
