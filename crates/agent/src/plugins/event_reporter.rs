@@ -231,20 +231,31 @@ impl PluginPort for EventReporterPlugin {
 #[async_trait]
 impl MiddlewarePluginPort<SandboxEvent, AgentServices> for EventReporterPlugin {
     async fn pre(&self, event: &mut SandboxEvent, _services: &AgentServices) -> Next {
-        if let SandboxEvent::Source(source) = event {
-            if self.verbosity != EventVerbosity::Full {
-                return Next::Continue;
-            }
-            let (study_id, session_id) = identity(&self.state);
-            let envelope = crate::plugins::wire::envelope_from_source(
-                self.clock.now_ms(),
-                next_seq(&self.seq),
-                study_id,
-                session_id,
-                source,
-            );
-            self.publish(envelope).await;
+        if self.verbosity != EventVerbosity::Full {
+            return Next::Continue;
         }
+        let (source, event_ts) = match event {
+            SandboxEvent::Source(source) => (source, None),
+            // Driver events keep their kernel time on the wire: the
+            // envelope's ts is the SOURCE event's fake-clock time, not the
+            // (possibly late) consumption time. Consumers correlate by
+            // study/session, never by wall clock — but ordering within the
+            // wire stream must follow the source's ground truth.
+            SandboxEvent::SourceDated(source, event_ts) => (source, Some(*event_ts)),
+            _ => return Next::Continue,
+        };
+        let (study_id, session_id) = identity(&self.state);
+        let mut envelope = crate::plugins::wire::envelope_from_source(
+            self.clock.now_ms(),
+            next_seq(&self.seq),
+            study_id,
+            session_id,
+            source,
+        );
+        if let Some(event_ts) = event_ts {
+            envelope.ts = event_ts;
+        }
+        self.publish(envelope).await;
         Next::Continue
     }
 }

@@ -79,6 +79,24 @@ pub struct UserActorSupervisorPlugin {
     queue: Mutex<Option<JobQueue<LaunchSpec>>>,
 }
 
+/// Resolve a configured launch path: absolute paths (textually determined —
+/// see [`crate::domain::image_name::is_absolute_path`]) pass through;
+/// relative paths resolve against the agent executable's directory (the
+/// user-actor deploys next to the agent; a service CWD is `System32` — the
+/// review flagged every relative default with the same trap). Falls back to
+/// the configured string when `current_exe` fails (the launch then fails
+/// loudly and is logged, not silently redirected elsewhere).
+#[must_use]
+fn resolve_relative_to_agent_exe(path: &str) -> String {
+    if crate::domain::image_name::is_absolute_path(path) {
+        return path.to_owned();
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(path)))
+        .map_or_else(|| path.to_owned(), |resolved| resolved.to_string_lossy().into_owned())
+}
+
 impl UserActorSupervisorPlugin {
     /// Assemble the plugin.
     #[must_use]
@@ -87,12 +105,14 @@ impl UserActorSupervisorPlugin {
     }
 
     /// Build the launch spec: the configured user-actor binary with the nonce
-    /// argument. No working directory — the binary is expected next to the
-    /// agent or at an absolute path from config.
+    /// argument. No working directory. A RELATIVE configured path resolves
+    /// against the agent executable's directory — the user-actor deploys
+    /// next to the agent, and a service CWD is `System32` (the review found
+    /// every default path with the same trap).
     #[must_use]
     pub fn launch_spec(&self) -> LaunchSpec {
         LaunchSpec {
-            path: self.deps.config.user_actor.path.clone(),
+            path: resolve_relative_to_agent_exe(&self.deps.config.user_actor.path),
             args: vec![NONCE_ARGUMENT.to_owned(), self.deps.nonce.clone()],
             working_dir: None,
         }

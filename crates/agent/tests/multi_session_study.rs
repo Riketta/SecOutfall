@@ -73,6 +73,15 @@ fn base_config(uptimes: Vec<u64>, autoshutdown: bool) -> AgentConfig {
     config.study.autoshutdown = autoshutdown;
     config.target.every_session = true;
     config.drops.extensions = vec![".txt".to_owned()];
+    // The collector creates the drops dir for real: point it at a per-run
+    // temp directory. The default is an absolute Windows path — a test run
+    // on Linux interprets it as a relative path and would litter the
+    // checkout (and on Windows it would write into the real ProgramData
+    // store).
+    config.drops.path = std::env::temp_dir()
+        .join(format!("secoutfall-test-drops-{}", std::process::id()))
+        .display()
+        .to_string();
     // 24 finalizes must not pay the legacy drain delay in real time; the
     // delay itself is proven separately (finalize_completion, paused time).
     config.platform.shutdown_delay_secs = 0;

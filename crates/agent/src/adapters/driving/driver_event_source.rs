@@ -81,8 +81,11 @@ use crate::{
 };
 
 const DRIVER_PATH: PCWSTR = windows::core::w!(r"\\.\secoutfall");
-// CTL_CODE(0x8000, 0x800, METHOD_OUT_DIRECT, FILE_READ_ACCESS)
-const IOCTL_GET_DATA: u32 = (0x8000 << 16) | (1 << 14) | (0x800 << 2) | 1;
+// Pinned in the port module (fixture vs the C compiler's macros) — the old
+// hand-derived constant here used method 1 (IN_DIRECT) where the driver
+// expects OUT_DIRECT, so every drain call failed against the real device.
+use crate::ports::driven::driver_control::codes;
+const IOCTL_GET_DATA: u32 = codes::GET_DATA;
 
 const DRAIN_BUFFER_SIZE: usize = 1 << 20; // 1 MiB
 const DRAIN_INTERVAL: Duration = Duration::from_millis(100);
@@ -160,10 +163,12 @@ impl Drop for DrainContext {
     }
 }
 
-// Maps one decoded record into zero or one SandboxEvent. Records without a
-// taxonomy home (DropCaptured for now) are logged, not dropped silently.
-// Exhaustive mapping table, one arm per wire record — the too-many-lines
-// exception matches the pattern used by `sample_for` in the payload crate.
+// Maps one decoded record into zero or one SandboxEvent (always the
+// `Source` shape; the drain loop re-wraps it as `SourceDated` with the
+// record's kernel time). Records without a taxonomy home (DropCaptured for
+// now) are logged, not dropped silently. Exhaustive mapping table, one arm
+// per wire record — the too-many-lines exception matches the pattern used by
+// `sample_for` in the payload crate.
 #[allow(clippy::too_many_lines)]
 fn map_record(record: &driver_wire::Record, context: &mut DrainContext) -> Option<SandboxEvent> {
     let pid = record.pid();
@@ -230,7 +235,7 @@ fn map_record(record: &driver_wire::Record, context: &mut DrainContext) -> Optio
                 key_name: key_path.clone(),
                 value_name: Some(value_name.clone()),
                 key_handle: None,
-                value_type: Some(format!("REG_{data_type}")),
+                value_type: Some(registry_type_name(*data_type)),
                 data_size: Some(u32::try_from(data.len()).unwrap_or(0)),
             })))
         }
@@ -317,6 +322,38 @@ fn map_record(record: &driver_wire::Record, context: &mut DrainContext) -> Optio
     }
 }
 
+/// FILETIME (100 ns ticks since 1601-01-01 — what the kernel stamps in
+/// `RecordHeader.Time`) to unix milliseconds, saturating. Ticks before the
+/// unix epoch clamp to 0 (a pre-1970 kernel clock is garbage, not history).
+#[must_use]
+fn filetime_to_unix_ms(ticks: u64) -> i64 {
+    const EPOCH_DIFF_100NS: u64 = 11_644_473_600_000_000_000; // 1601→1970
+    const TICKS_PER_MS: u64 = 10_000;
+    ticks
+        .checked_sub(EPOCH_DIFF_100NS)
+        .map_or(0, |unix_ticks| i64::try_from(unix_ticks / TICKS_PER_MS).unwrap_or(i64::MAX))
+}
+
+/// Registry value type names (REG_* from the winreg ABI) — formatting the
+/// raw number put "REG_4"-style strings on the wire.
+#[must_use]
+fn registry_type_name(data_type: u32) -> String {
+    match data_type {
+        1 => "REG_SZ".to_owned(),
+        2 => "REG_EXPAND_SZ".to_owned(),
+        3 => "REG_BINARY".to_owned(),
+        4 => "REG_DWORD".to_owned(),
+        5 => "REG_DWORD_BIG_ENDIAN".to_owned(),
+        6 => "REG_LINK".to_owned(),
+        7 => "REG_MULTI_SZ".to_owned(),
+        8 => "REG_RESOURCE_LIST".to_owned(),
+        9 => "REG_FULL_RESOURCE_DESCRIPTOR".to_owned(),
+        10 => "REG_RESOURCE_REQUIREMENTS_LIST".to_owned(),
+        11 => "REG_QWORD".to_owned(),
+        other => format!("REG_{other}"),
+    }
+}
+
 #[async_trait]
 impl crate::ports::driving::event_source::EventSourcePort for DriverEventSourceAdapter {
     async fn run(&self, inlet: Arc<dyn EventInletPort<SandboxEvent>>) -> Result<(), SourceError> {
@@ -340,29 +377,62 @@ impl crate::ports::driving::event_source::EventSourcePort for DriverEventSourceA
             if ok.is_err() {
                 return Err(SourceError::Stopped("GET_DATA failed".to_owned()));
             }
-            if returned as usize >= driver_wire::HEADER_SIZE {
-                // The decoder is golden-pinned and panic-free on hostile
-                // bytes; a malformed batch costs the batch, never the run.
-                match driver_wire::decode_all(buffer.get(..returned as usize).unwrap_or(&buffer)) {
-                    Ok(records) => {
-                        for record in &records {
-                            // Lazy clock offset: the first drained record
-                            // anchors real→fake; constant for the session.
-                            if !context.offset_captured {
-                                #[allow(clippy::cast_possible_wrap)] // kernel time fits i64
-                                let kernel_time = record.time() as i64;
-                                let offset = self.clock.now_ms().saturating_sub(kernel_time);
-                                self.clock_offset_ms.store(offset, Ordering::Relaxed);
-                                context.offset_captured = true;
-                            }
-                            if let Some(event) = map_record(record, &mut context) {
-                                inlet.accept(event).await;
-                            }
+            // The decoder is golden-pinned and panic-free on hostile bytes.
+            // Per-record walk with drop+count: one malformed record costs
+            // ITSELF (plus, when its size header is unusable, the rest of
+            // the batch — there is no trustworthy boundary to resume from).
+            // Never the whole 1 MiB drain, and never the run. The old
+            // all-or-nothing `decode_all` turned one degenerate record into
+            // mass telemetry loss.
+            // `min` clamps a hostile/oversized `returned` to the buffer —
+            // the API contract says it fits, but the lint cannot see that.
+            let mut rest: &[u8] =
+                buffer.get(..(returned as usize).min(buffer.len())).unwrap_or(&[]);
+            let mut decoded: usize = 0;
+            let mut skipped: usize = 0;
+            while !rest.is_empty() {
+                let size = driver_wire::record_size(rest);
+                match (driver_wire::decode(rest), size) {
+                    (Ok(record), Ok(size)) => {
+                        // Lazy clock offset: the first drained record anchors
+                        // real→fake; constant for the boot.
+                        if !context.offset_captured {
+                            let offset = self
+                                .clock
+                                .now_ms()
+                                .saturating_sub(filetime_to_unix_ms(record.time()));
+                            self.clock_offset_ms.store(offset, Ordering::Relaxed);
+                            context.offset_captured = true;
                         }
+                        let event_ts = filetime_to_unix_ms(record.time())
+                            .saturating_add(self.clock_offset_ms.load(Ordering::Relaxed));
+                        if let Some(SandboxEvent::Source(source_event)) =
+                            map_record(&record, &mut context)
+                        {
+                            inlet.accept(SandboxEvent::SourceDated(source_event, event_ts)).await;
+                        }
+                        rest = rest.get(size..).unwrap_or_default();
+                        decoded += 1;
                     }
-                    Err(error) => {
-                        // A malformed batch costs the batch, never the run.
-                        tracing::warn!(?error, "driver drain: undecodable batch skipped");
+                    // Unusable size: no trustworthy boundary to the next
+                    // record — drop the rest of the batch.
+                    (_, Err(_)) => {
+                        skipped += 1;
+                        tracing::warn!(
+                            decoded,
+                            skipped,
+                            rest = rest.len(),
+                            "driver drain: unusable record header, dropping batch remainder"
+                        );
+                        break;
+                    }
+                    // Decodable size but rejected payload: skip exactly this
+                    // record (the size header still describes a trustworthy
+                    // boundary) and keep going.
+                    (Err(error), Ok(size)) => {
+                        skipped += 1;
+                        tracing::warn!(?error, size, "driver drain: record skipped");
+                        rest = rest.get(size..).unwrap_or_default();
                     }
                 }
             }

@@ -42,13 +42,15 @@ autoshutdown = false
 # Extra processes killed at every finalization.
 processes_to_terminate = ["WINWORD", "POWERPNT", "EXCEL", "OfficeClickToRun"]
 # Scope DB location (atomic-write JSON; carries the study id across reboots).
-scope_path = "scope.json"
+# ABSOLUTE: a session-0 service's CWD is System32 — a relative path would
+# silently write state there.
+scope_path = 'C:\ProgramData\SecOutfall\scope.json'
 # Ransomware canary files; reserved (not yet enforced).
 files_to_validate = []
 
 [drops]
-# Local copy directory.
-path = "Drops"
+# Local copy directory (absolute — see scope_path).
+path = 'C:\ProgramData\SecOutfall\Drops'
 # Extension filter. `*` = everything, `none` = extensionless files, entries
 # otherwise match case-insensitively with an optional leading dot.
 extensions = [".txt", ".exe", ".dll", ".bat", ".ps1", ".py", ".js", ".vbs", "none"]
@@ -63,8 +65,9 @@ limit_per_session = 30
 # upload_uri = "http://127.0.0.1:8085"
 
 [screenshots]
-# Local save directory for received screenshots (agent side).
-path = "Screenshots"
+# Local save directory for received screenshots (agent side; absolute — see
+# scope_path).
+path = 'C:\ProgramData\SecOutfall\Screenshots'
 # Save received screenshots locally.
 save = false
 # Max screenshots per session; also the capture quota pushed to the user

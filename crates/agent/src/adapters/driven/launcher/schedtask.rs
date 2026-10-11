@@ -121,6 +121,10 @@ async fn run_schtasks(arguments: &[&str]) -> Result<(), LaunchError> {
         tokio::process::Command::new("schtasks")
             .args(arguments)
             .stdin(std::process::Stdio::null())
+            // The timeout drops this future; without kill_on_drop the hung
+            // schtasks survives as an orphan (the review found the old code
+            // abandoning it).
+            .kill_on_drop(true)
             .output()
             .await
     })

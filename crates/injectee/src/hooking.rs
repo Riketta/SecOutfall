@@ -46,12 +46,16 @@ pub(crate) fn get_module_symbol_address(
 }
 
 /// Installs every hook in `hooks`, collecting all failures before reporting.
+///
+/// SILENT by design: the DLL runs inside the analyzed process — a GUI/service
+/// host has no console, and `println!`/`eprintln!` PANIC on a failed write
+/// (the review found both here). The failure list flows back to the sensor's
+/// own reporting; nothing may print.
 pub(crate) fn install_all(hooks: &[fn() -> anyhow::Result<()>]) -> anyhow::Result<()> {
     let mut failures = Vec::new();
 
     for hook in hooks {
         if let Err(err) = hook() {
-            eprintln!("{err:#}");
             failures.push(err);
         }
     }
@@ -106,12 +110,12 @@ macro_rules! hook {
         }
 
         /// Installs the hook, or does nothing when it is already active.
+        /// Silent by design — printing inside the analyzed process panics on
+        /// a missing console (see `install_all`).
         pub(crate) fn install() -> anyhow::Result<()> {
             if $original.is_enabled() {
                 return Ok(());
             }
-
-            println!("Hooking {}!{}.", $module, stringify!($symbol));
 
             unsafe {
                 let address = $crate::hooking::get_module_symbol_address(

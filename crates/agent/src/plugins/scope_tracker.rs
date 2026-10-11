@@ -143,25 +143,24 @@ impl PluginPort for ScopeTrackerPlugin {
     }
 }
 
-#[async_trait]
-impl MiddlewarePluginPort<SandboxEvent, crate::app::builder::AgentServices> for ScopeTrackerPlugin {
-    async fn pre(
-        &self,
-        event: &mut SandboxEvent,
-        _services: &crate::app::builder::AgentServices,
-    ) -> Next {
-        // Expectations first: this is what makes the launcher's
-        // publish-before-create ordering airtight for the event below.
-        self.drain_expectations();
-        match event {
-            SandboxEvent::Source(SourceEvent::ProcessStarted(data)) => {
+impl ScopeTrackerPlugin {
+    /// Source-event membership + drop detection + the scoring bridge. Shared
+    /// by both stamping kinds (`Source` / `SourceDated`).
+    fn handle_source(&self, source: &SourceEvent) {
+        match source {
+            SourceEvent::ProcessStarted(data) => {
                 let now = self.clock.now_ms();
                 let entered = {
                     let mut state = self.state.lock();
                     self.tracker.lock().process_entered(&mut state, data, now)
                 };
                 if entered {
-                    if data.name.eq_ignore_ascii_case(&self.target_name) {
+                    // Unicode-aware normalization on BOTH sides — the target
+                    // match and scope membership must agree for every image
+                    // name, not only the ASCII ones.
+                    if crate::domain::scope::normalize_image_name(&data.name)
+                        == crate::domain::scope::normalize_image_name(&self.target_name)
+                    {
                         self.bus.publish(AgentBusEvent::TargetLaunched { name: data.name.clone() });
                     }
                     self.bus.publish(AgentBusEvent::ProcessEnteredScope {
@@ -170,7 +169,7 @@ impl MiddlewarePluginPort<SandboxEvent, crate::app::builder::AgentServices> for 
                     });
                 }
             }
-            SandboxEvent::Source(SourceEvent::ProcessStopped(data)) => {
+            SourceEvent::ProcessStopped(data) => {
                 let now = self.clock.now_ms();
                 let was_scoped = {
                     let mut state = self.state.lock();
@@ -187,7 +186,7 @@ impl MiddlewarePluginPort<SandboxEvent, crate::app::builder::AgentServices> for 
                     }
                 }
             }
-            SandboxEvent::Source(SourceEvent::FileWritten(data)) => {
+            SourceEvent::FileWritten(data) => {
                 let mut state = self.state.lock();
                 let observed = self.tracker.lock().drop_observed(&mut state, data, &self.filter);
                 drop(state);
@@ -195,7 +194,7 @@ impl MiddlewarePluginPort<SandboxEvent, crate::app::builder::AgentServices> for 
                     self.bus.publish(AgentBusEvent::DropObserved { path, pid: Some(data.pid) });
                 }
             }
-            SandboxEvent::Source(SourceEvent::BehaviorCall(data)) => {
+            SourceEvent::BehaviorCall(data) => {
                 // Scoring-v2 bridge: only signal apis of SCOPED processes cross
                 // onto the bus (high-rate hooked calls and unscoped noise are
                 // filtered here, before they can flood the bus).
@@ -211,9 +210,7 @@ impl MiddlewarePluginPort<SandboxEvent, crate::app::builder::AgentServices> for 
                     }
                 }
             }
-            SandboxEvent::Source(
-                SourceEvent::FileClosed(data) | SourceEvent::FileCleanedUp(data),
-            ) => {
+            SourceEvent::FileClosed(data) | SourceEvent::FileCleanedUp(data) => {
                 let state = self.state.lock();
                 let closed = self.tracker.lock().drop_closed(&state, data);
                 drop(state);
@@ -221,7 +218,29 @@ impl MiddlewarePluginPort<SandboxEvent, crate::app::builder::AgentServices> for 
                     self.bus.publish(AgentBusEvent::DropClosed { path });
                 }
             }
+            // Non-membership telemetry (image loads, registry, network,
+            // protection) is forwarded by the reporter — the tracker only
+            // consumes what it detects on.
             _ => {}
+        }
+    }
+}
+
+#[async_trait]
+impl MiddlewarePluginPort<SandboxEvent, crate::app::builder::AgentServices> for ScopeTrackerPlugin {
+    async fn pre(
+        &self,
+        event: &mut SandboxEvent,
+        _services: &crate::app::builder::AgentServices,
+    ) -> Next {
+        // Expectations first: this is what makes the launcher's
+        // publish-before-create ordering airtight for the event below.
+        self.drain_expectations();
+        // ETW events are stamped at consumption; driver events carry their
+        // own (offset-mapped) time — membership, drop detection and scoring
+        // treat both identically.
+        if let Some(source) = event.source_event() {
+            self.handle_source(source);
         }
         Next::Continue
     }

@@ -137,6 +137,20 @@ public:
 		}
 	}
 
+	// Teardown for ProtectionCleanup. Pool-tag memory is NOT reclaimed at
+	// driver unload (the old comment claimed otherwise) — without this walk,
+	// entries for still-running protected processes leaked nonpaged pool
+	// until reboot. Undo registration happens in the caller, so no callback
+	// can race this.
+	void Clear() {
+		AutoLock<FastMutex> locker(_lock);
+		while (!IsListEmpty(&_head)) {
+			auto link = RemoveHeadList(&_head);
+			ExFreePool(CONTAINING_RECORD(link, Entry, Link));
+		}
+		_count = 0;
+	}
+
 	bool Contains(_In_ ULONG pid) {
 		AutoLock<FastMutex> locker(_lock);
 		return FindLocked(pid) != nullptr;
@@ -184,8 +198,12 @@ OB_PREOP_CALLBACK_STATUS ObPreOperation(_In_ PVOID registrationContext,
 	if (!isProcess && !isThread)
 		return OB_PREOP_SUCCESS;
 
-	auto targetPid = isProcess ? HandleToULong(PsGetProcessId(static_cast<PEPROCESS>(information->Object)))
-		: HandleToULong(PsGetThreadId(static_cast<PETHREAD>(information->Object)));
+	// The protected table holds PROCESS pids. A thread handle must resolve
+	// to its OWNING process for the lookup — the review found the raw TID
+	// compared against the pid table, so thread protection never fired.
+	auto targetPid = isProcess
+		? HandleToULong(PsGetProcessId(static_cast<PEPROCESS>(information->Object)))
+		: HandleToULong(PsGetThreadProcessId(static_cast<PETHREAD>(information->Object)));
 	if (!g_Table->Contains(targetPid))
 		return OB_PREOP_SUCCESS; // not ours
 
@@ -262,8 +280,7 @@ void ProtectionCleanup() {
 		g_Names = nullptr;
 	}
 	if (g_Table) {
-		// Entries die with the pool tag at unload (process exits also clean
-		// them incrementally); the list head needs no teardown.
+		g_Table->Clear();
 		delete g_Table;
 		g_Table = nullptr;
 	}

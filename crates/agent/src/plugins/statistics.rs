@@ -173,7 +173,7 @@ impl PluginPort for StatisticsPlugin {
 impl MiddlewarePluginPort<SandboxEvent, AgentServices> for StatisticsPlugin {
     async fn pre(&self, event: &mut SandboxEvent, _services: &AgentServices) -> Next {
         match event {
-            SandboxEvent::Source(_) => {
+            SandboxEvent::Source(_) | SandboxEvent::SourceDated(_, _) => {
                 self.stats.source_events.fetch_add(1, Ordering::Relaxed);
             }
             SandboxEvent::ScreenshotReceived(_) => {
@@ -204,7 +204,6 @@ impl MiddlewarePluginPort<SandboxEvent, AgentServices> for StatisticsPlugin {
             | SandboxEvent::ServiceStop => {
                 self.stats.lifecycle_events.fetch_add(1, Ordering::Relaxed);
             }
-            SandboxEvent::InteractiveSessionReady => {}
         }
         Next::Continue
     }

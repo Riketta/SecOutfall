@@ -863,8 +863,14 @@ async fn etw_probe() -> anyhow::Result<()> {
     #[async_trait::async_trait]
     impl kernel::app::api_ports::EventInletPort<SandboxEvent> for RecordingInlet {
         async fn accept(&self, event: SandboxEvent) {
-            if let SandboxEvent::Source(source) = event {
-                println!("  {} :: {source:?}", source.event_type());
+            match event {
+                SandboxEvent::Source(source) => {
+                    println!("  {} :: {source:?}", source.event_type());
+                }
+                SandboxEvent::SourceDated(source, event_ts) => {
+                    println!("  {} @ {event_ts} :: {source:?}", source.event_type());
+                }
+                _ => {}
             }
         }
     }

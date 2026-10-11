@@ -178,6 +178,20 @@ impl BrokerPort for NatsBrokerAdapter {
             }
         }
     }
+
+    async fn flush(&self) -> Result<(), BrokerError> {
+        // Round-trip with the server: everything published before this point
+        // has been acknowledged server-side. Called once after finalize, so
+        // the session-ender/reboot request cannot die in the client queue.
+        match self.client.flush().await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.loss.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(%error, "NATS flush failed");
+                Err(BrokerError::ConnectionLost)
+            }
+        }
+    }
 }
 
 #[cfg(test)]

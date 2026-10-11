@@ -283,72 +283,87 @@ bool QueueLoadLibraryApc(_In_ PEPROCESS process, _In_ PETHREAD thread,
 	return ok;
 }
 
-// Attempts the injection for an entry whose thread and ntdll base are both
-// known. Called WITHOUT the ledger lock but with extra references taken:
-// thread (one extra), process (looked up by the caller).
-void TryInject(_In_ InjectionEntry* entry, _In_ ULONG pid, _In_ PETHREAD thread,
-	_In_ PEPROCESS process) {
-	if (!g_Data.LdrLoadDllRvaResolved || entry->NtdllBase == nullptr
-		|| g_Data.SensorDllPath.Buffer == nullptr) {
-		return;
+// Queues the sensor-load APC for a ledger entry SNAPSHOT: thread + ntdll
+// base are copies taken under the lock. Runs WITHOUT the ledger lock and
+// never touches the entry — a concurrent process exit (RemoveLedgerEntryLocked
+// ExFreePools the entry) must not turn this into a use-after-free.
+// Caller holds: one extra thread reference, one process reference.
+// IRQL <= APC_LEVEL (QueueLoadLibraryApc attaches to the target process).
+bool TryInjectSnapshot(_In_ PETHREAD thread, _In_ PEPROCESS process,
+	_In_ PVOID ntdllBase) {
+	if (!g_Data.LdrLoadDllRvaResolved || g_Data.SensorDllPath.Buffer == nullptr) {
+		return false;
 	}
-
-	auto ok = QueueLoadLibraryApc(process, thread, &g_Data.SensorDllPath,
-		entry->NtdllBase, g_Data.LdrLoadDllRva);
-
-	AutoLock<FastMutex> locker(*g_Data.InjectionLedgerLock);
-	// The entry may have been removed (process exit) during the injection;
-	// re-find instead of touching the stale pointer.
-	auto current = FindLedgerEntryLocked(pid);
-	if (current == nullptr)
-		return;
-	if (ok) {
-		InterlockedExchange(reinterpret_cast<volatile LONG*>(&current->State),
-			LONG(InjectionState::Injected));
-		InterlockedIncrement64(&g_Data.InjectionsQueued);
-	} else {
-		InterlockedExchange(reinterpret_cast<volatile LONG*>(&current->State),
-			LONG(InjectionState::Failed));
-		InterlockedIncrement64(&g_Data.InjectionsFailed);
-	}
+	return QueueLoadLibraryApc(process, thread, &g_Data.SensorDllPath,
+		ntdllBase, g_Data.LdrLoadDllRva);
 }
 
-// Takes the extra references and fires the injection attempt from a safe
-// (lock-free) context. Must be called WITH the ledger lock held.
+// Fires the injection attempt from the notify hooks. Must be called WITH the
+// ledger lock held; temporarily RELEASES it. Two hard contract rules the
+// review found violated here:
+// 1. PsLookupProcessByProcessId is PASSIVE_LEVEL-only, and this function
+//    runs at DISPATCH under the FastMutex — Driver Verifier bugcheck class.
+// 2. After dropping the lock the raw entry pointer is UNPROTECTED: a
+//    concurrent process exit frees it. Everything the APC needs is snapshotted
+//    into locals BEFORE the unlock, and the post-attempt state fixup re-finds
+//    the LIVE entry instead of dereferencing the stale one.
 void TryInjectLocked(_In_ InjectionEntry* entry, _In_ ULONG pid) {
 	if (entry->InitialThread == nullptr || entry->NtdllBase == nullptr
 		|| !g_Data.LdrLoadDllRvaResolved || !g_Data.InjectionEnabled
 		|| g_Data.SensorDllPath.Buffer == nullptr)
 		return;
 
-	// Transition Pending* -> Injected marks the attempt; rollback on failure
-	// lets a later trigger retry (e.g. ntdll RVA resolved late).
+	// Transition Pending* -> Injected claims the attempt; the fixup below
+	// rolls it back on failure so a later trigger can retry.
 	auto previous = InterlockedCompareExchange(
 		reinterpret_cast<volatile LONG*>(&entry->State),
 		LONG(InjectionState::Injected), LONG(InjectionState::PendingNtdll));
 	if (previous != LONG(InjectionState::PendingNtdll))
 		return;
 
+	// Snapshot under the lock: thread reference + ntdll base. The ENTRY has
+	// no extra reference — after Unlock it may be freed (that is exactly
+	// why this copy exists).
 	ObReferenceObject(entry->InitialThread);
 	auto thread = entry->InitialThread;
-	PEPROCESS process = nullptr;
-	auto status = ::PsLookupProcessByProcessId(reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid)), &process);
-	if (!NT_SUCCESS(status)) {
-		ObDereferenceObject(thread);
-		InterlockedExchange(reinterpret_cast<volatile LONG*>(&entry->State),
-			LONG(InjectionState::PendingNtdll));
-		return;
-	}
-	// The injection cannot run under the ledger lock (attach is APC-max):
-	// drop it, attempt, and re-lock for the state fixup. The extra thread +
-	// process references taken above keep the pointers alive throughout.
+	auto ntdllBase = entry->NtdllBase;
+
+	// PASSIVE_LEVEL from here: safe for PsLookupProcessByProcessId and for
+	// the process attach inside QueueLoadLibraryApc.
 	g_Data.InjectionLedgerLock->Unlock();
 
-	TryInject(entry, pid, thread, process);
+	PEPROCESS process = nullptr;
+	auto status = ::PsLookupProcessByProcessId(
+		reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid)), &process);
+	auto lookupOk = NT_SUCCESS(status);
+	auto ok = lookupOk && TryInjectSnapshot(thread, process, ntdllBase);
 
-	ObDereferenceObject(process);
+	if (process != nullptr)
+		ObDereferenceObject(process);
 	ObDereferenceObject(thread);
+
+	// State fixup on the LIVE entry (the stale pointer may already be freed
+	// — or, worst case, the pid reused by a fresh entry; either way the
+	// re-find decides, never the stale pointer).
 	g_Data.InjectionLedgerLock->Lock();
+	auto current = FindLedgerEntryLocked(pid);
+	if (current == nullptr)
+		return;
+	if (ok) {
+		InterlockedIncrement64(&g_Data.InjectionsQueued);
+	} else if (!lookupOk) {
+		// Process already gone (or unknown): retryable — a later trigger is
+		// meaningless for THIS process, but keeping Pending preserves the
+		// pre-review claim semantics and the counters stay honest.
+		InterlockedExchange(reinterpret_cast<volatile LONG*>(&current->State),
+			LONG(InjectionState::PendingNtdll));
+	} else {
+		// APC queue failure is terminal for the attempt (matches the old
+		// Failed state); Failed is scored as a sensor-degradation signal.
+		InterlockedExchange(reinterpret_cast<volatile LONG*>(&current->State),
+			LONG(InjectionState::Failed));
+		InterlockedIncrement64(&g_Data.InjectionsFailed);
+	}
 }
 
 } // namespace

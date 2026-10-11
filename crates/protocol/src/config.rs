@@ -148,7 +148,11 @@ impl Default for StudyConfig {
                 "EXCEL".to_owned(),
                 "OfficeClickToRun".to_owned(),
             ],
-            scope_path: "scope.json".to_owned(),
+            // Absolute: a session-0 service's working directory is
+            // `C:\Windows\System32` — a relative default silently wrote
+            // state there (the review found the dev-host `scope.json` at the
+            // repo root as the same trap's other face).
+            scope_path: "C:\\ProgramData\\SecOutfall\\scope.json".to_owned(),
             files_to_validate: Vec::new(),
         }
     }
@@ -174,7 +178,8 @@ pub struct DropsConfig {
 impl Default for DropsConfig {
     fn default() -> Self {
         Self {
-            path: "Drops".to_owned(),
+            // Absolute for the same System32-CWD reason as `scope_path`.
+            path: "C:\\ProgramData\\SecOutfall\\Drops".to_owned(),
             extensions: [".txt", ".exe", ".dll", ".bat", ".ps1", ".py", ".js", ".vbs", "none"]
                 .iter()
                 .map(ToString::to_string)
@@ -203,7 +208,13 @@ pub struct ScreenshotsConfig {
 
 impl Default for ScreenshotsConfig {
     fn default() -> Self {
-        Self { path: "Screenshots".to_owned(), save: false, max_per_session: 30, upload_uri: None }
+        // Absolute like every other state path (System32-CWD trap).
+        Self {
+            path: "C:\\ProgramData\\SecOutfall\\Screenshots".to_owned(),
+            save: false,
+            max_per_session: 30,
+            upload_uri: None,
+        }
     }
 }
 
@@ -516,18 +527,18 @@ mod tests {
         uptimes = [6000, 6000, 6000]
         autoshutdown = false
         processes_to_terminate = ["notepad", "CalculatorApp"]
-        scope_path = "scope.json"
+        scope_path = 'C:\\ProgramData\\SecOutfall\\scope.json'
         files_to_validate = []
 
         [drops]
-        path = "Drops"
+        path = 'C:\\ProgramData\\SecOutfall\\Drops'
         extensions = [".txt", ".ps1", ".bat", ".exe", ".dll", ".cld", ".dat", ".cvd"]
         max_size = 20971520
         limit_per_session = 30
         upload_uri = "http://127.0.0.1:8085"
 
         [screenshots]
-        path = "Screenshots"
+        path = 'C:\\ProgramData\\SecOutfall\\Screenshots'
         save = false
         max_per_session = 100
         upload_uri = "http://127.0.0.1:8080"

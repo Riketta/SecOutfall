@@ -34,12 +34,17 @@ use protocol::{
 /// driven ports.
 #[derive(Debug, Clone)]
 pub enum SandboxEvent {
-    /// Source telemetry (ETW today, driver later, scripted feed in simulation).
+    /// Source telemetry stamped at consumption (ETW today, scripted feeds in
+    /// simulation) — the wire envelope carries the consumption time.
     Source(SourceEvent),
+    /// Source telemetry with the SOURCE's own event time, already mapped to
+    /// the fake clock's unix-ms (driver records are kernel-stamped; the
+    /// adapter applies the real→fake offset at drain). The wire envelope
+    /// carries THIS time, not the consumption time — driver events keep
+    /// their ground-truth ordering even when a drain batch is late.
+    SourceDated(SourceEvent, i64),
     /// The current session's scheduled uptime elapsed.
     SessionDeadline,
-    /// An interactive session was detected (marker process seen).
-    InteractiveSessionReady,
     /// The service/console host asked the agent to stop.
     ServiceStop,
     /// A decoded screenshot frame arrived from the user-actor (IPC v1).
@@ -48,6 +53,18 @@ pub enum SandboxEvent {
     PersistTick,
     /// Periodic statistics tick.
     StatsTick,
+}
+
+impl SandboxEvent {
+    /// The source event, when this is source telemetry of either stamping
+    /// kind — membership, drop detection and scoring treat both identically.
+    #[must_use]
+    pub fn source_event(&self) -> Option<&SourceEvent> {
+        match self {
+            Self::Source(event) | Self::SourceDated(event, _) => Some(event),
+            _ => None,
+        }
+    }
 }
 
 /// One screenshot frame handed over by the user-actor.

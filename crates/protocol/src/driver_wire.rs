@@ -510,7 +510,13 @@ pub fn decode(buf: &[u8]) -> Result<Record, DecodeError> {
 fn min_size(kind: RecordKind) -> usize {
     match kind {
         RecordKind::ProcessExited => 48,
-        RecordKind::ProcessCreated | RecordKind::FileRenamed | RecordKind::DropCaptured => 60,
+        // FileRenamedFixed is 56 (header + 4×u16): the driver legitimately
+        // emits a 56-byte record when BOTH name lookups failed — a 60-byte
+        // minimum here rejected it and (all-or-nothing decode) poisoned the
+        // whole drain batch. The committed emit_minimal-rename.bin fixture
+        // pins exactly that shape.
+        RecordKind::ProcessCreated | RecordKind::DropCaptured => 60,
+        RecordKind::FileRenamed => 56,
         RecordKind::ThreadCreated
         | RecordKind::ThreadExited
         | RecordKind::RegistryKeyCreated
@@ -691,8 +697,15 @@ pub fn decode_all(buf: &[u8]) -> Result<Vec<Record>, DecodeError> {
 }
 
 // The declared size of the record at the front of `buf` (assumes `decode`
-// already validated the header).
-fn record_size(buf: &[u8]) -> Result<usize, DecodeError> {
+/// Wire extent in bytes of the record at the START of `buf` (its `Size`
+/// header field, validated against the buffer). The driver drain loop uses
+/// this to skip a rejected-but-sizeable record (drop+count) instead of
+/// discarding the whole batch.
+///
+/// # Errors
+/// [`DecodeError::BadSize`] when the declared size is smaller than the
+/// header or larger than the available buffer.
+pub fn record_size(buf: &[u8]) -> Result<usize, DecodeError> {
     let size_raw = u32_at(buf, 40)?;
     let size = size_raw as usize;
     if size < HEADER_SIZE || size > buf.len() {
@@ -711,6 +724,19 @@ pub fn golden_fixture_path() -> PathBuf {
         .join("driver")
         .join("tests")
         .join("golden_v2.bin")
+}
+
+/// Path of the degenerate-rename fixture: a 56-byte `FileRenamed` record
+/// with both strings absent — the exact shape the driver emits when both
+/// name lookups fail (`wiretest --emit minimal-rename`).
+#[must_use]
+pub fn minimal_rename_fixture_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("driver")
+        .join("tests")
+        .join("emit_minimal-rename.bin")
 }
 
 #[cfg(test)]
@@ -886,6 +912,31 @@ mod tests {
         assert_eq!(*arg1, 0x1234);
         assert_eq!(*arg2, 0x5678);
         assert_eq!(*arg3, 0x9ABC);
+    }
+
+    /// The degenerate rename the review found: the driver emits a 56-byte
+    /// record when both name lookups fail; the old 60-byte minimum rejected
+    /// it, and `decode_all`'s all-or-nothing walk then dropped the whole batch.
+    /// The committed fixture pins the exact bytes.
+    #[test]
+    fn minimal_rename_record_decodes_with_empty_paths() {
+        let bytes = std::fs::read(minimal_rename_fixture_path()).expect(
+            "committed fixture must exist — regenerate with wiretest --emit minimal-rename",
+        );
+        assert_eq!(bytes.len(), 56, "FileRenamedFixed is 56 on the wire");
+        let records = decode_all(&bytes).expect("the degenerate rename must decode");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind(), RecordKind::FileRenamed);
+        assert_eq!(records[0].pid(), 1004);
+        let Payload::FileRenamed { old_path, new_path } = records[0].payload() else {
+            panic!("expected a FileRenamed payload");
+        };
+        assert!(old_path.is_empty() && new_path.is_empty());
+        assert_ne!(
+            records[0].trunc_flags() & TRUNC_OLD_PATH,
+            0,
+            "both-absent names are flagged as truncated prefixes"
+        );
     }
 
     #[test]

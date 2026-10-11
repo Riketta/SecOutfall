@@ -34,12 +34,43 @@ pub fn extension_of(path: &str) -> Option<&str> {
     component.get(dot + 1..)
 }
 
+/// Is this configured path absolute ON WINDOWS (the only runtime that
+/// consumes it)? Textual by the same doctrine as [`image_name`]:
+/// `std::path::Path::is_absolute` is host-dependent — on Unix it answers
+/// false for `C:\Tools\tool.exe`, which once made a resolver prepend a
+/// build directory to an already-absolute config path. UNC roots (`\\server`)
+/// and drive letters (`C:`) count; a leading `/` counts too (normalized NT
+/// forms and cross-host tests).
+#[must_use]
+pub fn is_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('\\') || path.starts_with('/') || bytes.get(1) == Some(&b':')
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         extension_of,
         image_name,
+        is_absolute_path,
     };
+
+    #[test]
+    fn windows_absolute_paths_are_recognized_on_any_host() {
+        // The resolver regression: `Path::is_absolute` answered false for
+        // drive-letter paths on Unix and the launch path got mangled.
+        assert!(is_absolute_path("C:\\Tools\\user-actor.exe"));
+        assert!(is_absolute_path("c:/tools/user-actor.exe"));
+        assert!(is_absolute_path(r"\\??\C:\x.dll"));
+        assert!(is_absolute_path(r"\\server\share\x.dll"));
+        assert!(is_absolute_path("/normalized/nt/form"));
+        assert!(!is_absolute_path("secoutfall-user-actor.exe"));
+        assert!(!is_absolute_path("Drops\\sub"));
+        assert!(!is_absolute_path(""));
+        // A single letter is not a drive; `X:` needs the colon at index 1.
+        assert!(!is_absolute_path("x"));
+        assert!(is_absolute_path("x:"));
+    }
 
     #[test]
     fn windows_style_paths_split_on_backslash_on_any_host() {

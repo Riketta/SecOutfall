@@ -120,13 +120,17 @@ impl ScopeTracker {
         }
     }
 
-    /// Open a new session (id = current session count) at `now_ms`.
+    /// Open a new session (id = current session count) at `now_ms`. The
+    /// per-session drop-close memory is cleared — its doc says "per session"
+    /// and the review found nothing honoring that (a second session per boot
+    /// would have silently suppressed same-path closes).
     pub fn open_session(
-        &self,
+        &mut self,
         state: &mut ScopeState,
         now_ms: i64,
         scheduled_duration_secs: Option<u64>,
     ) {
+        self.closed.clear();
         let id = u32::try_from(state.sessions.len()).unwrap_or(u32::MAX);
         state.sessions.push(SessionRecord {
             id,

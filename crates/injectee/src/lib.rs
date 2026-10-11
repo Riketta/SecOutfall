@@ -26,11 +26,24 @@ pub extern "system" fn some_export() {
 /// `DllMain`: spawn the init thread and return immediately. The thread starts
 /// after the loader lock is released, so nothing here can deadlock the
 /// loader. The thread lives as long as the host process.
+///
+/// The init body is `catch_unwind`-contained: a panic on this thread degrades
+/// the SENSOR, never the host. The doctrine's earlier `panic = "abort"` was
+/// deliberately NOT set — in a cdylib an abort kills the analyzed process,
+/// and hooks are enrichment (kernel callbacks remain ground truth; sensor
+/// silence is itself a signal). Detour frames are `extern "system"`: a panic
+/// there aborts at the FFI boundary regardless of profile, so the real rule
+/// is "hooks are written panic-free" — enforced by review, not by unwind.
 #[unsafe(no_mangle)]
 extern "system" fn DllMain(_dll_module: *mut core::ffi::c_void, call_reason: u32, _reserved: *mut core::ffi::c_void) -> bool {
     // DLL_PROCESS_ATTACH == 1.
     if call_reason == 1 {
-        std::thread::spawn(sensor::run);
+        std::thread::spawn(|| {
+            // AssertUnwindSafe: the sensor's state is process-lifetime and
+            // single-shot; a panic mid-handshake leaves the ring unmapped,
+            // which every downstream path already treats as "idle sensor".
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(sensor::run));
+        });
     }
     true
 }

@@ -109,6 +109,10 @@ const PRE_HANDSHAKE_MAX_PAYLOAD: usize = 4096;
 /// are doctrine. Tests override it via [`IpcServerAdapter::with_max_clients`].
 const MAX_CONCURRENT_CLIENTS: usize = 16;
 
+/// Backoff before rebuilding a pipe instance after a transient connect
+/// failure (a hot loop here would spin the accept task).
+const IPC_CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// IPC server failures.
 #[derive(Debug, thiserror::Error)]
 pub enum IpcServerError {
@@ -281,7 +285,17 @@ impl IpcServerAdapter {
                     break;
                 }
                 connected = server.connect() => {
-                    connected.map_err(IpcServerError::Io)?;
+                    if let Err(error) = connected {
+                        // A transient connect failure must not kill the accept
+                        // loop for the whole boot (the review: one aborted-
+                        // connect race disabled UA transport until reboot).
+                        // Creation failures above remain fatal; here we log,
+                        // back off, and rebuild the instance.
+                        tracing::warn!(%error, "IPC connect failed; rebuilding the pipe instance");
+                        drop(server);
+                        tokio::time::sleep(IPC_CONNECT_BACKOFF).await;
+                        continue;
+                    }
                 }
             }
             if self.cancel.is_cancelled() {

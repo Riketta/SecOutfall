@@ -82,14 +82,17 @@ pub fn enable(name: &str) -> bool {
     let state_ptr: *const TOKEN_PRIVILEGES = std::ptr::from_ref(&state);
     // SAFETY: `state_ptr` is valid for the call and the token handle is open.
     let adjusted = unsafe { AdjustTokenPrivileges(token, false, Some(state_ptr), 0, None, None) };
+    // AdjustTokenPrivileges reports success even when the privilege is not
+    // held by the token; ERROR_NOT_ALL_ASSIGNED is the real verdict. Read it
+    // BEFORE anything else runs — an intervening FFI call may clobber the
+    // thread's last error (the review found the old order misreporting
+    // not-held as held).
+    // SAFETY: reads the last Win32 error of this thread.
+    let not_assigned = unsafe { GetLastError() } == ERROR_NOT_ALL_ASSIGNED;
     // SAFETY: owned handle, closed exactly once.
     unsafe {
         let _ = CloseHandle(token);
     }
-    // AdjustTokenPrivileges reports success even when the privilege is not
-    // held by the token; ERROR_NOT_ALL_ASSIGNED is the real verdict.
-    // SAFETY: no preconditions — reads the last Win32 error of this thread.
-    let not_assigned = unsafe { GetLastError() } == ERROR_NOT_ALL_ASSIGNED;
     adjusted.is_ok() && !not_assigned
 }
 

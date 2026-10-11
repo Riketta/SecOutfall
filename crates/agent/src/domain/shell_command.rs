@@ -36,11 +36,13 @@ pub fn substitute_command(command: &str, document: &str) -> Result<String, Shell
     }
 
     let mut result = String::with_capacity(command.len() + document.len() + 3);
+    let mut placeholder_seen = false;
     let mut index = 0;
     while let Some(rest) = command.get(index..) {
         // `%1` or its long-path alias `%L`, case-insensitive.
         if rest.starts_with("%1") || rest.starts_with("%l") || rest.starts_with("%L") {
             result.push_str(document);
+            placeholder_seen = true;
             index += 2;
         } else {
             let Some(chunk) = rest.chars().next() else { break };
@@ -49,7 +51,11 @@ pub fn substitute_command(command: &str, document: &str) -> Result<String, Shell
         }
     }
 
-    if !result.contains(document) {
+    // Append the quoted document only when NO placeholder was consumed. The
+    // old substring check (`result.contains(document)`) mis-fired when a
+    // placeholder-free template happened to embed the document path — the
+    // launch then dropped its argument entirely.
+    if !placeholder_seen {
         result.push(' ');
         result.push('"');
         result.push_str(document);

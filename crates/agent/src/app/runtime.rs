@@ -84,6 +84,7 @@ pub struct RunningSession {
     clock: Arc<dyn SystemClockPort>,
     seq: Arc<std::sync::atomic::AtomicU64>,
     finalize_done: Arc<std::sync::atomic::AtomicBool>,
+    broker: Arc<dyn BrokerPort>,
 }
 
 impl RunningSession {
@@ -135,7 +136,15 @@ impl RunningSession {
 
         let (stop_tx, stop_rx) = mpsc::channel::<SandboxEvent>(8);
         Ok((
-            Self { kernel, state, scheduler, clock: Arc::clone(&deps.clock), seq, finalize_done },
+            Self {
+                kernel,
+                state,
+                scheduler,
+                clock: Arc::clone(&deps.clock),
+                seq,
+                finalize_done,
+                broker: deps.broker,
+            },
             stop_tx,
             stop_rx,
         ))
@@ -208,6 +217,12 @@ impl RunningSession {
         }
         self.scheduler.stop();
         self.kernel.shutdown().await;
+        // Final wire flush: the finalize reports and the reboot/shutdown
+        // request must leave the process before exit, not die in the client
+        // queue (the review found exactly that race on fast exits).
+        if let Err(error) = self.broker.flush().await {
+            tracing::warn!(%error, "final broker flush failed; last reports may be lost");
+        }
         Ok(())
     }
 }

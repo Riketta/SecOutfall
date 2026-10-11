@@ -2,12 +2,17 @@
 //
 //   wiretest --generate <file>   writes the canonical fixture (deterministic)
 //   wiretest --verify <file>     byte-exact compares against the fixture
+//   wiretest --emit <name> <file> writes one control-plane blob (deterministic)
+//                                name: injection | drops | protection |
+//                                      security | stats | minimal-rename
 //
-// The fixture (driver/tests/golden_v2.bin) is committed: the same bytes are
-// decoded by crates/protocol/src/driver_wire.rs golden tests, so the C and
-// Rust interpretations of the wire format cannot drift apart silently. Any
-// schema change must regenerate the fixture AND update the Rust mirror —
-// both golden tests fail until they agree.
+// The record fixture (driver/tests/golden_v2.bin) is committed: the same
+// bytes are decoded by crates/protocol/src/driver_wire.rs golden tests, so
+// the C and Rust interpretations of the wire format cannot drift apart
+// silently. The --emit blobs pin the CONTROL plane (policy structs, stats
+// layout) the same way — the review that found the IOCTL/policy drift made
+// these fixtures mandatory: any schema change must regenerate the fixture
+// AND update the Rust mirror — both golden tests fail until they agree.
 //
 // Records are built from the REAL wire structs (offsets pinned by
 // static_asserts in secoutfallCommon.h) — hand-packed byte writers would
@@ -270,6 +275,112 @@ void BuildRegistrySetValue() {
 	AppendRaw(data.data(), dataBytes);
 }
 
+//
+// Control-plane blobs (--emit): built from the REAL policy structs so the
+// compiler's alignment/padding is the authority, exactly like the records.
+// Every field value is distinct so a Rust-side offset swap shows up as a
+// byte mismatch, not a silent pass.
+//
+
+void EmitInjectionPolicy() {
+	const WCHAR path[] = L"\\??\\C:\\ProgramData\\SecOutfall\\sensors\\boot-1f2e3d4c5b6a7988\\sensor-0a1b2c3d4e5f6071.dll";
+	const WCHAR exclusions[] = L"wiretest-helper.exe\0";
+	InjectionPolicy policy {};
+	policy.Enabled = 1;
+	policy.DllPathBytes = static_cast<ULONG>(sizeof(path));
+	policy.ExclusionsBytes = static_cast<ULONG>(sizeof(exclusions));
+	AppendRaw(&policy, sizeof(policy));
+	AppendRaw(path, sizeof(path));
+	AppendRaw(exclusions, sizeof(exclusions));
+}
+
+void EmitDropPolicy() {
+	const WCHAR extensions[] = L".exe\0.dll\0";
+	const WCHAR dir[] = L"\\??\\C:\\ProgramData\\SecOutfall\\Drops\\boot-1f2e3d4c5b6a7988";
+	DropPolicy policy {};
+	policy.Enabled = 1;
+	policy.ExtensionsCount = 2;
+	policy.ExtensionsBytes = static_cast<ULONG>(sizeof(extensions));
+	policy.DirBytes = static_cast<ULONG>(sizeof(dir));
+	AppendRaw(&policy, sizeof(policy));
+	AppendRaw(extensions, sizeof(extensions));
+	AppendRaw(dir, sizeof(dir));
+}
+
+void EmitProtectionPolicy() {
+	const WCHAR names[] = L"secoutfall-agent.exe\0secoutfall-user-actor.exe\0";
+	ProtectionPolicy policy {};
+	policy.Enabled = 1;
+	policy.NamesBytes = static_cast<ULONG>(sizeof(names));
+	AppendRaw(&policy, sizeof(policy));
+	AppendRaw(names, sizeof(names));
+}
+
+void EmitDeviceSecurity() {
+	// The SD itself is opaque to the wire layer (the driver validates shape
+	// before applying); the fixture pins the ENVELOPE: enabled + byte count
+	// + raw bytes, byte-exact.
+	const UCHAR sd[32] = {
+		0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+		0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF,
+		0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7,
+		0xB8, 0xB9, 0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF,
+	};
+	DeviceSecurityBlob blob {};
+	blob.Enabled = 1;
+	blob.SdBytes = sizeof(sd);
+	AppendRaw(&blob, sizeof(blob));
+	AppendRaw(sd, sizeof(sd));
+}
+
+void EmitStats() {
+	DriverStats stats {};
+	stats.Magic = SECOUTFALL_WIRE_MAGIC;
+	stats.Version = SECOUTFALL_WIRE_VERSION;
+	stats.QueueDepth = 1;
+	stats.QueueCapacity = 2;
+	stats.FileQueueDepth = 3;
+	stats.FileQueueCapacity = 4;
+	stats.DropsQueueDepth = 5;
+	stats.DropsQueueCapacity = 6;
+	stats.Sequence = 0x0102030405060708ull;
+	stats.QueueOverwritten = 0x1112131415161718ull;
+	stats.AllocFailures = 0x2122232425262728ull;
+	stats.OversizedSkipped = 0x3132333435363738ull;
+	stats.IdentityMisses = 0x4142434445464748ull;
+	stats.FilesOverwritten = 0x5152535455565758ull;
+	stats.FileNameQueriesFailed = 0x6162636465666768ull;
+	stats.NoiseWritesSkipped = 0x7172737475767778ull;
+	stats.DropsStopped = 0x8182838485868788ull;
+	stats.DropsMissedBusy = 0x9192939495969798ull;
+	stats.DropsLinkFailed = 0xA1A2A3A4A5A6A7A8ull;
+	stats.DropsCopyFailed = 0xB1B2B3B4B5B6B7B8ull;
+	stats.InjectionsQueued = 0xC1C2C3C4C5C6C7C8ull;
+	stats.InjectionsFailed = 0xD1D2D3D4D5D6D7D8ull;
+	stats.SensorsRegistered = 0xE1E2E3E4E5E6E7E8ull;
+	stats.SensorsRejected = 0xF1F2F3F4F5F6F7F8ull;
+	stats.ProtectionsStripped = 0x090A0B0C0D0E0F10ull;
+	stats.ProtectionTrusted = 0x192A2B2C2D2E2F30ull;
+	stats.SensorEventsDrained = 0x394A4B4C4D4E4F50ull;
+	stats.SensorEventsDropped = 0x596A6B6C6D6E6F70ull;
+	stats.SensorRingsActive = 0x798A8B8C8D8E8F90ull;
+	AppendRaw(&stats, sizeof(stats));
+}
+
+void EmitMinimalRename() {
+	// The degenerate rename: both name lookups failed (RenameContext absent,
+	// post-op name query failed) — the driver emits FileRenamedFixed bytes
+	// with BOTH strings absent. The Rust decoder must accept exactly this.
+	FileRenamedRecord record {};
+	record.Header = MakeHeader(FileRenamed, 1004, IdentityBase + 1004,
+		TRUNC_OLD_PATH | TRUNC_NEW_PATH, FileRenamedFixed);
+	record.OldPathOffset = 0;
+	record.OldPathBytes = 0;
+	record.NewPathOffset = 0;
+	record.NewPathBytes = 0;
+	AppendRaw(&record, FileRenamedFixed);
+}
+
 bool ReadFileBytes(const char* path, std::vector<BYTE>& bytes) {
 	FILE* f = nullptr;
 	if (fopen_s(&f, path, "rb") != 0 || f == nullptr)
@@ -321,9 +432,68 @@ bool WalkFixture(const std::vector<BYTE>& bytes) {
 
 } // namespace
 
+void EmitCodes() {
+	// The macro expansion IS the authority: the parent agent's Rust port
+	// pins these exact values (crates/agent/src/ports/driven/driver_control.rs).
+	struct { const char* name; ULONG code; } codes[] = {
+		{ "GET_DATA", IOCTL_SECOUTFALL_GET_DATA },
+		{ "GET_STATS", IOCTL_SECOUTFALL_GET_STATS },
+		{ "SET_FILE_WATCH", IOCTL_SECOUTFALL_SET_FILE_WATCH },
+		{ "SELFTEST_FLOOD", IOCTL_SECOUTFALL_SELFTEST_FLOOD },
+		{ "SET_DROP_POLICY", IOCTL_SECOUTFALL_SET_DROP_POLICY },
+		{ "SET_INJECTION_POLICY", IOCTL_SECOUTFALL_SET_INJECTION_POLICY },
+		{ "SENSOR_CHALLENGE", IOCTL_SECOUTFALL_SENSOR_CHALLENGE },
+		{ "SENSOR_REGISTER", IOCTL_SECOUTFALL_SENSOR_REGISTER },
+		{ "SET_PROTECTED", IOCTL_SECOUTFALL_SET_PROTECTED },
+		{ "SET_DEVICE_SECURITY", IOCTL_SECOUTFALL_SET_DEVICE_SECURITY },
+	};
+	char line[128];
+	for (auto& entry : codes) {
+		sprintf_s(line, "%s=0x%08X\n", entry.name, entry.code);
+		g_out.insert(g_out.end(), line, line + strlen(line));
+	}
+}
+
 int main(int argc, char** argv) {
+	if (argc == 3 && strcmp(argv[1], "--emit") == 0 && strcmp(argv[2], "codes") == 0) {
+		EmitCodes();
+		if (!WriteFileBytes("driver/tests/emit_codes.txt", g_out)) {
+			// Fall back to stdout when the default path is not writable.
+			fwrite(g_out.data(), 1, g_out.size(), stdout);
+			return 1;
+		}
+		printf("emitted codes -> driver/tests/emit_codes.txt (%zu bytes)\n", g_out.size());
+		return 0;
+	}
+
+	if (argc == 4 && strcmp(argv[1], "--emit") == 0) {
+		g_out.clear();
+		g_seq = 0;
+		const char* name = argv[2];
+		if (strcmp(name, "injection") == 0) EmitInjectionPolicy();
+		else if (strcmp(name, "drops") == 0) EmitDropPolicy();
+		else if (strcmp(name, "protection") == 0) EmitProtectionPolicy();
+		else if (strcmp(name, "security") == 0) EmitDeviceSecurity();
+		else if (strcmp(name, "stats") == 0) EmitStats();
+		else if (strcmp(name, "minimal-rename") == 0) EmitMinimalRename();
+		else {
+			printf("FAIL: unknown emit target '%s'\n", name);
+			return 2;
+		}
+		if (g_out.empty()) {
+			printf("FAIL: %s emitted nothing\n", name);
+			return 1;
+		}
+		if (!WriteFileBytes(argv[3], g_out)) {
+			printf("FAIL: cannot write %s\n", argv[3]);
+			return 1;
+		}
+		printf("emitted %s -> %s (%zu bytes)\n", name, argv[3], g_out.size());
+		return 0;
+	}
+
 	if (argc != 3 || (strcmp(argv[1], "--generate") != 0 && strcmp(argv[1], "--verify") != 0)) {
-		printf("usage: wiretest --generate <file> | --verify <file>\n");
+		printf("usage: wiretest --generate <file> | --verify <file> | --emit <name> <file>\n");
 		return 2;
 	}
 

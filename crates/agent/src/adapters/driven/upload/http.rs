@@ -39,9 +39,14 @@ use crate::ports::driven::uploader::{
 
 /// Upload chunk size fed into the request body.
 const CHUNK_BYTES: usize = 64 * 1024;
-/// Connect timeout; no total timeout — large drops may legitimately take a
-/// while on slow lab links and aborting mid-transfer would corrupt artifacts.
+/// Connect timeout: fail fast when the controller is unreachable.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// TOTAL request timeout — the review found a stalled server hanging kernel
+/// shutdown forever (the uploader awaits inside the plugin `stop` chain).
+/// Generous by design: the drops cap (20 MiB default) over a slow lab link
+/// is minutes, not hours; a wedged controller must never wedge the reboot
+/// request the whole study depends on.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Streaming uploader over a shared reqwest client.
 pub struct HttpUploadAdapter {
@@ -57,6 +62,7 @@ impl HttpUploadAdapter {
     pub fn new() -> Result<Self, UploadError> {
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|error| UploadError::Transport(error.to_string()))?;
         Ok(Self { client })

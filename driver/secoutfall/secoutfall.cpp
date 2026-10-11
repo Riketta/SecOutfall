@@ -159,7 +159,12 @@ ULONG64 NextIdentityMiss() {
 // record (the ItemFull wrapper header is invisible on the wire). `totalSize`
 // is the full wire record size, header included.
 RecordHeader* AllocRecord(_In_ ULONG totalSize, _In_ RecordType type, _In_ ULONG pid, _In_opt_ ULONG64 processCreateTime) {
-	auto item = (ItemFull<RecordHeader>*)::ExAllocatePool2(POOL_FLAG_PAGED,
+	// NON-paged: post-write/post-set-info callbacks may run at DISPATCH_LEVEL
+	// (the code's own IRQL guards elsewhere acknowledge that), and a paged
+	// allocation there is a documented bugcheck. The bounded queues cap the
+	// total nonpaged footprint (256 + 4096 + 512 records), so the cost is
+	// bounded by design.
+	auto item = (ItemFull<RecordHeader>*)::ExAllocatePool2(POOL_FLAG_NON_PAGED,
 		sizeof(ItemFull<RecordHeader>) + totalSize, DRIVER_TAG);
 	if (item == nullptr) {
 		InterlockedIncrement64(&g_Data.AllocFailures);
@@ -571,7 +576,7 @@ void EmitRegistryKeyRecord(_In_ RecordType type, _In_ PCUNICODE_STRING path) {
 
 void EmitRegistrySetValue(_In_ PCUNICODE_STRING keyPath, _In_ PCUNICODE_STRING valueName,
 	_In_ ULONG dataType, _In_reads_bytes_(dataLength) PVOID data, _In_ ULONG dataLength) {
-	bool keyTruncated = false, valueTruncated = false, dataTruncated = false;
+	bool keyTruncated = false, valueTruncated = false;
 	WCHAR keyScratch[MaxKeyPathBytes / sizeof(WCHAR)];
 	WCHAR valueScratch[MaxValueNameBytes / sizeof(WCHAR)];
 	auto keyBytes = CopyNameW(keyScratch, keyPath, MaxKeyPathBytes, keyTruncated);
@@ -587,7 +592,7 @@ void EmitRegistrySetValue(_In_ PCUNICODE_STRING keyPath, _In_ PCUNICODE_STRING v
 		header->TruncFlags |= TRUNC_KEY_PATH;
 	if (valueTruncated)
 		header->TruncFlags |= TRUNC_VALUE_NAME;
-	if (dataTruncated || dataLength > MaxValueDataBytes)
+	if (dataLength > MaxValueDataBytes)
 		header->TruncFlags |= TRUNC_DATA;
 
 	auto record = reinterpret_cast<RegistrySetValueRecord*>(header);
@@ -1085,16 +1090,10 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 				status = STATUS_INVALID_PARAMETER;
 				break;
 			}
-			UNICODE_STRING dir;
-			dir.Buffer = dirBlob;
-			dir.Length = static_cast<USHORT>(dirBytes - sizeof(WCHAR)); // minus NUL
-			dir.MaximumLength = dir.Length;
-			if (!g_Data.Target->Apply(&dir)) {
-				status = STATUS_INSUFFICIENT_RESOURCES;
-				break;
-			}
-
-			// Extension list, same shape as SET_FILE_WATCH (NUL-terminated).
+			// Parse/validate the extension list BEFORE any Apply: the review
+			// found the dir applied first, so a malformed extension blob left
+			// a MIXED policy (new dir + old extensions) live while the push
+			// reported failure. Build everything, then apply atomically.
 			auto exts = (PUNICODE_STRING*)::ExAllocatePool2(POOL_FLAG_NON_PAGED,
 				sizeof(PUNICODE_STRING) * input->ExtensionsCount, DRIVER_TAG);
 			auto extBlob = (PWCHAR)::ExAllocatePool2(POOL_FLAG_NON_PAGED,
@@ -1138,6 +1137,20 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 				ExFreePool(exts);
 				ExFreePool(extBlob);
 				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			// Both halves validated — apply. If the dir fails, roll the just-
+			// built extension state back so no half-policy survives.
+			UNICODE_STRING dir;
+			dir.Buffer = dirBlob;
+			dir.Length = static_cast<USHORT>(dirBytes - sizeof(WCHAR)); // minus NUL
+			dir.MaximumLength = dir.Length;
+			if (!g_Data.Target->Apply(&dir)) {
+				for (ULONG i = 0; i < count; ++i)
+					ExFreePool(exts[i]);
+				ExFreePool(exts);
+				ExFreePool(extBlob);
+				status = STATUS_INSUFFICIENT_RESOURCES;
 				break;
 			}
 			g_Data.DropWatch->Apply(true, exts, count, extBlob, extBytes);
@@ -1520,10 +1533,22 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI SecOutfallPreSetInfo(_Inout_ PFLT_CALLBACK_DATA
 	*NewCompletionContext = nullptr;
 
 	auto cls = Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
-	if (cls != FileRenameInformation && cls != FileRenameInformationEx)
+	// Rename needs a pre-op context (the old name only exists NOW). Deletes
+	// need only the post-op (the pre-review NO_CALLBACK here made the
+	// delete branch of the post callback unreachable — file.deleted
+	// telemetry was silently dead).
+	auto isRename = cls == FileRenameInformation || cls == FileRenameInformationEx;
+	auto isDelete = cls == FileDispositionInformation || cls == FileDispositionInformationEx;
+	if (!isRename && !isDelete)
 		return FLT_PREOP_SUCCESS_NO_CALLBACK;
 	if (!g_Data.Watch->Enabled() || KeGetCurrentIrql() > APC_LEVEL)
 		return FLT_PREOP_SUCCESS_NO_CALLBACK;
+	if (isDelete) {
+		// No pre-op state to carry: the post callback queries the name (the
+		// last path before disposition) itself.
+		*NewCompletionContext = nullptr;
+		return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+	}
 
 	// The pre-rename name only exists NOW: post-rename queries return the
 	// new name. Capture it into a nonpaged context for the post callback.

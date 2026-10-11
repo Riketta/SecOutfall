@@ -51,6 +51,20 @@ impl BrokerPort for TeeBroker {
         }
         Ok(())
     }
+
+    async fn flush(&self) -> Result<(), BrokerError> {
+        let mut failures = 0_usize;
+        for sink in &self.sinks {
+            if let Err(error) = sink.flush().await {
+                failures += 1;
+                tracing::warn!(%error, "tee sink flush failed");
+            }
+        }
+        if failures == self.sinks.len() {
+            return Err(BrokerError::Persistence("all tee sink flushes failed".to_owned()));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

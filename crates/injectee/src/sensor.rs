@@ -37,9 +37,14 @@ const DEVICE_PATH: &[u16] = &[
 const IOCTL_SENSOR_CHALLENGE: u32 = IOCTL_SECOUTFALL_SENSOR_CHALLENGE;
 const IOCTL_SENSOR_REGISTER: u32 = IOCTL_SECOUTFALL_SENSOR_REGISTER;
 
-// IOCTL codes (mirrored; CTL_CODE(0x8000, n, METHOD_BUFFERED, access)).
-const IOCTL_SECOUTFALL_SENSOR_CHALLENGE: u32 = (0x8000u32 << 16) | (0x806u32 << 2) | 1;
-const IOCTL_SECOUTFALL_SENSOR_REGISTER: u32 = (0x8000u32 << 16) | (0x807u32 << 2) | 2;
+// IOCTL codes — pinned to the C compiler's macro expansion
+// (driver/tests/emit_codes.txt; see the agent's ports::driven::driver_control::codes).
+// The review-era hand derivation here dropped the access bits and set junk
+// low bits: (0x8000<<16)|(0x806<<2)|1 = 0x80002019 where the driver expects
+// 0x80006018 — the handshake would have failed against the real device.
+// CTL_CODE(0x8000, fn, METHOD_BUFFERED, access) with access pre-shifted:
+const IOCTL_SECOUTFALL_SENSOR_CHALLENGE: u32 = 0x8000_6018; // fn 0x806, FILE_READ_ACCESS
+const IOCTL_SECOUTFALL_SENSOR_REGISTER: u32 = 0x8000_A01C; // fn 0x807, FILE_WRITE_ACCESS
 
 #[repr(C)]
 #[derive(Clone, Copy)]

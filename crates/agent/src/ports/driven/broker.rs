@@ -40,4 +40,17 @@ pub trait BrokerPort: Send + Sync + 'static {
         channel: Channel,
         envelope: &Envelope<Payload>,
     ) -> Result<(), BrokerError>;
+
+    /// Drain transport buffers: when this resolves, everything published so
+    /// far has left the process (or failed loudly). The runtime awaits it
+    /// once after finalize, before exit — the review found the final
+    /// `session.ended`/reboot request sitting in the client's send queue
+    /// while the process tore down. Adapters with synchronous hand-off
+    /// (console, tee, fake) inherit the no-op.
+    ///
+    /// # Errors
+    /// [`BrokerError::ConnectionLost`] when the drain fails.
+    async fn flush(&self) -> Result<(), BrokerError> {
+        Ok(())
+    }
 }

@@ -272,7 +272,10 @@ async fn finalize_session(ctx: &FinalizeCtx<'_>, reason: FinalizeReason) {
     {
         let mut guard = state.lock();
         let Some(session) = guard.current_session_mut() else {
+            // The liveness flag must be set on EVERY exit path — the host
+            // polls it after `stop`; a silent early return wedges shutdown.
             tracing::error!("finalize requested with no open session");
+            finalize_done.store(true, Ordering::SeqCst);
             return;
         };
         session.ended_at_ms = Some(now_ms);
@@ -286,6 +289,7 @@ async fn finalize_session(ctx: &FinalizeCtx<'_>, reason: FinalizeReason) {
     let (study_id, session_id, session_count) = {
         let guard = state.lock();
         let Some(session) = guard.current_session() else {
+            finalize_done.store(true, Ordering::SeqCst);
             return;
         };
         (guard.study_id, session.id, guard.sessions.len())
@@ -383,7 +387,14 @@ async fn request_reboot_or_shutdown(
     if !delay.is_zero() {
         tokio::time::sleep(delay).await;
     }
-    let shutdown = !uptimes.is_empty() && session_count >= uptimes.len();
+    // Shutdown decides the STUDY is over: either the `uptimes` table ran
+    // out (fixed-count study complete) or the study is DYNAMIC (empty
+    // table) — there is no next session to reboot into, so dead-scope or
+    // session-count exhaustion ends the study. Reboot means "schedule the
+    // next session"; with an empty table there is no next session. The
+    // review flagged the old `!uptimes.is_empty() &&` as an accidental
+    // reboot-forever loop for dynamic studies.
+    let shutdown = uptimes.is_empty() || session_count >= uptimes.len();
     let reason_text = format!("{reason:?}").to_lowercase();
     let request = if shutdown {
         emit(
@@ -550,7 +561,12 @@ impl PluginPort for SessionManagerPlugin {
             EventType::AgentState,
             Payload::AgentState(AgentStateData { agent_version: self.deps.agent_version.clone() }),
         );
-        let _ = self.deps.broker.publish(Channel::Event, &state_report).await;
+        if let Err(error) = self.deps.broker.publish(Channel::Event, &state_report).await {
+            // Boot reports are the Controller's proof of life; a loss here
+            // must surface in the agent's own log (loss counters still
+            // count it).
+            tracing::error!(%error, "agent.state publish failed");
+        }
         let started = crate::plugins::wire::envelope_raw(
             now,
             crate::plugins::wire::next_seq(&self.deps.seq),
@@ -559,7 +575,9 @@ impl PluginPort for SessionManagerPlugin {
             EventType::SessionStarted,
             Payload::SessionStarted(SessionStartedData { scheduled_duration_secs: scheduled }),
         );
-        let _ = self.deps.broker.publish(Channel::Event, &started).await;
+        if let Err(error) = self.deps.broker.publish(Channel::Event, &started).await {
+            tracing::error!(%error, "session.started publish failed");
+        }
 
         // Bus subscriptions: dead-scope finalize (autoshutdown) + score raises.
         let mut receiver = self.deps.bus.subscribe();

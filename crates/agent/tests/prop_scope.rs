@@ -106,7 +106,7 @@ proptest! {
         exits in proptest::collection::vec(any::<bool>(), 24),
         restarts in proptest::collection::vec(any::<bool>(), 24),
     ) {
-        let tracker = ScopeTracker::new(vec!["evil.exe".to_owned()]);
+        let mut tracker = ScopeTracker::new(vec!["evil.exe".to_owned()]);
         let mut state = ScopeState::default();
         tracker.open_session(&mut state, 1_000, Some(60));
         let mut model = LiveModel::default();
