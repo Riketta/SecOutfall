@@ -45,6 +45,7 @@ use protocol::{
         ScreenshotUploadedData,
     },
 };
+use tokio::io::AsyncWriteExt;
 
 use crate::{
     app::{
@@ -147,10 +148,26 @@ impl ScreenshotIntakePlugin {
             }
             path
         } else if inner.deps.config.upload_uri.is_some() {
-            let path = std::env::temp_dir().join(&wire_name);
-            if let Err(error) = tokio::fs::write(&path, &frame.jpeg).await {
-                tracing::error!(%error, path = %path.display(), "screenshot staging failed");
-                return;
+            // Random per-frame staging name, created exclusively: a predictable
+            // name in a shared temp dir let an in-VM process pre-plant a
+            // file/junction and redirect a SYSTEM write.
+            let staging_name = format!(
+                "screenshot-{session_id}-{}-{}.part",
+                frame.seq,
+                uuid::Uuid::new_v4().simple()
+            );
+            let path = std::env::temp_dir().join(staging_name);
+            match tokio::fs::OpenOptions::new().write(true).create_new(true).open(&path).await {
+                Ok(mut file) => {
+                    if let Err(error) = file.write_all(&frame.jpeg).await {
+                        tracing::error!(%error, path = %path.display(), "screenshot staging failed");
+                        return;
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, path = %path.display(), "screenshot staging failed");
+                    return;
+                }
             }
             path
         } else {

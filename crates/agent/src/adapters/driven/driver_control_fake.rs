@@ -25,6 +25,7 @@ pub struct FakeDriverControl {
 struct Inner {
     applied: Option<DriverPolicies>,
     device_security: Option<String>,
+    file_watch: Option<(bool, Vec<String>)>,
     stats: DriverStatsSnapshot,
     fail_policies: bool,
 }
@@ -46,6 +47,12 @@ impl FakeDriverControl {
     #[must_use]
     pub fn device_security(&self) -> Option<String> {
         self.inner.lock().device_security.clone()
+    }
+
+    /// The last file-watch push, if any (enabled + extension list).
+    #[must_use]
+    pub fn file_watch(&self) -> Option<(bool, Vec<String>)> {
+        self.inner.lock().file_watch.clone()
     }
 
     /// Serve this snapshot from `query_stats`.
@@ -75,6 +82,19 @@ impl DriverControlPort for FakeDriverControl {
             return Err(DriverControlError::DeviceMissing);
         }
         inner.device_security = Some(sddl.to_owned());
+        Ok(())
+    }
+
+    fn set_file_watch(
+        &self,
+        enabled: bool,
+        extensions: &[String],
+    ) -> Result<(), DriverControlError> {
+        let mut inner = self.inner.lock();
+        if inner.fail_policies {
+            return Err(DriverControlError::DeviceMissing);
+        }
+        inner.file_watch = Some((enabled, extensions.to_vec()));
         Ok(())
     }
 
@@ -113,6 +133,9 @@ mod tests {
 
         fake.apply_device_security("D:P(A;;GA;;;SY)").unwrap();
         assert_eq!(fake.device_security(), Some("D:P(A;;GA;;;SY)".to_owned()));
+
+        fake.set_file_watch(true, &[]).unwrap();
+        assert_eq!(fake.file_watch(), Some((true, Vec::new())));
     }
 
     #[test]

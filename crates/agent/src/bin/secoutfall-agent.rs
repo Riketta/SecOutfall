@@ -45,15 +45,26 @@ use kernel::app::api_ports::EventInletPort;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
     let args = Args::parse();
     match args.mode.as_deref() {
-        Some("simulate") => simulate().await,
+        Some("simulate") => {
+            init_tracing(None);
+            simulate().await
+        }
         Some("service") => service_mode(&args).await,
-        Some("install") => service_install(&args),
-        Some("uninstall") => service_uninstall(),
+        Some("install") => {
+            init_tracing(None);
+            service_install(&args)
+        }
+        Some("uninstall") => {
+            init_tracing(None);
+            service_uninstall()
+        }
         Some("local") => local(&args).await,
-        Some("etw-probe") => etw_probe().await,
+        Some("etw-probe") => {
+            init_tracing(None);
+            etw_probe().await
+        }
         _ => console(&args).await,
     }
 }
@@ -77,10 +88,13 @@ fn standalone_config(
 }
 
 /// Single global subscriber: `registry` + `EnvFilter` (`RUST_LOG`-aware) +
-/// console fmt + the `sentry-tracing` layer. The Sentry layer is a no-op
-/// until [`init_sentry`] activates a client — layer wiring is fixed at init,
-/// the client is not.
-fn init_tracing() {
+/// console fmt + the `sentry-tracing` layer, plus (when a `log_dir` is given)
+/// a non-blocking daily rolling file. The Sentry layer is a no-op until
+/// [`init_sentry`] activates a client — layer wiring is fixed at init, the
+/// client is not. Called AFTER the config is loaded in every config-holding
+/// mode: `log_dir` is a config value, and the pre-subscriber window only
+/// carries startup prints (config errors go to stderr via anyhow).
+fn init_tracing(log_dir: Option<&std::path::Path>) {
     use tracing_subscriber::{
         EnvFilter,
         layer::SubscriberExt,
@@ -88,11 +102,26 @@ fn init_tracing() {
     };
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,agent=debug"));
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(tracing_subscriber::fmt::layer().with_target(false))
-        .with(sentry_tracing::layer())
-        .init();
+    let console = tracing_subscriber::fmt::layer().with_target(false);
+    let registry =
+        tracing_subscriber::registry().with(filter).with(console).with(sentry_tracing::layer());
+    let Some(dir) = log_dir else {
+        registry.init();
+        return;
+    };
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        // The file sink is diagnostics, not the product: log nowhere rather
+        // than refuse to start.
+        eprintln!("log dir {} unavailable ({error}); file logging disabled", dir.display());
+        registry.init();
+        return;
+    }
+    let appender = tracing_appender::rolling::daily(dir, "secoutfall-agent.log");
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    // The worker guard is leaked deliberately — process-lifetime transport,
+    // the same choice as the Sentry client guard.
+    std::mem::forget(guard);
+    registry.with(tracing_subscriber::fmt::layer().with_target(false).with_writer(writer)).init();
 }
 
 /// Activate Sentry egress to the local `GlitchTip` (doctrine: gated by
@@ -200,12 +229,14 @@ fn generate_nonce() -> String {
 }
 
 /// Production wiring: strict TOML config, real NATS broker (legacy retry
-/// budget), HTTP uploader, config-driven scope DB location.
+/// budget), HTTP uploader, config-driven scope DB location. The config is
+/// loaded by the CALLER (the log dir from it configures tracing before any
+/// of this logs).
 async fn production_session_deps(
-    config_path: &std::path::Path,
+    config: protocol::config::AgentConfig,
     user_actor_nonce: String,
 ) -> anyhow::Result<SessionDeps> {
-    let config = Arc::new(agent::adapters::driven::config_toml::load(config_path)?);
+    let config = Arc::new(config);
     let broker =
         agent::adapters::driven::broker::nats::NatsBrokerAdapter::connect(&config.broker).await?;
     tracing::info!(uri = %config.broker.uri, "NATS broker connected");
@@ -419,6 +450,7 @@ async fn console(args: &Args) -> anyhow::Result<()> {
     // server (HELLO verification).
     let nonce = generate_nonce();
     let (session_deps, broker_kind) = if args.demo {
+        init_tracing(None);
         println!("{} v{} (console, demo)", agent::NAME, env!("CARGO_PKG_VERSION"));
         (
             SessionDeps {
@@ -454,8 +486,11 @@ async fn console(args: &Args) -> anyhow::Result<()> {
         )
     } else {
         println!("{} v{} (console)", agent::NAME, env!("CARGO_PKG_VERSION"));
+        // Config first: the log dir configures tracing before any log line.
+        let config = agent::adapters::driven::config_toml::load(&args.config_path)?;
+        init_tracing(Some(std::path::Path::new(&config.telemetry.log_dir)));
         (
-            production_session_deps(&args.config_path, nonce.clone()).await?,
+            production_session_deps(config, nonce.clone()).await?,
             args.config_path.display().to_string(),
         )
     };
@@ -484,10 +519,11 @@ async fn console(args: &Args) -> anyhow::Result<()> {
         let _ = ctrl_c_tx.send(SandboxEvent::ServiceStop).await;
     });
 
-    attach_event_source(&session, &event_source_config).await;
+    let source = attach_event_source(&session, &event_source_config).await;
 
     drop(stop_tx);
     session.run_until_stop(stop_rx).await?;
+    source.stop().await;
     println!("session finalized, agent stopped");
     Ok(())
 }
@@ -522,6 +558,7 @@ async fn local(args: &Args) -> anyhow::Result<()> {
     };
     let config = Arc::new(standalone_config(base, args.target.clone()));
     config.validate()?;
+    init_tracing(Some(std::path::Path::new(&config.telemetry.log_dir)));
     if !has_config && args.target.is_none() {
         println!(
             "hint: pass `--target <path-to-sample>` (or a --config file), or the\n             built-in placeholder target will fail to launch"
@@ -577,29 +614,31 @@ async fn local(args: &Args) -> anyhow::Result<()> {
         let _ = ctrl_c_tx.send(SandboxEvent::ServiceStop).await;
     });
 
-    attach_event_source(&session, &config).await;
+    let source = attach_event_source(&session, &config).await;
 
     drop(stop_tx);
     session.run_until_stop(stop_rx).await?;
+    source.stop().await;
     println!("session finalized, agent stopped");
     Ok(())
 }
 
 #[cfg(all(windows, feature = "etw"))]
-#[allow(clippy::unused_async)] // keeps the console flow shape uniform across features
-async fn attach_etw(session: &agent::app::runtime::RunningSession) {
+fn attach_etw(session: &agent::app::runtime::RunningSession) -> SourceHandle {
     use agent::ports::driving::event_source::EventSourcePort;
     let adapter = Arc::new(agent::adapters::driving::etw_adapter::EtwKernelTraceAdapter::new(
         8192,
-        agent::adapters::driving::etw_adapter::SESSION_NAME,
+        agent::adapters::driving::etw_adapter::SESSION_NAME.to_owned(),
     ));
     let inlet = session.inlet();
+    let task_adapter = Arc::clone(&adapter);
     tokio::spawn(async move {
-        if let Err(error) = adapter.run(inlet).await {
+        if let Err(error) = task_adapter.run(inlet).await {
             println!("ETW attach failed (admin required?): {error}");
         }
     });
-    println!("ETW kernel trace attached");
+    println!("ETW event source attached (kernel trace)");
+    SourceHandle::Etw(adapter)
 }
 
 /// One-shot driver policy push (feature `driver`): device-security (console
@@ -685,7 +724,17 @@ async fn push_driver_policies(config: &protocol::config::AgentConfig) {
             Err(error) => tracing::warn!(%error, "driver policy push failed"),
         }
 
-        // 3. Baseline health snapshot (loss counters continue via stats).
+        // 3. File watch: the driver boots with file telemetry OFF, and both
+        // file events AND drop capture are gated behind it — without this
+        // push the driver source silently loses them. All files (empty list):
+        // the flood-class queue's bounded overwrite-oldest policy is the
+        // flood defense, per design.
+        match control.set_file_watch(true, &[]) {
+            Ok(()) => tracing::info!("driver file watch enabled (all files)"),
+            Err(error) => tracing::warn!(%error, "driver file-watch push failed"),
+        }
+
+        // 4. Baseline health snapshot (loss counters continue via stats).
         match control.query_stats() {
             Ok(stats) => tracing::info!(?stats, "driver stats at policy push"),
             Err(error) => tracing::warn!(%error, "driver stats query failed"),
@@ -696,16 +745,49 @@ async fn push_driver_policies(config: &protocol::config::AgentConfig) {
     }
 }
 
-/// Attach THE event source for this build. Shared by every host mode
-/// (console / local / service) so the wiring cannot diverge — the service is
-/// the production deployment and must observe exactly like console (the
-/// historical bug: service mode attached nothing and observed silently). The
-/// driver-track `DriverEventSourceAdapter` replaces this call site.
+// Attach THE event source for this build. Shared by every host mode
+// (console / local / service) so the wiring cannot diverge — the service is
+// the production deployment and must observe exactly like console (the
+// historical bug: service mode attached nothing and observed silently). The
+// driver-track `DriverEventSourceAdapter` replaces this call site.
+
+/// Handle to the attached event source, stopped at teardown: the ETW kernel
+/// trace session must not outlive the agent (a lingering named session would
+/// block a restarted agent's trace), and the driver drain mirrors the same
+/// lifecycle for symmetry.
+enum SourceHandle {
+    #[cfg(all(windows, feature = "driver"))]
+    Driver(Arc<agent::adapters::driving::driver_event_source::DriverEventSourceAdapter>),
+    #[cfg(all(windows, feature = "etw"))]
+    Etw(Arc<agent::adapters::driving::etw_adapter::EtwKernelTraceAdapter>),
+    #[allow(dead_code)] // every feature combination has a lane
+    None,
+}
+
+impl SourceHandle {
+    // `async` for the ETW arm's await; feature lanes without it see no await
+    // (the lints are silenced for exactly those lanes).
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    async fn stop(&self) {
+        match self {
+            #[cfg(all(windows, feature = "driver"))]
+            Self::Driver(adapter) => adapter.stop(),
+            #[cfg(all(windows, feature = "etw"))]
+            Self::Etw(adapter) => adapter.stop().await,
+            Self::None => {}
+        }
+    }
+}
+
 #[allow(clippy::unused_async)] // signature parity across the feature lanes
 async fn attach_event_source(
     session: &agent::app::runtime::RunningSession,
     config: &protocol::config::AgentConfig,
-) {
+) -> SourceHandle {
+    // etw-only builds never read it (the driver branch is cfg'd out).
+    #[cfg(not(all(windows, feature = "driver")))]
+    let _ = config;
+
     // Driver replaces ETW when armed: exactly one source is active.
     #[cfg(all(windows, feature = "driver"))]
     if config.driver.enabled {
@@ -718,17 +800,18 @@ async fn attach_event_source(
             agent::adapters::driving::driver_event_source::DriverEventSourceAdapter::new(clock),
         );
         let inlet = session.inlet();
+        let task_adapter = Arc::clone(&adapter);
         tokio::spawn(async move {
-            if let Err(error) = adapter.run(inlet).await {
+            if let Err(error) = task_adapter.run(inlet).await {
                 println!("driver event source failed: {error}");
             }
         });
         println!("driver event source attached (kernel telemetry)");
-        return;
+        return SourceHandle::Driver(adapter);
     }
 
     #[cfg(all(windows, feature = "etw"))]
-    attach_etw(session).await;
+    return attach_etw(session);
 
     #[cfg(not(any(all(windows, feature = "etw"), all(windows, feature = "driver"))))]
     {
@@ -737,6 +820,7 @@ async fn attach_event_source(
             "no event source: build with --features etw or --features driver (and run \
              elevated) — nothing will be observed and the run will idle"
         );
+        SourceHandle::None
     }
 }
 
@@ -927,7 +1011,23 @@ async fn run_service_body(args: Vec<std::ffi::OsString>) -> anyhow::Result<()> {
     // `--config <path>` set at install time lands here.
     let args = Args::parse_from(args);
     let nonce = generate_nonce();
-    let deps = production_session_deps(&args.config_path, nonce.clone()).await?;
+
+    // Register the handler and report StartPending BEFORE anything slow: the
+    // broker connect retries for up to 90 s, and without this SCM's default
+    // 30 s start wait expires (error 1053) — flagging the service failed
+    // exactly when the broker is slow to come up, the scenario the retry
+    // budget exists for.
+    let (scm_tx, scm_rx) = std::sync::mpsc::channel::<SandboxEvent>();
+    let status = agent::adapters::driving::service_control::register_control_handler(scm_tx)?;
+    status
+        .start_pending(std::time::Duration::from_secs(100))
+        .map_err(|error| anyhow::anyhow!("SCM StartPending rejected: {error}"))?;
+
+    // Config first (the log dir configures tracing), then the slow broker
+    // connect, then Running.
+    let config = agent::adapters::driven::config_toml::load(&args.config_path)?;
+    init_tracing(Some(std::path::Path::new(&config.telemetry.log_dir)));
+    let deps = production_session_deps(config, nonce.clone()).await?;
     // Held for the whole service body: dropping the guard shuts egress down.
     let _sentry_guard = init_sentry(&deps.config);
 
@@ -939,11 +1039,8 @@ async fn run_service_body(args: Vec<std::ffi::OsString>) -> anyhow::Result<()> {
 
     let (session, stop_tx, stop_rx) = agent::app::runtime::RunningSession::start(deps).await?;
     attach_ipc(&session, &ipc_config, ipc_broker, ipc_clock, &nonce, ipc_pid_gate).await;
-    attach_event_source(&session, &ipc_config).await;
+    let source = attach_event_source(&session, &ipc_config).await;
 
-    // SCM handler (sync thread) → runtime stop channel (async).
-    let (scm_tx, scm_rx) = std::sync::mpsc::channel::<SandboxEvent>();
-    let status = agent::adapters::driving::service_control::register_control_handler(scm_tx)?;
     status.running()?;
     tokio::task::spawn_blocking(move || {
         for event in &scm_rx {
@@ -954,6 +1051,7 @@ async fn run_service_body(args: Vec<std::ffi::OsString>) -> anyhow::Result<()> {
     });
 
     session.run_until_stop(stop_rx).await?;
+    source.stop().await;
     status.stopped()?;
     Ok(())
 }

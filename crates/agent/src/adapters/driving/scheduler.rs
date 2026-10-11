@@ -6,8 +6,11 @@
 //! it is pure periodic wire output, not sandbox telemetry. The deadline is a
 //! pipeline event because it drives the core session state machine.
 //!
-//! Timers use tokio's clock (pausable in tests); durations are computed from
-//! the injected `SystemClockPort`'s view of session start.
+//! Timers use tokio's clock (pausable in tests). The deadline measures
+//! BOOT-LOCAL monotonic time, not the injected clock's view of the session:
+//! the wall clock inside the VM is deliberately fake and the study start may
+//! jump it by any amount — a forward-dated `time.timestamp` made the old
+//! `now - started_at` elapsed enormous and finalized session 0 instantly.
 
 use std::{
     sync::{
@@ -80,14 +83,10 @@ impl SchedulerAdapter {
         self.cancel.cancel();
     }
 
-    /// Seconds from now until the current session's deadline (`None` = dynamic).
-    fn deadline_delay_secs(&self) -> Option<u64> {
+    /// The current session's scheduled uptime, if any (`None` = dynamic).
+    fn scheduled_secs(&self) -> Option<u64> {
         let state = self.state.lock();
-        let session = state.current_session()?;
-        let scheduled = session.scheduled_duration_secs?;
-        let elapsed_ms = (self.clock.now_ms() - session.started_at_ms).max(0);
-        let elapsed = u64::try_from(elapsed_ms).unwrap_or(0);
-        Some(scheduled.saturating_sub(elapsed / 1000))
+        state.current_session()?.scheduled_duration_secs
     }
 
     async fn keepalive_loop(&self) {
@@ -148,16 +147,21 @@ impl SchedulerAdapter {
     }
 
     async fn deadline_task(&self, inlet: &Arc<dyn EventInletPort<SandboxEvent>>) {
-        let Some(delay_secs) = self.deadline_delay_secs() else {
+        let Some(scheduled) = self.scheduled_secs() else {
             // Dynamic session: no scheduled deadline; the scope-die path or an
             // external stop ends the session instead. Park until cancelled.
             self.cancel.cancelled().await;
             return;
         };
+        // Monotonic uptime from scheduler start: the wall clock is a plaything
+        // of the study (see the module doc) — boot-local time is immune to it
+        // by construction. The scheduler starts within the same assembly as
+        // the session open, so the skew against `started_at_ms` is sub-second.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(scheduled);
         tokio::select! {
             biased;
             () = self.cancel.cancelled() => {}
-            () = tokio::time::sleep(Duration::from_secs(delay_secs)) => {
+            () = tokio::time::sleep_until(deadline) => {
                 inlet.accept(SandboxEvent::SessionDeadline).await;
             }
         }

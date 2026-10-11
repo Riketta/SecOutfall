@@ -31,6 +31,7 @@ use crate::ports::driven::driver_control::{
     decode_driver_stats,
     encode_device_security,
     encode_drop_policy,
+    encode_file_watch_policy,
     encode_injection_policy,
     encode_protection_policy,
 };
@@ -175,6 +176,14 @@ impl DriverControlPort for DriverControlDevice {
             self.send(codes::SET_PROTECTED, &encode_protection_policy(protection))?;
         }
         Ok(())
+    }
+
+    fn set_file_watch(
+        &self,
+        enabled: bool,
+        extensions: &[String],
+    ) -> Result<(), DriverControlError> {
+        self.send(codes::SET_FILE_WATCH, &encode_file_watch_policy(enabled, extensions))
     }
 
     fn query_stats(&self) -> Result<DriverStatsSnapshot, DriverControlError> {

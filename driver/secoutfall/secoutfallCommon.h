@@ -263,13 +263,14 @@ struct DriverStats {
 	ULONG64 SensorEventsDrained;   // ring slots promoted to records
 	ULONG64 SensorEventsDropped;   // slots skipped: torn, stale or garbage
 	ULONG64 SensorRingsActive;     // currently registered sensors with rings
+	ULONG64 SensorRingsSkipped;    // registered rings beyond a drain's snapshot cap
 };
 
 // Fixed payload extents ON THE WIRE: header + payload FIELDS, excluding any
 // struct tail padding (records are byte-packed — the next record starts at
 // `Size`, so sizeof(ThreadRecord)'s 56-byte tail-padded form never goes on
 // the wire). static_asserts keep the constants honest against the structs.
-const ULONG ProcessExitedFixed = sizeof(ProcessExitedRecord);       // 48
+const ULONG ProcessExitedFixed = sizeof(ProcessExitedRecord);           // 48
 const ULONG ProcessCreatedFixed = sizeof(ProcessCreatedRecord);     // 60
 const ULONG ThreadFixed = 52;
 const ULONG ImageLoadedFixed = sizeof(ImageLoadedRecord);           // 64
@@ -284,6 +285,13 @@ const ULONG ProtectionEventFixed = sizeof(ProtectionEventRecord);   // 80
 static_assert(offsetof(ThreadRecord, ThreadId) + sizeof(ULONG) == ThreadFixed, "wire layout pinned");
 static_assert(offsetof(RegistryKeyRecord, PathBytes) + sizeof(USHORT) == RegistryKeyFixed, "wire layout pinned");
 static_assert(offsetof(FileRecord, PathBytes) + sizeof(USHORT) == FileFixed, "wire layout pinned");
+
+// Largest possible wire record: the fixed ProcessCreated payload plus the two
+// capped strings it carries. GET_DATA rejects output buffers smaller than
+// this — a client that cannot hold ANY record must not silently destroy the
+// queue through the drain's oversized-skip policy.
+#define SECOUTFALL_MAX_RECORD_BYTES \
+	(ProcessCreatedFixed + MaxCommandLineBytes + MaxImageNameBytes)
 
 // IOCTLs. Unsigned literals: 0x8000 << 16 would overflow int (UB) and the
 // value would stop being a constant expression (unusable as a case label).

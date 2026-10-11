@@ -49,6 +49,7 @@ use protocol::{
         RegistryKeyData,
         RegistryValueSetData,
         ThreadStartedData,
+        ThreadStoppedData,
     },
 };
 use windows::{
@@ -95,13 +96,25 @@ const NAME_CACHE_CAP: usize = 4096;
 pub struct DriverEventSourceAdapter {
     clock: Arc<dyn crate::ports::driven::clock::SystemClockPort>,
     clock_offset_ms: AtomicI64,
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl DriverEventSourceAdapter {
     /// Builds the adapter over the agent's (fake) clock port; the real→fake
     /// offset is captured lazily from the first drained record.
     pub fn new(clock: Arc<dyn crate::ports::driven::clock::SystemClockPort>) -> Self {
-        Self { clock, clock_offset_ms: AtomicI64::new(0) }
+        Self {
+            clock,
+            clock_offset_ms: AtomicI64::new(0),
+            cancel: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    /// Stops the drain loop (idempotent). [`run`](Self::run) returns shortly
+    /// after — the per-iteration sleep is cancel-aware; a blocking
+    /// `GET_DATA` never waits (the driver answers with whatever is queued).
+    pub fn stop(&self) {
+        self.cancel.cancel();
     }
 }
 
@@ -199,11 +212,22 @@ fn map_record(record: &driver_wire::Record, context: &mut DrainContext) -> Optio
             })))
         }
         driver_wire::Payload::Thread { thread_id } => {
-            Some(SandboxEvent::Source(SourceEvent::ThreadStarted(ThreadStartedData {
-                pid,
-                tid: *thread_id,
-                parent_tid: None,
-            })))
+            // The decoder collapses both thread kinds into one payload; the
+            // record's kind carries the direction. Mapping unconditionally to
+            // `ThreadStarted` published a `thread.started` for every thread
+            // DEATH — the review found it.
+            if record.kind() == driver_wire::RecordKind::ThreadExited {
+                Some(SandboxEvent::Source(SourceEvent::ThreadStopped(ThreadStoppedData {
+                    pid,
+                    tid: *thread_id,
+                })))
+            } else {
+                Some(SandboxEvent::Source(SourceEvent::ThreadStarted(ThreadStartedData {
+                    pid,
+                    tid: *thread_id,
+                    parent_tid: None,
+                })))
+            }
         }
         driver_wire::Payload::ImageLoaded { name, .. } => {
             let resolved = name_from(name.as_ref());
@@ -436,7 +460,11 @@ impl crate::ports::driving::event_source::EventSourcePort for DriverEventSourceA
                     }
                 }
             }
-            tokio::time::sleep(DRAIN_INTERVAL).await;
+            tokio::select! {
+                biased;
+                () = self.cancel.cancelled() => return Ok(()),
+                () = tokio::time::sleep(DRAIN_INTERVAL) => {}
+            }
         }
     }
 }

@@ -187,3 +187,44 @@ async fn zero_scheduled_duration_deadlines_immediately_once() {
     sched.stop();
     let _ = tokio::time::timeout(Duration::from_millis(1), handle).await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn forward_dated_fake_clock_does_not_fire_the_deadline_early() {
+    // The regression: a forward-dated `time.timestamp` made the old wall-clock
+    // elapsed (`fake_now - real_started_at`) enormous, so session 0 finalized
+    // instantly. The deadline measures boot-local monotonic time now — the
+    // fake clock's position must be irrelevant.
+    let state = open_session_state(Some(3600));
+    let year_2030_ms: i64 = 1_893_456_000_000;
+    let clock = Arc::new(FakeClock::new(year_2030_ms));
+    let broker = Arc::new(FakeBroker::default());
+    let seq = Arc::new(AtomicU64::new(0));
+    let inlet = Arc::new(RecordingInlet::default());
+    let sched = Arc::new(adapter(state, &seq, &broker, &clock));
+    let run_inlet: Arc<dyn EventInletPort<SandboxEvent>> = inlet.clone();
+    let task_sched = Arc::clone(&sched);
+    let handle = tokio::spawn(async move { task_sched.run(run_inlet).await });
+
+    tokio::task::yield_now().await;
+    // One simulated minute: nowhere near the 3600 s uptime.
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let deadlines = inlet
+        .snapshot()
+        .into_iter()
+        .filter(|event| matches!(event, SandboxEvent::SessionDeadline))
+        .count();
+    assert_eq!(deadlines, 0, "forward-dated clock must not fire the deadline");
+
+    // ...and the full simulated uptime still fires exactly once.
+    tokio::time::advance(Duration::from_secs(3540)).await;
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let deadlines = inlet
+        .snapshot()
+        .into_iter()
+        .filter(|event| matches!(event, SandboxEvent::SessionDeadline))
+        .count();
+    assert_eq!(deadlines, 1, "deadline fires after the scheduled uptime");
+    sched.stop();
+    let _ = tokio::time::timeout(Duration::from_millis(1), handle).await;
+}

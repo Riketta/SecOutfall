@@ -82,12 +82,27 @@ InjectionEntry* FindLedgerEntryLocked(_In_ ULONG pid) {
 	return nullptr;
 }
 
-void RemoveLedgerEntryLocked(_In_ InjectionEntry* entry) {
-	RemoveEntryList(&entry->Link);
-	g_Data.InjectionLedgerCount--;
+// Unlinks the entry for `pid` (lock held). The CALLER destroys the returned
+// entry outside the lock via DestroyLedgerEntry — teardown closes the ring
+// section and unmaps the kernel view (ZwClose/MmUnmapViewInSystemSpace are
+// PASSIVE-only, never under this FastMutex at APC_LEVEL).
+InjectionEntry* UnlinkLedgerEntryLocked(_In_ ULONG pid) {
+	auto entry = FindLedgerEntryLocked(pid);
+	if (entry != nullptr) {
+		RemoveEntryList(&entry->Link);
+		g_Data.InjectionLedgerCount--;
+	}
+	return entry;
+}
+
+// Full entry teardown: PASSIVE, no locks held.
+void DestroyLedgerEntry(_In_ InjectionEntry* entry) {
 	if (entry->InitialThread)
 		ObDereferenceObject(entry->InitialThread);
-	entry->InitialThread = nullptr;
+	if (entry->RingKernelVa)
+		::MmUnmapViewInSystemSpace(entry->RingKernelVa);
+	if (entry->RingSection)
+		::ZwClose(entry->RingSection);
 	ExFreePool(entry);
 }
 
@@ -285,16 +300,16 @@ bool QueueLoadLibraryApc(_In_ PEPROCESS process, _In_ PETHREAD thread,
 
 // Queues the sensor-load APC for a ledger entry SNAPSHOT: thread + ntdll
 // base are copies taken under the lock. Runs WITHOUT the ledger lock and
-// never touches the entry — a concurrent process exit (RemoveLedgerEntryLocked
-// ExFreePools the entry) must not turn this into a use-after-free.
+// never touches the entry — a concurrent process exit (entry teardown
+// outside the lock) must not turn this into a use-after-free.
 // Caller holds: one extra thread reference, one process reference.
 // IRQL <= APC_LEVEL (QueueLoadLibraryApc attaches to the target process).
-bool TryInjectSnapshot(_In_ PETHREAD thread, _In_ PEPROCESS process,
-	_In_ PVOID ntdllBase) {
-	if (!g_Data.LdrLoadDllRvaResolved || g_Data.SensorDllPath.Buffer == nullptr) {
+bool TryInjectSnapshot(_In_ PCUNICODE_STRING dllPath, _In_ PETHREAD thread,
+	_In_ PEPROCESS process, _In_ PVOID ntdllBase) {
+	if (!g_Data.LdrLoadDllRvaResolved) {
 		return false;
 	}
-	return QueueLoadLibraryApc(process, thread, &g_Data.SensorDllPath,
+	return QueueLoadLibraryApc(process, thread, dllPath,
 		ntdllBase, g_Data.LdrLoadDllRva);
 }
 
@@ -313,20 +328,31 @@ void TryInjectLocked(_In_ InjectionEntry* entry, _In_ ULONG pid) {
 		|| g_Data.SensorDllPath.Buffer == nullptr)
 		return;
 
-	// Transition Pending* -> Injected claims the attempt; the fixup below
-	// rolls it back on failure so a later trigger can retry.
+	// Transition Ready -> Injected claims the attempt; the fixup below rolls
+	// it back on failure so a later trigger can retry.
 	auto previous = InterlockedCompareExchange(
 		reinterpret_cast<volatile LONG*>(&entry->State),
-		LONG(InjectionState::Injected), LONG(InjectionState::PendingNtdll));
-	if (previous != LONG(InjectionState::PendingNtdll))
+		LONG(InjectionState::Injected), LONG(InjectionState::Ready));
+	if (previous != LONG(InjectionState::Ready))
 		return;
 
-	// Snapshot under the lock: thread reference + ntdll base. The ENTRY has
-	// no extra reference — after Unlock it may be freed (that is exactly
-	// why this copy exists).
+	// Snapshot under the lock: thread reference, ntdll base, and the DLL
+	// path (a concurrent policy push frees the global buffer — the APC must
+	// never touch it after Unlock). The ENTRY has no extra reference — after
+	// Unlock it may be freed (that is exactly why these copies exist).
 	ObReferenceObject(entry->InitialThread);
 	auto thread = entry->InitialThread;
 	auto ntdllBase = entry->NtdllBase;
+	WCHAR pathBuffer[MaxFilePathBytes / sizeof(WCHAR)];
+	auto pathBytes = static_cast<USHORT>(min(g_Data.SensorDllPath.Length,
+		static_cast<USHORT>(sizeof(pathBuffer) - sizeof(WCHAR))));
+	pathBytes &= static_cast<USHORT>(~1);
+	::memcpy(pathBuffer, g_Data.SensorDllPath.Buffer, pathBytes);
+	pathBuffer[pathBytes / sizeof(WCHAR)] = L'\0';
+	UNICODE_STRING dllPath;
+	dllPath.Buffer = pathBuffer;
+	dllPath.Length = pathBytes;
+	dllPath.MaximumLength = pathBytes;
 
 	// PASSIVE_LEVEL from here: safe for PsLookupProcessByProcessId and for
 	// the process attach inside QueueLoadLibraryApc.
@@ -336,7 +362,7 @@ void TryInjectLocked(_In_ InjectionEntry* entry, _In_ ULONG pid) {
 	auto status = ::PsLookupProcessByProcessId(
 		reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid)), &process);
 	auto lookupOk = NT_SUCCESS(status);
-	auto ok = lookupOk && TryInjectSnapshot(thread, process, ntdllBase);
+	auto ok = lookupOk && TryInjectSnapshot(&dllPath, thread, process, ntdllBase);
 
 	if (process != nullptr)
 		ObDereferenceObject(process);
@@ -352,11 +378,11 @@ void TryInjectLocked(_In_ InjectionEntry* entry, _In_ ULONG pid) {
 	if (ok) {
 		InterlockedIncrement64(&g_Data.InjectionsQueued);
 	} else if (!lookupOk) {
-		// Process already gone (or unknown): retryable — a later trigger is
-		// meaningless for THIS process, but keeping Pending preserves the
-		// pre-review claim semantics and the counters stay honest.
+		// Process already gone (or unknown): retryable — keeping Ready
+		// preserves the pre-review claim semantics and the counters stay
+		// honest.
 		InterlockedExchange(reinterpret_cast<volatile LONG*>(&current->State),
-			LONG(InjectionState::PendingNtdll));
+			LONG(InjectionState::Ready));
 	} else {
 		// APC queue failure is terminal for the attempt (matches the old
 		// Failed state); Failed is scored as a sensor-degradation signal.
@@ -433,7 +459,7 @@ void InjectionCleanup() {
 	}
 	while (!IsListEmpty(&dead)) {
 		auto link = RemoveHeadList(&dead);
-		RemoveLedgerEntryLocked(CONTAINING_RECORD(link, InjectionEntry, Link));
+		DestroyLedgerEntry(CONTAINING_RECORD(link, InjectionEntry, Link));
 	}
 	if (g_Data.InjectionBlocklist) {
 		delete g_Data.InjectionBlocklist;
@@ -551,7 +577,7 @@ void InjectionOnProcessCreate(_In_ ULONG pid, _In_ ULONG64 createTime,
 	ULONG64 tick = 0;
 	KeQueryTickCount(reinterpret_cast<PLARGE_INTEGER>(&tick));
 	ULONG64 nonce = tick * 0x9E3779B97F4A7C15ull ^ (ULONGLONG(pid) << 32)
-		^ InterlockedIncrement64(&g_Data.InjectionsQueued);
+		^ InterlockedIncrement64(&g_Data.InjectionNonceCounter);
 
 	auto entry = (InjectionEntry*)::ExAllocatePool2(POOL_FLAG_NON_PAGED,
 		sizeof(InjectionEntry), DRIVER_TAG);
@@ -563,9 +589,12 @@ void InjectionOnProcessCreate(_In_ ULONG pid, _In_ ULONG64 createTime,
 	entry->CreateTime = createTime;
 	entry->Nonce = nonce;
 	entry->InitialThread = nullptr;
-	entry->ProcessHandle = nullptr;
 	entry->NtdllBase = nullptr;
 	entry->State = InjectionState::PendingThread;
+	entry->RingSection = nullptr;
+	entry->RingKernelVa = nullptr;
+	entry->RingDrainIndex = 0;
+	entry->SensorVersion = 0;
 
 	AutoLock<FastMutex> locker(*g_Data.InjectionLedgerLock);
 	if (FindLedgerEntryLocked(pid) != nullptr) {
@@ -584,6 +613,13 @@ void InjectionOnFirstThread(_In_ ULONG pid, _In_ PETHREAD thread) {
 	if (entry->InitialThread == nullptr) {
 		ObReferenceObject(thread);
 		entry->InitialThread = thread;
+		// Advance the machine: thread seen. With ntdll already recorded the
+		// entry becomes Ready; otherwise it waits for the ntdll image load.
+		auto target = entry->NtdllBase != nullptr
+			? InjectionState::Ready
+			: InjectionState::PendingNtdll;
+		InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&entry->State),
+			LONG(target), LONG(InjectionState::PendingThread));
 	}
 	TryInjectLocked(entry, pid);
 }
@@ -617,42 +653,26 @@ void InjectionOnImageLoad(_In_ ULONG pid, _In_ PVOID base, _In_ PCUNICODE_STRING
 		// Every process maps ntdll; record THIS process's base (any ntdll
 		// image-load for the pid — there is exactly one per process).
 		entry->NtdllBase = base;
+		// Advance the machine: ntdll seen. The expected previous state depends
+		// on the arrival order (thread first -> PendingNtdll), but both orders
+		// end in Ready; the losing CAS is a harmless no-op.
+		auto expected = entry->InitialThread != nullptr
+			? InjectionState::PendingNtdll
+			: InjectionState::PendingThread;
+		InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&entry->State),
+			LONG(InjectionState::Ready), LONG(expected));
 	}
 	TryInjectLocked(entry, pid);
 }
 
 void InjectionOnProcessExit(_In_ ULONG pid) {
-	AutoLock<FastMutex> locker(*g_Data.InjectionLedgerLock);
-	auto entry = FindLedgerEntryLocked(pid);
-	if (entry != nullptr)
-		RemoveLedgerEntryLocked(entry);
-}
-
-// Creates + kernel-maps the sensor ring for an entry (challenge time). The
-// section is UNNAMED — the only route to it is the duplicate handle the
-// challenge hands to the injected sensor.
-bool CreateSensorRing(_Inout_ InjectionEntry* entry) {
-	if (entry->RingKernelVa)
-		return true; // already created (duplicate challenge)
-	LARGE_INTEGER maxSize;
-	maxSize.QuadPart = SENSOR_RING_SIZE;
-	auto status = ::ZwCreateSection(&entry->RingSection, SECTION_MAP_READ | SECTION_MAP_WRITE,
-		nullptr, &maxSize, PAGE_READWRITE, SEC_COMMIT, nullptr);
-	if (!NT_SUCCESS(status))
-		return false;
-	SIZE_T viewSize = SENSOR_RING_SIZE;
-	status = ::MmMapViewInSystemSpace(entry->RingSection, &entry->RingKernelVa, &viewSize);
-	if (!NT_SUCCESS(status)) {
-		::ZwClose(entry->RingSection);
-		entry->RingSection = nullptr;
-		return false;
+	InjectionEntry* victim = nullptr;
+	{
+		AutoLock<FastMutex> locker(*g_Data.InjectionLedgerLock);
+		victim = UnlinkLedgerEntryLocked(pid);
 	}
-	::RtlZeroMemory(entry->RingKernelVa, SENSOR_RING_SIZE);
-	auto control = (SensorRingControl*)entry->RingKernelVa;
-	control->SlotSize = SENSOR_SLOT_SIZE;
-	control->SlotCount = SENSOR_SLOT_COUNT;
-	entry->RingDrainIndex = 0;
-	return true;
+	if (victim != nullptr)
+		DestroyLedgerEntry(victim);
 }
 
 bool InjectionSensorChallenge(_In_ ULONG pid, _In_ HANDLE callerProcess,
@@ -663,35 +683,141 @@ bool InjectionSensorChallenge(_In_ ULONG pid, _In_ HANDLE callerProcess,
 	challenge->SlotSize = 0;
 	challenge->SlotCount = 0;
 
-	AutoLock<FastMutex> locker(*g_Data.InjectionLedgerLock);
-	auto entry = FindLedgerEntryLocked(pid);
-	if (entry == nullptr || entry->State != InjectionState::Injected) {
-		InterlockedIncrement64(&g_Data.SensorsRejected);
-		return false;
-	}
-	if (!CreateSensorRing(entry)) {
-		InterlockedIncrement64(&g_Data.AllocFailures);
-		return false;
+	// Pass 1 (lock): gate on the ledger, snapshot the identity. No Zw* work
+	// under the FastMutex — section create/map/duplicate are PASSIVE-only,
+	// and the lock raises to APC_LEVEL (the exact defect class the
+	// TryInjectLocked refactor fixed).
+	ULONG64 nonce = 0;
+	ULONG64 createTime = 0;
+	bool hasRing = false;
+	HANDLE existingSection = nullptr;
+	{
+		AutoLock<FastMutex> locker(*g_Data.InjectionLedgerLock);
+		auto entry = FindLedgerEntryLocked(pid);
+		if (entry == nullptr || entry->State != InjectionState::Injected) {
+			InterlockedIncrement64(&g_Data.SensorsRejected);
+			return false;
+		}
+		nonce = entry->Nonce;
+		createTime = entry->CreateTime;
+		hasRing = entry->RingKernelVa != nullptr;
+		existingSection = entry->RingSection;
 	}
 
-	// Duplicate the section into the caller (the injected sensor process).
+	// Pass 2 (no lock, PASSIVE): create/map a fresh ring when the entry has
+	// none, and duplicate the section into the caller.
+	bool created = false;
+	HANDLE section = nullptr;   // handle duplicated FROM
+	PVOID freshVa = nullptr;    // set only for a freshly created ring
 	HANDLE caller = nullptr;
-	auto status = ::ObOpenObjectByPointer(callerProcess, 0, nullptr,
-		PROCESS_DUP_HANDLE, *PsProcessType, UserMode, &caller);
-	if (!NT_SUCCESS(status)) {
-		InterlockedIncrement64(&g_Data.SensorsRejected);
-		return false;
-	}
 	HANDLE userHandle = nullptr;
-	status = ::ZwDuplicateObject(NtCurrentProcess(), entry->RingSection, caller,
-		&userHandle, 0, 0, DUPLICATE_SAME_ACCESS);
-	::ZwClose(caller);
-	if (!NT_SUCCESS(status)) {
-		InterlockedIncrement64(&g_Data.SensorsRejected);
-		return false;
+	if (hasRing) {
+		section = existingSection;
+	} else {
+		LARGE_INTEGER maxSize;
+		maxSize.QuadPart = SENSOR_RING_SIZE;
+		auto status = ::ZwCreateSection(&section, SECTION_MAP_READ | SECTION_MAP_WRITE,
+			nullptr, &maxSize, PAGE_READWRITE, SEC_COMMIT, nullptr);
+		if (!NT_SUCCESS(status)) {
+			InterlockedIncrement64(&g_Data.AllocFailures);
+			return false;
+		}
+		SIZE_T viewSize = SENSOR_RING_SIZE;
+		status = ::MmMapViewInSystemSpace(section, &freshVa, &viewSize);
+		if (!NT_SUCCESS(status)) {
+			::ZwClose(section);
+			InterlockedIncrement64(&g_Data.AllocFailures);
+			return false;
+		}
+		::RtlZeroMemory(freshVa, SENSOR_RING_SIZE);
+		auto control = (SensorRingControl*)freshVa;
+		control->SlotSize = SENSOR_SLOT_SIZE;
+		control->SlotCount = SENSOR_SLOT_COUNT;
+		created = true;
+	}
+	{
+		auto status = ::ObOpenObjectByPointer(callerProcess, 0, nullptr,
+			PROCESS_DUP_HANDLE, *PsProcessType, UserMode, &caller);
+		if (!NT_SUCCESS(status)) {
+			if (created) {
+				::MmUnmapViewInSystemSpace(freshVa);
+				::ZwClose(section);
+			}
+			InterlockedIncrement64(&g_Data.SensorsRejected);
+			return false;
+		}
+		status = ::ZwDuplicateObject(NtCurrentProcess(), section, caller,
+			&userHandle, 0, 0, DUPLICATE_SAME_ACCESS);
+		::ZwClose(caller);
+		if (!NT_SUCCESS(status)) {
+			if (created) {
+				::MmUnmapViewInSystemSpace(freshVa);
+				::ZwClose(section);
+			}
+			InterlockedIncrement64(&g_Data.SensorsRejected);
+			return false;
+		}
 	}
 
-	challenge->Nonce = entry->Nonce;
+	// Pass 3 (lock): re-find the LIVE entry and commit. A concurrent challenge
+	// may have won the ring between the passes — in that case our fresh ring
+	// is discarded and the caller gets a duplicate of the entry's own section
+	// (one more PASSIVE pass, outside the lock).
+	bool ok = false;
+	bool adoptExisting = false;
+	{
+		AutoLock<FastMutex> locker(*g_Data.InjectionLedgerLock);
+		auto entry = FindLedgerEntryLocked(pid);
+		if (entry != nullptr && entry->State == InjectionState::Injected
+			&& entry->CreateTime == createTime && entry->Nonce == nonce) {
+			if (hasRing || entry->RingKernelVa != nullptr) {
+				if (!hasRing) {
+					// Lost a concurrent challenge's race: adopt the winner's
+					// section instead of ours.
+					adoptExisting = true;
+					existingSection = entry->RingSection;
+				}
+				ok = true;
+			} else {
+				// Transfer the fresh ring into the entry (ownership moves; the
+				// drain and the teardown take it from here).
+				entry->RingSection = section;
+				entry->RingKernelVa = freshVa;
+				entry->RingDrainIndex = 0;
+				created = false;
+				ok = true;
+			}
+		}
+	}
+	if (!ok) {
+		if (created) {
+			::MmUnmapViewInSystemSpace(freshVa);
+			::ZwClose(section);
+		}
+		::ZwClose(userHandle);
+		InterlockedIncrement64(&g_Data.SensorsRejected);
+		return false;
+	}
+	if (adoptExisting) {
+		// Our orphan userHandle points at a ring nobody will activate.
+		::ZwClose(userHandle);
+		caller = nullptr;
+		auto status = ::ObOpenObjectByPointer(callerProcess, 0, nullptr,
+			PROCESS_DUP_HANDLE, *PsProcessType, UserMode, &caller);
+		if (!NT_SUCCESS(status)) {
+			InterlockedIncrement64(&g_Data.SensorsRejected);
+			return false;
+		}
+		status = ::ZwDuplicateObject(NtCurrentProcess(), existingSection, caller,
+			&userHandle, 0, 0, DUPLICATE_SAME_ACCESS);
+		::ZwClose(caller);
+		if (!NT_SUCCESS(status)) {
+			InterlockedIncrement64(&g_Data.SensorsRejected);
+			return false;
+		}
+	}
+
+	challenge->Nonce = nonce;
 	challenge->RingHandle = userHandle;
 	challenge->RingSize = SENSOR_RING_SIZE;
 	challenge->SlotSize = SENSOR_SLOT_SIZE;
@@ -732,12 +858,17 @@ void InjectionDrainRings() {
 	{
 		AutoLock<FastMutex> locker(*g_Data.InjectionLedgerLock);
 		for (auto link = g_Data.InjectionLedger.Flink;
-			link != &g_Data.InjectionLedger && count < 64; link = link->Flink) {
+			link != &g_Data.InjectionLedger; link = link->Flink) {
 			auto entry = CONTAINING_RECORD(link, InjectionEntry, Link);
 			if (entry->State == InjectionState::Registered && entry->RingKernelVa != nullptr) {
-				rings[count] = { entry->RingKernelVa, entry->RingDrainIndex,
-					entry->Pid, entry->CreateTime };
-				++count;
+				if (count < 64) {
+					rings[count] = { entry->RingKernelVa, entry->RingDrainIndex,
+						entry->Pid, entry->CreateTime };
+					++count;
+				} else {
+					// Beyond the snapshot cap: counted, never silent.
+					InterlockedIncrement64(&g_Data.SensorRingsSkipped);
+				}
 			}
 		}
 	}

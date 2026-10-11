@@ -21,10 +21,17 @@ pub fn random_hex(bytes: usize) -> String {
 }
 
 /// Win32 path → NT-form path (`\??\C:\...`), the form `LdrLoadDll` wants.
+/// UNC paths (\\server\share\...) map to the `\??\UNC\...` device namespace —
+/// the naive prefix would produce the invalid `\??\\\server\...`.
 #[must_use]
 pub fn to_nt_path(dos: &str) -> String {
-    let trimmed = dos.trim_start_matches(r"\??\");
-    format!(r"\??\{}", trimmed.replace('/', "\\"))
+    // Normalize separators FIRST: the UNC check runs on backslash form, so
+    // `//server/share` must already be `\\server\share` when tested.
+    let trimmed = dos.trim_start_matches(r"\??\").replace('/', "\\");
+    if let Some(rest) = trimmed.strip_prefix(r"\\") {
+        return format!(r"\??\UNC\{rest}");
+    }
+    format!(r"\??\{trimmed}")
 }
 
 /// SHA-256 of `bytes`, lowercase hex.
@@ -66,6 +73,12 @@ mod tests {
         assert_eq!(to_nt_path("C:/x/y.dll"), r"\??\C:\x\y.dll");
         // Already-NT paths survive unchanged (idempotent).
         assert_eq!(to_nt_path(r"\??\C:\x\y.dll"), r"\??\C:\x\y.dll");
+    }
+
+    #[test]
+    fn unc_paths_map_to_the_unc_device_namespace() {
+        assert_eq!(to_nt_path(r"\\server\share\x.dll"), r"\??\UNC\server\share\x.dll");
+        assert_eq!(to_nt_path("//server/share/x.dll"), r"\??\UNC\server\share\x.dll");
     }
 
     #[test]

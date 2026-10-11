@@ -210,8 +210,10 @@ OB_PREOP_CALLBACK_STATUS ObPreOperation(_In_ PVOID registrationContext,
 	// Trusted callers: the System process and our own protected processes
 	// (the agent must be able to manage the user-actor it launched).
 	auto caller = HandleToULong(PsGetCurrentProcessId());
-	if (caller == 4 || g_Table->Contains(caller))
+	if (caller == 4 || g_Table->Contains(caller)) {
+		InterlockedIncrement64(&g_Data.ProtectionTrusted);
 		return OB_PREOP_SUCCESS;
+	}
 
 	ULONG64 mask = isProcess ? ProcessStripMask : ThreadStripMask;
 	ULONG64 original = 0;

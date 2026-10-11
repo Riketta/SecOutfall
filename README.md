@@ -148,13 +148,15 @@ config.
 
 ## Telemetry
 
-`tracing` macros everywhere; subscriber = `registry()` + `EnvFilter` +
-console + `sentry-tracing` layer → a **local GlitchTip**. Sentry joins as a
-layer in the single global registry — no conflict with
-`tracing-subscriber`. Egress is gated by `[telemetry] sentry_enabled` (egress
-from the analysis VM is visible to malware). The user actor reports to
-GlitchTip directly with its own DSN, pushed over IPC. Timestamps are skewed
-by the fake clock — correlate by session id, never by SDK timestamps.
+`tracing` macros everywhere; subscriber = `registry()` + `EnvFilter` + console
++ a non-blocking daily rolling file under `[telemetry] log_dir` (default
+`C:\ProgramData\SecOutfall\logs`) + `sentry-tracing` layer → a **local
+GlitchTip**. Sentry joins as a layer in the single global registry — no
+conflict with `tracing-subscriber`. Egress is gated by `[telemetry]
+sentry_enabled` (egress from the analysis VM is visible to malware). The user
+actor reports to GlitchTip directly with its own DSN, pushed over IPC, and
+writes its own rolling file in the same default directory. Timestamps are
+skewed by the fake clock — correlate by session id, never by SDK timestamps.
 
 ## Testing
 

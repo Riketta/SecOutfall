@@ -12,9 +12,12 @@
 enum class ConsoleColor : WORD {
 	DarkGreen = 2,
 	DarkRed = 4,
+	DarkYellow = 6,
 	Cyan = 11,
 	Green = 10,
 	Red = 12,
+	Magenta = 13,
+	Yellow = 14,
 	Gray = 7,
 	White = 15,
 };
@@ -40,8 +43,8 @@ bool RangeOk(DWORD recordSize, USHORT offset, USHORT bytes) {
 		&& static_cast<ULONG>(offset) + bytes <= recordSize;
 }
 
-std::wstring ReadWstr(const BYTE* record, USHORT offset, USHORT bytes) {
-	if (!RangeOk(0, offset, bytes))
+std::wstring ReadWstr(const BYTE* record, DWORD recordSize, USHORT offset, USHORT bytes) {
+	if (!RangeOk(recordSize, offset, bytes))
 		return L"<out of range>";
 	return std::wstring(reinterpret_cast<const WCHAR*>(record + offset), bytes / sizeof(WCHAR));
 }
@@ -99,7 +102,7 @@ void DisplayData(const BYTE* buffer, DWORD size) {
 				}
 				auto record = reinterpret_cast<const ProcessCreatedRecord*>(buffer);
 				auto cmd = record->CommandLineBytes > 0
-					? ReadWstr(buffer, record->CommandLineOffset, record->CommandLineBytes)
+					? ReadWstr(buffer, header->Size, record->CommandLineOffset, record->CommandLineBytes)
 					: std::wstring(L"<none>");
 				printf("process %lu created (parent %lu, id %llu): %ws%ws\n",
 					header->ProcessId, record->ParentProcessId,
@@ -140,7 +143,7 @@ void DisplayData(const BYTE* buffer, DWORD size) {
 					return;
 				}
 				auto record = reinterpret_cast<const ImageLoadedRecord*>(buffer);
-				auto name = ReadWstr(buffer, record->NameOffset, record->NameBytes);
+				auto name = ReadWstr(buffer, header->Size, record->NameOffset, record->NameBytes);
 				printf("image %ws loaded in process %lu (base %llx, %lu bytes)%ws\n",
 					name.c_str(), header->ProcessId,
 					static_cast<unsigned long long>(record->ImageBase), record->ImageSize,
@@ -157,7 +160,7 @@ void DisplayData(const BYTE* buffer, DWORD size) {
 					return;
 				}
 				auto record = reinterpret_cast<const RegistryKeyRecord*>(buffer);
-				auto path = ReadWstr(buffer, record->PathOffset, record->PathBytes);
+				auto path = ReadWstr(buffer, header->Size, record->PathOffset, record->PathBytes);
 				printf("registry key %hs: %ws (process %lu)%ws\n",
 					header->Type == RegistryKeyCreated ? "created" : "deleted",
 					path.c_str(), header->ProcessId,
@@ -173,13 +176,117 @@ void DisplayData(const BYTE* buffer, DWORD size) {
 					return;
 				}
 				auto record = reinterpret_cast<const RegistrySetValueRecord*>(buffer);
-				auto key = ReadWstr(buffer, record->KeyPathOffset, record->KeyPathBytes);
-				auto value = ReadWstr(buffer, record->ValueNameOffset, record->ValueNameBytes);
+				auto key = ReadWstr(buffer, header->Size, record->KeyPathOffset, record->KeyPathBytes);
+				auto value = ReadWstr(buffer, header->Size, record->ValueNameOffset, record->ValueNameBytes);
 				printf("registry write (process %lu): %ws\\%ws type %lu size %lu%ws%ws\n",
 					header->ProcessId, key.c_str(), value.c_str(),
 					record->DataType, record->DataBytes,
 					TruncSuffix(header->TruncFlags, TRUNC_KEY_PATH, L"key").c_str(),
 					TruncSuffix(header->TruncFlags, TRUNC_DATA, L"data").c_str());
+				break;
+			}
+
+			case FileCreated:
+			case FileCleanedUp:
+			case FileDeleted:
+			{
+				SetColor(ConsoleColor::Yellow);
+				if (header->Size < FileFixed) {
+					printf("short file record\n");
+					return;
+				}
+				auto record = reinterpret_cast<const FileRecord*>(buffer);
+				auto path = ReadWstr(buffer, header->Size, record->PathOffset, record->PathBytes);
+				printf("file %hs: %ws (process %lu)%ws\n",
+					header->Type == FileCreated ? "created"
+					: header->Type == FileCleanedUp ? "cleaned-up" : "deleted",
+					path.c_str(), header->ProcessId,
+					TruncSuffix(header->TruncFlags, TRUNC_FILE_PATH, L"path").c_str());
+				break;
+			}
+
+			case FileWritten:
+			{
+				SetColor(ConsoleColor::DarkYellow);
+				if (header->Size < FileWrittenFixed) {
+					printf("short file-write record\n");
+					return;
+				}
+				auto record = reinterpret_cast<const FileWrittenRecord*>(buffer);
+				auto path = ReadWstr(buffer, header->Size, record->PathOffset, record->PathBytes);
+				printf("file write %lu bytes at +%llu: %ws (process %lu)%ws\n",
+					record->BytesCount,
+					static_cast<unsigned long long>(record->ByteOffset), path.c_str(),
+					header->ProcessId,
+					TruncSuffix(header->TruncFlags, TRUNC_FILE_PATH, L"path").c_str());
+				break;
+			}
+
+			case FileRenamed:
+			{
+				SetColor(ConsoleColor::Yellow);
+				if (header->Size < FileRenamedFixed) {
+					printf("short file-rename record\n");
+					return;
+				}
+				auto record = reinterpret_cast<const FileRenamedRecord*>(buffer);
+				auto oldPath = ReadWstr(buffer, header->Size, record->OldPathOffset, record->OldPathBytes);
+				auto newPath = ReadWstr(buffer, header->Size, record->NewPathOffset, record->NewPathBytes);
+				printf("file renamed (process %lu): %ws -> %ws%ws%ws\n",
+					header->ProcessId, oldPath.c_str(), newPath.c_str(),
+					TruncSuffix(header->TruncFlags, TRUNC_OLD_PATH, L"old").c_str(),
+					TruncSuffix(header->TruncFlags, TRUNC_NEW_PATH, L"new").c_str());
+				break;
+			}
+
+			case DropCaptured:
+			{
+				SetColor(ConsoleColor::Magenta);
+				if (header->Size < DropCapturedFixed) {
+					printf("short drop record\n");
+					return;
+				}
+				auto record = reinterpret_cast<const DropCapturedRecord*>(buffer);
+				auto path = ReadWstr(buffer, header->Size, record->PathOffset, record->PathBytes);
+				auto stored = ReadWstr(buffer, header->Size, record->StoredOffset, record->StoredBytes);
+				printf("drop captured (%hs): %ws -> %ws (process %lu)%ws\n",
+					record->Method == DROP_METHOD_HARDLINK ? "hardlink" : "copy",
+					path.c_str(), stored.c_str(), header->ProcessId,
+					TruncSuffix(header->TruncFlags, TRUNC_FILE_PATH, L"path").c_str());
+				break;
+			}
+
+			case BehaviorCall:
+			{
+				SetColor(ConsoleColor::Red);
+				if (header->Size < BehaviorCallFixed) {
+					printf("short behavior record\n");
+					return;
+				}
+				auto record = reinterpret_cast<const BehaviorCallRecord*>(buffer);
+				printf("behavior api %lu (thread %lu): 0x%llx 0x%llx 0x%llx 0x%llx (process %lu)\n",
+					record->Api, record->ThreadId,
+					static_cast<unsigned long long>(record->Arg0),
+					static_cast<unsigned long long>(record->Arg1),
+					static_cast<unsigned long long>(record->Arg2),
+					static_cast<unsigned long long>(record->Arg3),
+					header->ProcessId);
+				break;
+			}
+
+			case ProtectionEvent:
+			{
+				SetColor(ConsoleColor::Red);
+				if (header->Size < ProtectionEventFixed) {
+					printf("short protection record\n");
+					return;
+				}
+				auto record = reinterpret_cast<const ProtectionEventRecord*>(buffer);
+				printf("protection: %s %lu (opener %lu): stripped 0x%llx of 0x%llx\n",
+					record->TargetIsThread ? "thread" : "process",
+					record->ProtectedPid, header->ProcessId,
+					static_cast<unsigned long long>(record->StrippedAccess),
+					static_cast<unsigned long long>(record->OriginalDesiredAccess));
 				break;
 			}
 

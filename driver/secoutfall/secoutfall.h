@@ -56,6 +56,7 @@ struct Globals {
 	volatile LONG64 DropsCopyFailed;
 	volatile LONG64 SensorEventsDrained; // ring slots promoted to records
 	volatile LONG64 SensorEventsDropped; // slots skipped: torn, stale or garbage
+	volatile LONG64 SensorRingsSkipped;  // registered rings beyond a drain snapshot cap
 	// Drop extension matcher + target directory (heap-built: FastMutex).
 	FileWatch* DropWatch;
 	DropTarget* Target;
@@ -75,21 +76,12 @@ struct Globals {
 	bool LdrLoadDllRvaResolved;
 	volatile LONG64 InjectionsQueued;
 	volatile LONG64 InjectionsFailed;
+	volatile LONG64 InjectionNonceCounter; // nonce ingredient (never surfaced)
 	volatile LONG64 SensorsRegistered;
 	volatile LONG64 SensorsRejected;
 	volatile LONG64 ProtectionsStripped; // handle-open attempts stripped
 	volatile LONG64 ProtectionTrusted;   // attempts allowed (trusted caller)
 	PVOID ObRegistration;                // ObCallbacks handle (D4)
-
-	// File telemetry stays OFF until a client (agent/dumper) sends
-	// SET_FILE_WATCH — a driver that observes nothing cannot flood anything.
-	volatile LONG64 FileWatchEnabled;
-	// Configured extension list (each WITH the dot, e.g. L".exe"), nonpaged
-	// UNICODE_STRING array; empty array + enabled = ALL files.
-	PUNICODE_STRING* Extensions;
-	ULONG ExtensionsCount;
-	// Scratch buffer backing the extension strings.
-	PWCHAR ExtensionsBlob;
 
 	// Minifilter registration handle (nullptr until registered).
 	PFLT_FILTER Filter;

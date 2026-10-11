@@ -86,6 +86,14 @@ fn base_config() -> AgentConfig {
     config.target.path = "C:\\Targets\\evil.exe".into();
     config.target.every_session = false;
     config.platform.shutdown_delay_secs = 0;
+    // The collector creates the drops dir for real whenever a flow observes
+    // a drop: point it at a per-run temp directory. The default is an
+    // absolute Windows path — a test run on Linux parses it as RELATIVE and
+    // litters the checkout (the documented U+F03A litter).
+    config.drops.path = std::env::temp_dir()
+        .join(format!("secoutfall-flow-drops-{}", std::process::id()))
+        .display()
+        .to_string();
     config
 }
 

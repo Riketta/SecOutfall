@@ -95,6 +95,7 @@ fn launch_blocking(spec: &LaunchSpec) -> Result<LaunchOutcome, LaunchError> {
                     WTSQueryUserToken,
                 },
                 Threading::{
+                    CREATE_NO_WINDOW,
                     CREATE_UNICODE_ENVIRONMENT,
                     CreateProcessAsUserW,
                     PROCESS_INFORMATION,
@@ -197,7 +198,11 @@ fn launch_blocking(spec: &LaunchSpec) -> Result<LaunchOutcome, LaunchError> {
             None,
             None,
             false,
-            CREATE_UNICODE_ENVIRONMENT,
+            // CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT: the user actor is
+            // a headless observer — a visible console window on the analyzed
+            // desktop is a realism leak to the malware. (The TARGET keeps its
+            // own console; only OUR process is hidden.)
+            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
             None,
             working_dir_ptr,
             std::ptr::from_ref(&si),

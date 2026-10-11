@@ -142,11 +142,27 @@ fn init_tracing() {
     // The Sentry layer is wired at init but stays a no-op until the DSN from
     // the WELCOME push activates a client — layers are fixed at subscriber
     // init, the egress client is not (`init_sentry_once`).
-    tracing_subscriber::registry()
+    //
+    // Rolling file: the interactive session has no console, so without a
+    // file sink the module logs nowhere. The DEFAULT log directory is used
+    // deliberately — the module starts before its config push arrives and
+    // reads no files to learn a custom one (the agent's `[telemetry] log_dir`
+    // documents this). Writing logs is output, not config; the process runs
+    // as SYSTEM and the directory already exists in a deployed VM.
+    let registry = tracing_subscriber::registry()
         .with(filter)
         .with(tracing_subscriber::fmt::layer().with_target(false))
-        .with(sentry_tracing::layer())
-        .init();
+        .with(sentry_tracing::layer());
+    let dir = std::path::Path::new(r"C:\ProgramData\SecOutfall\logs");
+    if std::fs::create_dir_all(dir).is_err() {
+        registry.init();
+        return; // diagnostics only — never refuse to run
+    }
+    let appender = tracing_appender::rolling::daily(dir, "secoutfall-user-actor.log");
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    // Process-lifetime transport, same deliberate leak as the Sentry guard.
+    std::mem::forget(guard);
+    registry.with(tracing_subscriber::fmt::layer().with_target(false).with_writer(writer)).init();
 }
 
 /// Activate Sentry egress exactly once, from the DSN pushed over IPC (the

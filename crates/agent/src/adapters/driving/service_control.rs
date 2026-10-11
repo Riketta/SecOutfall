@@ -62,6 +62,25 @@ impl StatusHandle {
         self.set(ServiceState::Stopped, ServiceControlAccept::empty())
     }
 
+    /// Transition to `StartPending` with a wait hint. The broker connect
+    /// retries for up to 90 s — without reporting `StartPending` first, SCM's
+    /// default 30 s start wait expires (error 1053) and the service is
+    /// flagged failed exactly when the broker is slow to come up.
+    ///
+    /// # Errors
+    /// [`windows_service::Error`] when SCM rejects the status update.
+    pub fn start_pending(&self, wait_hint: Duration) -> Result<(), windows_service::Error> {
+        self.inner.set_service_status(ServiceStatus {
+            service_type: self.service_type,
+            current_state: ServiceState::StartPending,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint,
+            process_id: None,
+        })
+    }
+
     fn set(
         &self,
         current_state: ServiceState,

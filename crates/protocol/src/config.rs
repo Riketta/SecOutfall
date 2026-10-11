@@ -283,7 +283,7 @@ impl Default for UserActorSection {
 }
 
 /// Telemetry egress policy (`[telemetry]` section).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TelemetryConfig {
     /// Master switch for Sentry-protocol egress (local `GlitchTip`).
@@ -292,6 +292,23 @@ pub struct TelemetryConfig {
     pub dsn: String,
     /// User-actor DSN, pushed over IPC; empty disables user-actor reporting.
     pub user_actor_dsn: String,
+    /// Rolling-file log directory (absolute). The agent writes its rolling
+    /// log here; the user actor uses the same default directory (it starts
+    /// logging before its config push arrives, so it cannot honor a custom
+    /// value).
+    pub log_dir: String,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            sentry_enabled: false,
+            dsn: String::new(),
+            user_actor_dsn: String::new(),
+            // Absolute like every other state path (System32-CWD trap).
+            log_dir: "C:\\ProgramData\\SecOutfall\\logs".to_owned(),
+        }
+    }
 }
 
 /// Scoring weights (`[scoring]` section).
@@ -454,6 +471,20 @@ impl AgentConfig {
         if self.telemetry.sentry_enabled && self.telemetry.dsn.is_empty() {
             problems.push("telemetry.dsn must not be empty when sentry_enabled");
         }
+        // State paths: empty means "relative to the service CWD" — which is
+        // System32 for a session-0 service (the documented silent-write trap).
+        if self.study.scope_path.is_empty() {
+            problems.push("study.scope_path must not be empty");
+        }
+        if self.drops.path.is_empty() {
+            problems.push("drops.path must not be empty");
+        }
+        if self.screenshots.path.is_empty() {
+            problems.push("screenshots.path must not be empty");
+        }
+        if self.telemetry.log_dir.is_empty() {
+            problems.push("telemetry.log_dir must not be empty");
+        }
 
         if problems.is_empty() { Ok(()) } else { Err(ConfigError::Validation(problems.join("; "))) }
     }
@@ -527,18 +558,18 @@ mod tests {
         uptimes = [6000, 6000, 6000]
         autoshutdown = false
         processes_to_terminate = ["notepad", "CalculatorApp"]
-        scope_path = 'C:\\ProgramData\\SecOutfall\\scope.json'
+        scope_path = 'C:\ProgramData\SecOutfall\scope.json'
         files_to_validate = []
 
         [drops]
-        path = 'C:\\ProgramData\\SecOutfall\\Drops'
+        path = 'C:\ProgramData\SecOutfall\Drops'
         extensions = [".txt", ".ps1", ".bat", ".exe", ".dll", ".cld", ".dat", ".cvd"]
         max_size = 20971520
         limit_per_session = 30
         upload_uri = "http://127.0.0.1:8085"
 
         [screenshots]
-        path = 'C:\\ProgramData\\SecOutfall\\Screenshots'
+        path = 'C:\ProgramData\SecOutfall\Screenshots'
         save = false
         max_per_session = 100
         upload_uri = "http://127.0.0.1:8080"
@@ -564,6 +595,7 @@ mod tests {
         sentry_enabled = true
         dsn = "http://glitchtip.lab.local/agent-project/1"
         user_actor_dsn = "http://glitchtip.lab.local/user-actor-project/2"
+        log_dir = 'C:\ProgramData\SecOutfall\logs'
 
         [debug]
         skip_reboot_and_shutdown = false
@@ -589,6 +621,7 @@ mod tests {
         assert_eq!(config.user_actor.focus_method, FocusMethod::WinEvents);
         assert!(config.user_actor.screencapture);
         assert!(config.telemetry.sentry_enabled);
+        assert_eq!(config.telemetry.log_dir, "C:\\ProgramData\\SecOutfall\\logs");
         assert!(config.debug.console);
         assert!(config.validate().is_ok());
     }
@@ -647,6 +680,32 @@ mod tests {
         config.telemetry.sentry_enabled = true;
         let error = config.validate().unwrap_err();
         assert!(error.to_string().contains("telemetry.dsn"), "{error}");
+    }
+
+    #[test]
+    fn validation_rejects_empty_state_paths() {
+        // Empty state paths mean "relative to the service CWD" — System32 for
+        // a session-0 service. Defaults are absolute; stripping one must be a
+        // loud validation error, not a silent state file in System32.
+        let mut config = AgentConfig::default();
+        config.target.path = "C:\\t.exe".to_owned();
+        config.study.scope_path = String::new();
+        assert!(config.validate().unwrap_err().to_string().contains("scope_path"));
+
+        let mut config = AgentConfig::default();
+        config.target.path = "C:\\t.exe".to_owned();
+        config.drops.path = String::new();
+        assert!(config.validate().unwrap_err().to_string().contains("drops.path"));
+
+        let mut config = AgentConfig::default();
+        config.target.path = "C:\\t.exe".to_owned();
+        config.screenshots.path = String::new();
+        assert!(config.validate().unwrap_err().to_string().contains("screenshots.path"));
+
+        let mut config = AgentConfig::default();
+        config.target.path = "C:\\t.exe".to_owned();
+        config.telemetry.log_dir = String::new();
+        assert!(config.validate().unwrap_err().to_string().contains("log_dir"));
     }
 
     #[test]

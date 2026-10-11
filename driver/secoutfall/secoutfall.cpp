@@ -156,6 +156,32 @@ ULONG64 NextIdentityMiss() {
 	return InterlockedIncrement64(&g_Data.IdentityMisses);
 }
 
+// Arms the destination stream's context with CopyDone BEFORE the copy's
+// writes go out: TryCaptureDrop sees a non-PENDING context (KEEP_IF_EXISTS)
+// and skips; TryCleanupCopy sees a non-PENDING state and skips.
+void MarkStreamCopied(_In_ PFLT_INSTANCE instance, _In_opt_ PFILE_OBJECT object) {
+	if (object == nullptr)
+		return;
+	DropStreamContext* context = nullptr;
+	if (!NT_SUCCESS(::FltAllocateContext(g_Data.Filter, FLT_STREAM_CONTEXT,
+		sizeof(DropStreamContext), NonPagedPool,
+		reinterpret_cast<PFLT_CONTEXT*>(&context))))
+		return;
+	// FltAllocateContext does not zero: every field the callbacks read must
+	// be initialized (TryCleanupCopy snapshots StoredName before its state
+	// check).
+	context->State = DROP_COPY_DONE;
+	context->StoredName.Buffer = context->Buffer;
+	context->StoredName.Length = 0;
+	context->StoredName.MaximumLength = sizeof(context->Buffer);
+	::RtlZeroMemory(context->Buffer, sizeof(context->Buffer));
+	if (!NT_SUCCESS(::FltSetStreamContext(instance, object,
+		FLT_SET_CONTEXT_KEEP_IF_EXISTS, context, nullptr))) {
+		// A context already exists (write raced us) — its state governs.
+	}
+	::FltReleaseContext(context);
+}
+
 // Allocates a queue item and fills the v2 record header. Returns the WIRE
 // record (the ItemFull wrapper header is invisible on the wire). `totalSize`
 // is the full wire record size, header included.
@@ -312,7 +338,8 @@ bool CopyFileToDrops(_In_ PFLT_INSTANCE instance, _In_ PCUNICODE_STRING sourcePa
 	OBJECT_ATTRIBUTES dstOa;
 	InitializeObjectAttributes(&dstOa, &dest, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, nullptr, nullptr);
 	HANDLE dstHandle = nullptr;
-	status = ::FltCreateFileEx2(g_Data.Filter, instance, &dstHandle, nullptr,
+	PFILE_OBJECT dstObject = nullptr;
+	status = ::FltCreateFileEx2(g_Data.Filter, instance, &dstHandle, &dstObject,
 		FILE_GENERIC_WRITE, &dstOa, &iosb, nullptr, FILE_ATTRIBUTE_NORMAL,
 		FILE_SHARE_READ, FILE_SUPERSEDE, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
 		nullptr, 0, 0, nullptr);
@@ -322,6 +349,10 @@ bool CopyFileToDrops(_In_ PFLT_INSTANCE instance, _In_ PCUNICODE_STRING sourcePa
 			::FltObjectDereference(srcObject);
 		return false;
 	}
+	// Mark the destination stream as driver-copied: the filter's own write
+	// callbacks must never capture the copy as a drop of its own
+	// (self-capture loop polluting the drops evidence).
+	MarkStreamCopied(instance, dstObject);
 
 	auto chunk = (PUCHAR)::ExAllocatePool2(POOL_FLAG_PAGED, 65536, DRIVER_TAG);
 	auto ok = chunk != nullptr;
@@ -349,6 +380,8 @@ bool CopyFileToDrops(_In_ PFLT_INSTANCE instance, _In_ PCUNICODE_STRING sourcePa
 	if (chunk)
 		ExFreePool(chunk);
 	::ZwClose(dstHandle);
+	if (dstObject)
+		::FltObjectDereference(dstObject);
 	::FltClose(srcHandle);
 	if (srcObject)
 		::FltObjectDereference(srcObject);
@@ -440,17 +473,31 @@ void TryCleanupCopy(_In_ PFLT_INSTANCE instance, _In_ PFLT_CALLBACK_DATA data,
 	if (!NT_SUCCESS(::FltGetStreamContext(instance, data->Iopb->TargetFileObject,
 		reinterpret_cast<PFLT_CONTEXT*>(&context))))
 		return; // never a drop candidate
+	// Snapshot the stored name BEFORE anything can release the context: at
+	// cleanup this reference may be the last one (stream teardown racing the
+	// post-cleanup callback), and a released context is freed memory.
+	WCHAR storedBuf[64];
+	UNICODE_STRING stored;
+	auto storedBytes = static_cast<USHORT>(min(context->StoredName.Length,
+		static_cast<USHORT>(sizeof(storedBuf) - sizeof(WCHAR))));
+	storedBytes &= static_cast<USHORT>(~1);
+	::memcpy(storedBuf, context->StoredName.Buffer, storedBytes);
+	storedBuf[storedBytes / sizeof(WCHAR)] = L'\0';
+	stored.Buffer = storedBuf;
+	stored.Length = storedBytes;
+	stored.MaximumLength = storedBytes;
 	auto state = InterlockedExchange(&context->State, DROP_COPY_DONE);
 	::FltReleaseContext(context);
 	if (state != DROP_COPY_PENDING)
 		return; // linked at first write, or a duplicate cleanup
 	if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
-		InterlockedExchange(&context->State, DROP_COPY_PENDING);
+		// Capture lost (counted): the context is already released and there
+		// is exactly one cleanup per stream — no state to restore.
 		InterlockedIncrement64(&g_Data.DropsMissedBusy);
 		return;
 	}
-	if (CopyFileToDrops(instance, path, &context->StoredName))
-		EmitDropCaptured(path, &context->StoredName, DROP_METHOD_COPY, pid);
+	if (CopyFileToDrops(instance, path, &stored))
+		EmitDropCaptured(path, &stored, DROP_METHOD_COPY, pid);
 	else
 		InterlockedIncrement64(&g_Data.DropsCopyFailed);
 }
@@ -667,21 +714,25 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING) {
 			break;
 		}
 
-		g_Data.Identities = new (PagedPool) IdentityTable;
+		g_Data.Identities = new (NonPagedPool) IdentityTable;
 		g_Data.Identities->Init();
-		g_Data.Watch = new (PagedPool) FileWatch;
+		g_Data.Watch = new (NonPagedPool) FileWatch;
 		g_Data.Watch->Init();
-		g_Data.Target = new (PagedPool) DropTarget;
+		g_Data.Target = new (NonPagedPool) DropTarget;
 		g_Data.Target->Init();
-		g_Data.DropWatch = new (PagedPool) FileWatch;
+		g_Data.DropWatch = new (NonPagedPool) FileWatch;
 		g_Data.DropWatch->Init();
 		InjectionInit();
 		ProtectionInit();
-		g_Data.Drops = new (PagedPool) Queue<FastMutex>(512);
-		g_Data.Items = new (PagedPool) Queue<FastMutex>(256, &g_Data.QueueOverwritten);
+		// NON-paged objects: their locks and list heads are touched from
+		// minifilter post-op callbacks that may run at DISPATCH_LEVEL (the
+		// records themselves are nonpaged via AllocRecord for the same
+		// reason).
+		g_Data.Drops = new (NonPagedPool) Queue<FastMutex>(512);
+		g_Data.Items = new (NonPagedPool) Queue<FastMutex>(256, &g_Data.QueueOverwritten);
 		// Flood class gets its own bounded list: a write storm must not evict
 		// process evidence. Same drain, per-class overflow counters.
-		g_Data.Files = new (PagedPool) Queue<FastMutex>(4096, &g_Data.FilesOverwritten);
+		g_Data.Files = new (NonPagedPool) Queue<FastMutex>(4096, &g_Data.FilesOverwritten);
 
 		//
 		// setup process, thread and image callbacks
@@ -869,8 +920,12 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 			// METHOD_OUT_DIRECT with a zero-length buffer carries no MDL — and
 			// MmGetSystemAddressForMdlSafe dereferences the MDL pointer, so the
 			// null check must come FIRST (NT_ASSERT compiles out in free
-			// builds; every IOCTL is hostile input).
-			if (size == 0 || Irp->MdlAddress == nullptr) {
+			// builds; every IOCTL is hostile input). Buffers that cannot hold
+			// the LARGEST possible record are rejected outright: the drain's
+			// oversized-skip policy would otherwise silently discard the whole
+			// queue on behalf of a client that can never make progress.
+			if (size == 0 || Irp->MdlAddress == nullptr
+				|| size < SECOUTFALL_MAX_RECORD_BYTES) {
 				status = STATUS_INVALID_PARAMETER;
 				break;
 			}
@@ -879,6 +934,9 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 				status = STATUS_INSUFFICIENT_RESOURCES;
 				break;
 			}
+			// Sensor rings drain first: promoted BehaviorCall records join
+			// this same batch via the merged queue drain below.
+			InjectionDrainRings();
 			auto count = 0UL;
 			// Merged drain over all three rate-class queues, ordered by the
 			// global sequence: pop the globally-older head that fits; a head
@@ -974,6 +1032,7 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 			stats->SensorsRejected = g_Data.SensorsRejected;
 			stats->SensorEventsDrained = g_Data.SensorEventsDrained;
 			stats->SensorEventsDropped = g_Data.SensorEventsDropped;
+			stats->SensorRingsSkipped = g_Data.SensorRingsSkipped;
 			stats->SensorRingsActive = 0;
 			{
 				AutoLock<FastMutex> locker(*g_Data.InjectionLedgerLock);
@@ -1000,7 +1059,7 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 			auto blobBytes = input->ExtensionsBytes;
 			if (blobBytes > FileWatch::MaxBlobBytes || blobBytes % 2 != 0
 				|| input->ExtensionsCount > FileWatch::MaxExtensions
-				|| inputLength < sizeof(FileWatchPolicy) + blobBytes) {
+				|| inputLength != sizeof(FileWatchPolicy) + blobBytes) {
 				status = STATUS_INVALID_PARAMETER;
 				break;
 			}
@@ -1226,6 +1285,7 @@ NTSTATUS SecOutfallDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 			auto pathBytes = input->DllPathBytes;
 			auto exclBytes = input->ExclusionsBytes;
 			if (pathBytes < 2 * sizeof(WCHAR) || pathBytes % 2 != 0
+				|| pathBytes > MaxFilePathBytes
 				|| exclBytes % 2 != 0
 				|| inputLength != sizeof(InjectionPolicy) + pathBytes + exclBytes) {
 				status = STATUS_INVALID_PARAMETER;
@@ -1686,7 +1746,15 @@ FLT_POSTOP_CALLBACK_STATUS FLTAPI SecOutfallPostSetInfo(_Inout_ PFLT_CALLBACK_DA
 	_In_ PCFLT_RELATED_OBJECTS FltObjects, _In_opt_ PVOID CompletionContext,
 	_In_ FLT_POST_OPERATION_FLAGS Flags) {
 	UNREFERENCED_PARAMETER(FltObjects);
-	UNREFERENCED_PARAMETER(Flags);
+
+	// Filter teardown drain: CallbackData must not be touched — only the
+	// pre-op context may (and must) be freed.
+	if (FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING)) {
+		auto drained = static_cast<RenameContext*>(CompletionContext);
+		if (drained != nullptr)
+			ExFreePool(drained);
+		return FLT_POSTOP_FINISHED_PROCESSING;
+	}
 
 	auto context = static_cast<RenameContext*>(CompletionContext);
 	auto cls = Data->Iopb->Parameters.SetFileInformation.FileInformationClass;

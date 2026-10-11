@@ -7,12 +7,14 @@
 //
 // Flow (state in the ledger, lock-guarded):
 //   process create   -> PendingThread   (identity + nonce minted)
-//   ntdll image load -> ntdll base recorded; LdrLoadDll RVA resolved once
-//   first thread     -> both present  -> APC queued (Injected)
+//   first thread     -> PendingThread -> PendingNtdll (ntdll not seen yet)
+//                        or straight to Ready when ntdll is already present
+//   ntdll image load -> Pending*     -> Ready
+//   both present     -> APC queued (Injected), CAS from Ready
 //   sensor register  -> Registered    (nonce echoed; one-shot)
 //   process exit     -> entry removed
 //
-// The APC routine is a 17-byte stub written into the target: it bridges the
+// The APC routine is a 20-byte stub written into the target: it bridges the
 // user-APC single argument to LdrLoadDll's four (see InjectStubBytes).
 //
 // Known, accepted v1 limits:
@@ -43,7 +45,6 @@ struct InjectionEntry {
 	ULONG64 CreateTime;      // identity pairing
 	ULONG64 Nonce;           // per-injection secret, echoed at registration
 	PETHREAD InitialThread;  // referenced while the entry lives
-	HANDLE ProcessHandle;    // kernel handle, VM operation on the target
 	PVOID NtdllBase;         // ntdll base in THIS process
 	InjectionState State;
 
@@ -82,4 +83,3 @@ void InjectionDrainRings();
 void InjectionEmitBehaviorCall(_In_ ULONG pid, _In_ ULONG64 createTime,
 	_In_ ULONG threadId, _In_ ULONG api, _In_ ULONG64 arg0, _In_ ULONG64 arg1,
 	_In_ ULONG64 arg2, _In_ ULONG64 arg3);
-bool InjectionSensorRegister(_In_ ULONG pid, _In_ ULONG64 nonce, _In_ ULONG sensorVersion);

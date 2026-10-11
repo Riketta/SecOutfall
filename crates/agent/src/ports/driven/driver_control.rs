@@ -104,6 +104,8 @@ pub struct DriverStatsSnapshot {
     pub sensor_events_dropped: u64,
     /// Currently registered sensors with rings (u64 in the C struct).
     pub sensor_rings_active: u64,
+    /// Registered rings beyond a drain's snapshot cap (never drained).
+    pub sensor_rings_skipped: u64,
     /// Handle-open attempts stripped.
     pub protections_stripped: u64,
     /// Attempts allowed (trusted caller).
@@ -151,8 +153,10 @@ pub mod codes {
     /// (the second wrong-method finding; the agent's constant was even
     /// mislabeled `METHOD_OUT_DIRECT` while holding method 1).
     pub const GET_STATS: u32 = ctl_code(DEVICE, 0x801, METHOD_BUFFERED, FILE_READ_ACCESS);
-    /// File-telemetry extension filter (reserved; the agent does not send
-    /// it yet — the driver's boot default applies).
+    /// File-telemetry extension filter: enabled + extension list (empty list
+    /// = ALL files). The agent pushes it whenever the driver source is
+    /// active — the driver boots with the watch OFF, and without this push
+    /// file telemetry AND drop capture never run.
     pub const SET_FILE_WATCH: u32 = ctl_code(DEVICE, 0x802, METHOD_BUFFERED, FILE_WRITE_ACCESS);
     /// Lab-only self-flood; never sent by the agent.
     pub const SELFTEST_FLOOD: u32 = ctl_code(DEVICE, 0x803, METHOD_BUFFERED, FILE_WRITE_ACCESS);
@@ -272,6 +276,23 @@ pub fn encode_device_security(enabled: bool, security_descriptor: &[u8]) -> Vec<
     blob
 }
 
+/// Serializes the file-watch push into the `FileWatchPolicy` input blob:
+/// 12-byte header `{Enabled u8, Reserved[3], ExtensionsCount u32,
+/// ExtensionsBytes u32}` followed by the extension list (NUL-terminated
+/// UTF-16LE, C-array convention). An empty list with `enabled = true` means
+/// ALL files.
+#[must_use]
+pub fn encode_file_watch_policy(enabled: bool, extensions: &[String]) -> Vec<u8> {
+    let list = wide_list(extensions);
+    let mut blob = Vec::with_capacity(12 + list.len());
+    blob.push(u8::from(enabled));
+    blob.extend_from_slice(&[0; 3]);
+    blob.extend_from_slice(&u32::to_le_bytes(u32::try_from(extensions.len()).unwrap_or(u32::MAX)));
+    blob.extend_from_slice(&u32::to_le_bytes(u32::try_from(list.len()).unwrap_or(u32::MAX)));
+    blob.extend_from_slice(&list);
+    blob
+}
+
 /// Decodes the `GET_STATS` reply (the `DriverStats` C struct, natural x64
 /// alignment: 4-byte magic trio, six `ULONG`s, then 8-aligned `ULONG64`s —
 /// the tail order per secoutfallCommon.h is sensors → protections → sensor
@@ -311,7 +332,8 @@ pub fn decode_driver_stats(bytes: &[u8]) -> Result<DriverStatsSnapshot, DriverCo
     const OFF_SENSOR_EVENTS_DRAINED: usize = 176;
     const OFF_SENSOR_EVENTS_DROPPED: usize = 184;
     const OFF_SENSOR_RINGS_ACTIVE: usize = 192;
-    const STATS_SIZE: usize = 200;
+    const OFF_SENSOR_RINGS_SKIPPED: usize = 200;
+    const STATS_SIZE: usize = 208;
 
     // Magic + version header, same trio the record stream carries.
     // SECOUTFALL_WIRE_MAGIC = 0x5346 ('SF'), SECOUTFALL_WIRE_VERSION = 2
@@ -381,6 +403,7 @@ pub fn decode_driver_stats(bytes: &[u8]) -> Result<DriverStatsSnapshot, DriverCo
         sensor_events_drained: field64(OFF_SENSOR_EVENTS_DRAINED)?,
         sensor_events_dropped: field64(OFF_SENSOR_EVENTS_DROPPED)?,
         sensor_rings_active: field64(OFF_SENSOR_RINGS_ACTIVE)?,
+        sensor_rings_skipped: field64(OFF_SENSOR_RINGS_SKIPPED)?,
     })
 }
 
@@ -499,12 +522,36 @@ mod pin_tests {
         assert_eq!(stats.sensor_events_drained, 0x394A_4B4C_4D4E_4F50);
         assert_eq!(stats.sensor_events_dropped, 0x596A_6B6C_6D6E_6F70);
         assert_eq!(stats.sensor_rings_active, 0x798A_8B8C_8D8E_8F90);
+        assert_eq!(stats.sensor_rings_skipped, 0x99AA_BBCC_DDEE_FF00);
+    }
+
+    /// The `GET_DATA` floor the driver enforces (a smaller buffer would
+    /// silently destroy the queue) is pinned alongside the codes.
+    #[test]
+    fn max_record_bytes_matches_the_c_macro() {
+        let text = String::from_utf8(fixture("emit_codes.txt")).unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.starts_with("MAX_RECORD_BYTES="))
+            .expect("C fixture lacks MAX_RECORD_BYTES");
+        let theirs: u32 = line["MAX_RECORD_BYTES=".len()..].parse().unwrap();
+        // C: ProcessCreatedFixed (sizeof, tail-padded to 8-alignment: 60 → 64)
+        // + MaxCommandLineBytes + MaxImageNameBytes.
+        assert_eq!(theirs, 64 + 8192 + 1024);
+    }
+
+    #[test]
+    fn file_watch_policy_bytes_match_the_c_struct() {
+        let blob = encode_file_watch_policy(true, &[".exe".to_owned(), ".dll".to_owned()]);
+        assert_eq!(blob, fixture("emit_filewatch.bin"));
+        // The all-files push (enabled, empty list) is a bare 12-byte header.
+        assert_eq!(encode_file_watch_policy(true, &[]), vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]
     fn short_stats_reply_is_an_error_not_a_panic() {
         let bytes = fixture("emit_stats.bin");
-        assert!(decode_driver_stats(&bytes[..199]).is_err());
+        assert!(decode_driver_stats(&bytes[..207]).is_err());
         assert!(decode_driver_stats(&[]).is_err());
     }
 
@@ -568,6 +615,20 @@ pub trait DriverControlPort: Send + Sync + 'static {
     /// [`DriverControlError`] when the device is missing or the driver
     /// rejects the descriptor.
     fn apply_device_security(&self, sddl: &str) -> Result<(), DriverControlError>;
+
+    /// Arms (or disarms) the file-telemetry watch. The driver boots with the
+    /// watch OFF — without this push, file telemetry AND drop capture never
+    /// run. An empty `extensions` list with `enabled = true` means ALL files.
+    /// Idempotent; safe to re-send on config reload.
+    ///
+    /// # Errors
+    /// [`DriverControlError`] when the device is missing or the driver
+    /// rejects the policy.
+    fn set_file_watch(
+        &self,
+        enabled: bool,
+        extensions: &[String],
+    ) -> Result<(), DriverControlError>;
 
     /// Queries the loss/health snapshot.
     ///

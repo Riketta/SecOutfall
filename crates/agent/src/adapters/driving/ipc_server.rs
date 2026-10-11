@@ -461,7 +461,19 @@ impl ClientSession {
             if handshaked.is_none() && frame.message_type != message_type::HELLO {
                 tracing::warn!(frame_type = frame.message_type, "frame before HELLO; refusing");
                 let body = error_frame_body("handshake required")?;
-                send_frame(server, message_type::ERROR, &body).await?;
+                // The refusal write is bounded by the SAME handshake deadline:
+                // a hostile client that writes but never reads would otherwise
+                // pin this task (and one of the bounded pipe instances)
+                // forever.
+                if tokio::time::timeout_at(deadline, send_frame(server, message_type::ERROR, &body))
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!(
+                        "pre-handshake ERROR not accepted in time; dropping the client"
+                    );
+                    return Ok(());
+                }
                 continue;
             }
 

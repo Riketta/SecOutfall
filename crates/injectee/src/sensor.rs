@@ -120,7 +120,10 @@ fn open_device() -> Result<HANDLE, ()> {
             std::ptr::null_mut(),
         )
     };
-    if handle.is_null() {
+    // Win32 failure is INVALID_HANDLE_VALUE (-1), NOT null — the null-only
+    // check misclassified every failure as a valid handle and burned the
+    // handshake retries on a garbage handle.
+    if handle.is_null() || handle as usize == usize::MAX {
         Err(())
     } else {
         Ok(handle)

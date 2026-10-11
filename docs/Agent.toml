@@ -150,6 +150,10 @@ sentry_enabled = false
 dsn = ""
 # Separate user-actor DSN, pushed over IPC (independent failure domain).
 user_actor_dsn = ""
+# Rolling-file log directory (absolute — see scope_path). The agent writes
+# its rolling log here; the user actor logs to the same default directory
+# (it starts before its config push arrives).
+log_dir = 'C:\ProgramData\SecOutfall\logs'
 
 [debug]
 # Do not request reboot/shutdown at finalization (dev hosts!).

@@ -89,6 +89,9 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      - name: Build (all features)
+        run: cargo build --workspace --all-features
+
       # The injectee sensor DLL is a separate nightly workspace (retour
       # static detours need nightly); excluded from the main workspace, so
       # build it explicitly — it must not rot in a corner.
@@ -123,3 +126,19 @@ jobs:
       - name: Verify wire golden fixture (C side)
         shell: pwsh
         run: ./driver/wiretest/x64/Release/wiretest.exe --verify driver/tests/golden_v2.bin
+
+      # Control-plane pinning: regenerate every committed fixture from the
+      # REAL C structs/macros and require byte-identical output. A
+      # secoutfallCommon.h change without fixture regeneration fails here
+      # instead of silently diverging from the Rust mirrors.
+      - name: Pin control-plane fixtures (C side)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $wiretest = "./driver/wiretest/x64/Release/wiretest.exe"
+          foreach ($name in @("injection", "drops", "filewatch", "protection", "security", "stats", "minimal-rename")) {
+            & $wiretest --emit $name "driver/tests/emit_$name.bin"
+          }
+          & $wiretest --emit codes
+          git diff --exit-code -- driver/tests/
+          if ($LASTEXITCODE -ne 0) { throw "control-plane fixtures drifted from secoutfallCommon.h — regenerate with wiretest and update the Rust mirrors" }

@@ -303,7 +303,14 @@ async fn copy_capped(
     max_bytes: u64,
 ) -> Result<[u8; 32], std::io::Error> {
     let mut input = tokio::fs::File::open(source).await?;
-    let mut output = tokio::fs::File::create(destination).await?;
+    // create_new: a pre-existing `.part` (leftover litter or a planted file)
+    // must never be silently truncated into our copy; the sequential
+    // name_seq makes collisions practically impossible, and a collision is
+    // an error, not a clobber. sync_all before the caller's rename: the
+    // doctrine's atomic-write pattern (scope persistence does the same) —
+    // after a VM power loss a renamed drop must not be empty/truncated.
+    let mut output =
+        tokio::fs::OpenOptions::new().write(true).create_new(true).open(destination).await?;
     let mut hasher = Sha256::new();
     let mut total = 0_u64;
     // Truncate-after-read keeps the full-capacity allocation: no slicing, no
@@ -327,6 +334,7 @@ async fn copy_capped(
         chunk.resize(COPY_CHUNK_BYTES, 0);
     }
     output.flush().await?;
+    output.sync_all().await?;
     Ok(hasher.finalize().into())
 }
 

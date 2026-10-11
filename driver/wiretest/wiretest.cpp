@@ -3,8 +3,9 @@
 //   wiretest --generate <file>   writes the canonical fixture (deterministic)
 //   wiretest --verify <file>     byte-exact compares against the fixture
 //   wiretest --emit <name> <file> writes one control-plane blob (deterministic)
-//                                name: injection | drops | protection |
-//                                      security | stats | minimal-rename
+//                                name: injection | drops | filewatch |
+//                                      protection | security | stats |
+//                                      minimal-rename
 //
 // The record fixture (driver/tests/golden_v2.bin) is committed: the same
 // bytes are decoded by crates/protocol/src/driver_wire.rs golden tests, so
@@ -364,7 +365,20 @@ void EmitStats() {
 	stats.SensorEventsDrained = 0x394A4B4C4D4E4F50ull;
 	stats.SensorEventsDropped = 0x596A6B6C6D6E6F70ull;
 	stats.SensorRingsActive = 0x798A8B8C8D8E8F90ull;
+	stats.SensorRingsSkipped = 0x99AABBCCDDEEFF00ull;
 	AppendRaw(&stats, sizeof(stats));
+}
+
+void EmitFileWatch() {
+	// Same NUL-terminated-per-entry list convention as the other policy
+	// blobs: the array's implicit terminator double-NULs the last entry.
+	FileWatchPolicy blob {};
+	blob.Enabled = 1;
+	const WCHAR exts[] = L".exe\0.dll\0";
+	blob.ExtensionsCount = 2;
+	blob.ExtensionsBytes = sizeof(exts);
+	AppendRaw(&blob, sizeof(blob));
+	AppendRaw(exts, sizeof(exts));
 }
 
 void EmitMinimalRename() {
@@ -452,6 +466,9 @@ void EmitCodes() {
 		sprintf_s(line, "%s=0x%08X\n", entry.name, entry.code);
 		g_out.insert(g_out.end(), line, line + strlen(line));
 	}
+	sprintf_s(line, "MAX_RECORD_BYTES=%lu\n",
+		static_cast<ULONG>(SECOUTFALL_MAX_RECORD_BYTES));
+	g_out.insert(g_out.end(), line, line + strlen(line));
 }
 
 int main(int argc, char** argv) {
@@ -472,6 +489,7 @@ int main(int argc, char** argv) {
 		const char* name = argv[2];
 		if (strcmp(name, "injection") == 0) EmitInjectionPolicy();
 		else if (strcmp(name, "drops") == 0) EmitDropPolicy();
+		else if (strcmp(name, "filewatch") == 0) EmitFileWatch();
 		else if (strcmp(name, "protection") == 0) EmitProtectionPolicy();
 		else if (strcmp(name, "security") == 0) EmitDeviceSecurity();
 		else if (strcmp(name, "stats") == 0) EmitStats();
