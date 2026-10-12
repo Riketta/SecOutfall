@@ -115,21 +115,22 @@ jobs:
       - uses: actions/checkout@v4
 
       # SDK + WDK, downloaded straight from Microsoft — the exact installers
-      # winget's own manifests point at, pinned to the matching 2454 build
-      # pair (the WDK requires the same-build SDK; the vcxproj pins the
-      # generic 10.0.26100.0, which any 26100.x satisfies). winget itself is
-      # a Store-licensed AppX the runner cannot launch, so it is not used.
-      # SHA-256 pins come from those same manifests.
+      # winget's own manifests point at. Per Microsoft's kit versioning, the
+      # SDK and WDK must match on BUILD number (26100) but not QFE, so the
+      # live SDK 2454 link pairs with the live WDK 6584 link; the vcxproj
+      # pins the generic 10.0.26100.0, which any 26100.x satisfies. winget
+      # itself is a Store-licensed AppX the runner cannot launch. SHA-256
+      # pins come from those same manifests.
       - name: Install Windows SDK + WDK
         shell: pwsh
         run: |
           $progressPreference = 'silentlyContinue'
           Invoke-WebRequest -Uri "https://download.microsoft.com/download/a/f/2/af287d69-2c0a-4320-9d0f-555d5be767b9/WinSDKSetup.exe" -OutFile "$env:TEMP\WinSDKSetup.exe"
-          Invoke-WebRequest -Uri "https://download.microsoft.com/download/a/0/4/a04a6ea0-d70d-496f-9949-a73e283be017/wdksetup.exe" -OutFile "$env:TEMP\wdksetup.exe"
+          Invoke-WebRequest -Uri "https://download.microsoft.com/download/41fb59c2-1723-45f9-a270-96b73ad58233/KIT_BUNDLE_WDK_MEDIACREATION/wdksetup.exe" -OutFile "$env:TEMP\wdksetup.exe"
           $sdkHash = (Get-FileHash "$env:TEMP\WinSDKSetup.exe" -Algorithm SHA256).Hash
           if ($sdkHash -ne "2D1C2335BE6639464AC18A98FE55C96E5313608DE4EBFFB3CBA7ED5D113D994D") { throw "SDK installer hash mismatch: $sdkHash" }
           $wdkHash = (Get-FileHash "$env:TEMP\wdksetup.exe" -Algorithm SHA256).Hash
-          if ($wdkHash -ne "89C8BD4DA6FDF0761E3C3D6A208E40FA5BA10743D84A4F63B6E867A388E07997") { throw "WDK installer hash mismatch: $wdkHash" }
+          if ($wdkHash -ne "ED82C46BD98E0F1D07FD6E5075900E42AEDC3FA5E68C06A8764B3DC5303CFF1B") { throw "WDK installer hash mismatch: $wdkHash" }
           $sdk = Start-Process -FilePath "$env:TEMP\WinSDKSetup.exe" -ArgumentList "/q", "/norestart" -Wait -PassThru
           if ($sdk.ExitCode -notin 0, 3010) { throw "SDK install failed: $($sdk.ExitCode)" }
           $wdk = Start-Process -FilePath "$env:TEMP\wdksetup.exe" -ArgumentList "/q", "/norestart" -Wait -PassThru
